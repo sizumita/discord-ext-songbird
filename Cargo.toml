@@ -1,0 +1,19 @@
+[package]
+name = "discord-ext-streaming"
+description = "An discord.py extension for voice recording"
+readme = "README.md"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/sizumita/discord-ext-streaming"
+authors = [
+    "sizumita mail@smdr.io"
+]
+publish = false
+
+[lib]
+name = "discord_ext_streaming_backend"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23.2", features = ["extension-module"] }

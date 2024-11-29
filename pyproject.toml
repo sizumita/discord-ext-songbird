@@ -1,17 +1,32 @@
 [project]
 name = "discord-ext-streaming"
-version = "0.1.0"
-description = "An discord.py extension for voice recording"
-readme = "README.md"
-authors = [
-    { name = "sizumita", email = "github@smdr.io" }
+requires-python = ">=3.10"
+dependencies = [
+    "discord.py[voice]",
+    "audioop-lts; python_version >= '3.13'"
 ]
-requires-python = ">=3.13"
-dependencies = ["discord.py", "audioop-lts; python_version >= '3.13'"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+]
+readme = "README.md"
+dynamic = ["version", "description", "authors", "license"]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["hatchling", "maturin"]
+build-backend = "maturin"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/discord"]
+[tool.uv.sources]
+"discord.py" = { git = "https://github.com/rapptz/discord.py" }
+
+[dependency-groups]
+dev = [
+    "hatchling>=1.26.3",
+    "maturin>=1.7.6"
+]
+
+[tool.maturin]
+python-source = "py-src"
+module-name = "discord.ext.streaming.backend"
+features = ["pyo3/extension-module"]
