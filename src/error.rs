@@ -1,7 +1,6 @@
 use pyo3::{create_exception, PyErr};
-use thiserror::Error;
 use songbird::error::JoinError;
-
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum SongbirdError {
@@ -11,17 +10,17 @@ pub enum SongbirdError {
     JoinError(#[from] JoinError),
 }
 
-
 create_exception!(module, PySongbirdError, pyo3::exceptions::PyException);
 
 create_exception!(module, PyConnectionNotInitialized, PySongbirdError);
 create_exception!(module, PyJoinError, PySongbirdError);
 
-
 impl From<SongbirdError> for PyErr {
     fn from(error: SongbirdError) -> Self {
         match error {
-            SongbirdError::ConnectionNotStarted => PyConnectionNotInitialized::new_err(error.to_string()),
+            SongbirdError::ConnectionNotStarted => {
+                PyConnectionNotInitialized::new_err(error.to_string())
+            }
             SongbirdError::JoinError(e) => PyJoinError::new_err(e.to_string()),
         }
     }

@@ -3,19 +3,16 @@
   <component name="AutoImportSettings">
     <option name="autoReloadType" value="ALL" />
   </component>
+  <component name="CargoProjects">
+    <cargoProject FILE="$PROJECT_DIR$/Cargo.toml" />
+  </component>
   <component name="ChangeListManager">
     <list default="true" id="5c75eaf3-a403-4fb9-9733-ddcc0c55088c" name="変更" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/.gitignore" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/discord-ext-songbird.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/discord-ext-songbird.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/modules.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/examples/basic.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/basic.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/py-src/discord/ext/songbird/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/py-src/discord/ext/songbird/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/py-src/discord/ext/songbird/backend.pyi" beforeDir="false" afterPath="$PROJECT_DIR$/py-src/discord/ext/songbird/backend.pyi" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/py-src/discord/ext/songbird/client.py" beforeDir="false" afterPath="$PROJECT_DIR$/py-src/discord/ext/songbird/client.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/client.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/client.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/connection.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/connection.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/error.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/error.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/lib.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -38,14 +35,25 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
-    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.rust.reset.selective.auto.import": "true",
+    "git-widget-placeholder": "master",
+    "last_opened_file_path": "/Users/sizumita/Workspace/sizumita/discord-ext-songbird",
+    "node.js.detected.package.eslint": "true",
+    "node.js.detected.package.tslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "org.rust.cargo.project.model.PROJECT_DISCOVERY": "true",
+    "org.rust.cargo.project.model.impl.CargoExternalSystemProjectAware.subscribe.first.balloon": "",
+    "vue.rearranger.settings.migration": "true"
   }
-}</component>
+}]]></component>
+  <component name="RustProjectSettings">
+    <option name="toolchainHomeDirectory" value="$USER_HOME$/.cargo/bin" />
+  </component>
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
@@ -63,6 +71,7 @@
       <option name="presentableId" value="Default" />
       <updated>1733263931500</updated>
       <workItem from="1733263932786" duration="2000" />
+      <workItem from="1733263944029" duration="414000" />
     </task>
     <servers />
   </component>
