@@ -1,5 +1,5 @@
 [project]
-name = "discord-ext-streaming"
+name = "discord-ext-songbird"
 requires-python = ">=3.10"
 dependencies = [
     "discord.py[voice]",
@@ -28,5 +28,5 @@ dev = [
 
 [tool.maturin]
 python-source = "py-src"
-module-name = "discord.ext.streaming.backend"
+module-name = "discord.ext.songbird.backend"
 features = ["pyo3/extension-module"]

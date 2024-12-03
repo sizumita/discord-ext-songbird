@@ -23,7 +23,7 @@ class AsyncStreamWriterABC(Generic[W], ABC):
         return reader(self)
 
 
-class AsyncStreamABC(Generic[R, W], ABC, AsyncStreamReaderABC[R], AsyncStreamWriterABC[W]):
+class AsyncStreamABC(Generic[R, W], AsyncStreamReaderABC[R], AsyncStreamWriterABC[W]):
     @abstractmethod
     async def __anext__(self) -> W:
         return await anext(self._stream)

@@ -8,8 +8,12 @@ wheels/
 
 # Virtual environments
 .venv
+venv
 
 
 # Added by cargo
 
 /target
+
+*.so
+test.sh
