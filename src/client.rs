@@ -10,12 +10,12 @@ use crate::connection::{DpyVoiceUpdate, VoiceConnection};
 use crate::error::{SongbirdError, SongbirdResult};
 
 #[pyclass]
-pub struct SongbirdClient {
+pub struct SongbirdBackend {
     connection: Arc<VoiceConnection>,
 }
 
 #[pymethods]
-impl SongbirdClient {
+impl SongbirdBackend {
     #[new]
     fn new<'py>(py: Python<'py>, channel_id: u64) -> PyResult<Self> {
         use std::panic;

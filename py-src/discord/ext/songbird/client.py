@@ -1,12 +1,12 @@
 from typing import Any, Union, Optional
 from .abc import AsyncStreamWriterABC
 
-from .backend import SongbirdClient
+from .backend import SongbirdBackend
 import discord
 from discord.types.voice import VoiceServerUpdate as VoiceServerUpdatePayload, GuildVoiceState as GuildVoiceStatePayload
 
 
-class StreamingClient(discord.VoiceProtocol):
+class SongbirdClient(discord.VoiceProtocol):
     channel: Union[discord.VoiceChannel, discord.StageChannel]
 
     def __init__(self, client: discord.Client, channel: discord.abc.Connectable) -> None:
@@ -14,7 +14,7 @@ class StreamingClient(discord.VoiceProtocol):
 
         channel_id = getattr(channel, "id", None)
         assert channel_id is not None
-        self.songbird = SongbirdClient(channel_id)
+        self.songbird = SongbirdBackend(channel_id)
 
     async def connect(self, *, timeout: float, reconnect: bool, self_deaf: bool = False, self_mute: bool = False) -> None:
         guild_id, key_type = self.channel._get_voice_client_key()

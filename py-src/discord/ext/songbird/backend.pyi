@@ -15,7 +15,7 @@ class ConnectionNotInitialized(SongbirdError):
     ...
 
 
-class SongbirdClient:
+class SongbirdBackend:
     def __init__(self, channel_id: int) -> None:
         ...
 

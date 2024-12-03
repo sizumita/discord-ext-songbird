@@ -1,3 +1,3 @@
-from .backend import SongbirdClient
+from .backend import SongbirdBackend, SongbirdError, JoinError, ConnectionNotInitialized
 from .abc import *
-from .client import StreamingClient
+from .client import SongbirdClient

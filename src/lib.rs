@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 #[pymodule]
 #[pyo3(name="backend")]
 fn discord_ext_songbird_backend(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<client::SongbirdClient>()?;
+    m.add_class::<client::SongbirdBackend>()?;
     m.add("SongbirdError", py.get_type::<error::PySongbirdError>())?;
     m.add("JoinError", py.get_type::<error::PyJoinError>())?;
     m.add("ConnectionNotInitialized", py.get_type::<error::PyConnectionNotInitialized>())?;

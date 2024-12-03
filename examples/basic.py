@@ -10,10 +10,11 @@ CHANNEL_ID = 1311019617740783747
 
 @client.event
 async def on_ready():
+    print("ready")
     channel: discord.VoiceChannel = client.get_channel(CHANNEL_ID)
-    stream_client: songbird.StreamingClient = await channel.connect(cls=songbird.StreamingClient, self_deaf=True)
+    voice_client: songbird.SongbirdClient = await channel.connect(cls=songbird.SongbirdClient, self_deaf=True)
 
     await asyncio.sleep(5)
-    await stream_client.disconnect(force=True)
+    await voice_client.disconnect(force=True)
 
 client.run(os.environ["DISCORD_BOT_TOKEN"])
