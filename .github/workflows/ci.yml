@@ -25,6 +25,11 @@ jobs:
           version: "latest"
           python-version: ${{ matrix.python-version }}
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
       - name: Install the project
         run: uv sync --all-extras --dev
 

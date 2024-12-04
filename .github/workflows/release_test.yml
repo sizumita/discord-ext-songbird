@@ -33,18 +33,13 @@ jobs:
           version: "latest"
           python-version: ${{ matrix.python-version }}
 
-      - name: Install the project
-        run: uv sync --all-extras --dev
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libopus-dev
-
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Install the project
+        run: uv sync --all-extras --dev
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -83,18 +78,14 @@ jobs:
           version: "latest"
           python-version: ${{ matrix.python-version }}
 
-      - name: Install the project
-        run: uv sync --all-extras --dev
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libopus-dev
-
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Install the project
+        run: uv sync --all-extras --dev
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -127,15 +118,13 @@ jobs:
           version: "latest"
           python-version: ${{ matrix.python-version }}
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
       - name: Install the project
         run: uv sync --all-extras --dev
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libopus-dev
-
-      - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
@@ -171,18 +160,13 @@ jobs:
           version: "latest"
           python-version: ${{ matrix.python-version }}
 
-      - name: Install the project
-        run: uv sync --all-extras --dev
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libopus-dev
-
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Install the project
+        run: uv sync --all-extras --dev
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
