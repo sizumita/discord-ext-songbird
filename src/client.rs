@@ -1,9 +1,14 @@
 use crate::connection::{DpyVoiceUpdate, VoiceConnection};
 use crate::error::{SongbirdError, SongbirdResult};
-use pyo3::{pyclass, pymethods, Bound, Py, PyAny, PyResult, Python};
+use crate::player::PlayerHandler;
+use crate::source::{AudioSource, SourceComposed};
+use pyo3::prelude::PyAnyMethods;
+use pyo3::{pyclass, pymethods, Bound, IntoPyObject, IntoPyObjectExt, Py, PyAny, PyResult, Python};
 use pyo3_async_runtimes::tokio::future_into_py;
+use songbird::input::Input;
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[pyclass]
 pub struct SongbirdBackend {
@@ -75,6 +80,26 @@ impl SongbirdBackend {
         let conn = self.connection.clone();
         future_into_py(py, async move {
             Ok(conn.connect(timeout, self_deaf, self_mute).await?)
+        })
+    }
+
+    pub fn play_source<'py>(
+        &self,
+        py: Python<'py>,
+        source: Bound<'py, AudioSource>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let conn = self.connection.clone();
+        let inner = source.call_method0("get_source")?;
+        let composed = inner.downcast_exact::<SourceComposed>()?;
+        let c = composed.get();
+        let input = Input::from(composed.get().0.input());
+        println!("source {:?}", source);
+        future_into_py(py, async move {
+            let handler = PlayerHandler {
+                handle: conn.play(input).await?,
+            };
+            handler.handle.enable_loop().unwrap();
+            Ok(handler)
         })
     }
 

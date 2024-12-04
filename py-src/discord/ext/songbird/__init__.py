@@ -1,4 +1,4 @@
-from .backend import SongbirdBackend, SongbirdError, JoinError, ConnectionNotInitialized
+from .backend import SongbirdBackend, SongbirdError, JoinError, ConnectionNotInitialized, AudioSource, SourceComposed, RawBufferSource
 from .client import SongbirdClient
 
 __all__ = [
@@ -7,4 +7,7 @@ __all__ = [
     "JoinError",
     "ConnectionNotInitialized",
     "SongbirdClient",
+    "AudioSource",
+    "SourceComposed",
+    "RawBufferSource",
 ]

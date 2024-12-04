@@ -1,6 +1,6 @@
 from typing import Union, Optional
 
-from .backend import SongbirdBackend
+from .backend import SongbirdBackend, AudioSource
 import discord
 from discord.types.voice import VoiceServerUpdate as VoiceServerUpdatePayload, GuildVoiceState as GuildVoiceStatePayload  # type: ignore
 
@@ -54,3 +54,6 @@ class SongbirdClient(discord.VoiceProtocol):
             await self.disconnect(force=True)
         else:
             await self.songbird.move_to(channel.id)
+
+    async def play(self, source: AudioSource):
+        return await self.songbird.play_source(source)

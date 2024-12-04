@@ -3,7 +3,9 @@ use async_trait::async_trait;
 use pyo3::{Py, PyAny, Python};
 use songbird::error::{JoinError, JoinResult};
 use songbird::id::{ChannelId, GuildId};
+use songbird::input::Input;
 use songbird::shards::{Shard, VoiceUpdate};
+use songbird::tracks::TrackHandle;
 use songbird::{Call, Config};
 use std::fmt::Debug;
 use std::num::NonZeroU64;
@@ -131,6 +133,14 @@ impl VoiceConnection {
         if let Some(handler) = &mut *self.call.lock().await {
             let r = handler.join(channel_id).await?;
             Ok(r.await?)
+        } else {
+            Err(SongbirdError::ConnectionNotStarted)
+        }
+    }
+
+    pub async fn play(&self, input: Input) -> SongbirdResult<TrackHandle> {
+        if let Some(handler) = &mut *self.call.lock().await {
+            Ok(handler.play_input(input))
         } else {
             Err(SongbirdError::ConnectionNotStarted)
         }
