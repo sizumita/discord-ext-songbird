@@ -221,7 +221,7 @@ wheels = [
 
 [[package]]
 name = "discord-ext-songbird"
-version = "0.0.1"
+version = "0.0.2"
 source = { editable = "." }
 dependencies = [
     { name = "audioop-lts", marker = "python_full_version >= '3.13'" },

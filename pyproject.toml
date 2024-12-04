@@ -30,6 +30,8 @@ dev = [
 python-source = "py-src"
 module-name = "discord.ext.songbird.backend"
 features = ["pyo3/extension-module"]
+frozen = true
+locked = true
 
 [tool.ruff]
 include = ["py-src/**/*.py", "py-src/**/*.pyi"]
