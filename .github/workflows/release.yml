@@ -1,0 +1,61 @@
+name: Release
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    name: CI ${{ matrix.target.id }} on ${{ matrix.target.os }} (Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.target.os }}
+    strategy:
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+        target:
+          - id: "linux-amd64"
+            os: "ubuntu-latest"
+            target-name: "x86_64-unknown-linux-gnu"
+            rust-toolchain: "stable"
+
+          - id: "linux-aarch64"
+            os: "ubuntu-latest"
+            target-name: "aarch64-unknown-linux-gnu"
+            rust-toolchain: "stable"
+
+          - id: "darwin-amd64"
+            os: "macos-latest"
+            target-name: "x86_64-apple-darwin"
+            rust-toolchain: "stable"
+
+          - id: "darwin-aarch64"
+            os: "macos-latest"
+            target-name: "aarch64-apple-darwin"
+            rust-toolchain: "stable"
+
+          - id: "windows-amd64"
+            os: "windows-latest"
+            target-name: "x86_64-pc-windows-msvc"
+            rust-toolchain: "stable"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust-version }}
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+      - name: Install the project
+        run: uv sync --all-extras --dev
+
+      - name: Build uv
+        run: uv build

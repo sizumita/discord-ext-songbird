@@ -1,5 +1,4 @@
-from typing import Any, Union, Optional
-from .abc import AsyncStreamWriterABC
+from typing import Union
 
 from .backend import SongbirdBackend
 import discord

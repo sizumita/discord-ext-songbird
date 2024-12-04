@@ -30,3 +30,17 @@ dev = [
 python-source = "py-src"
 module-name = "discord.ext.songbird.backend"
 features = ["pyo3/extension-module"]
+
+[tool.ruff]
+include = ["py-src/**/*.py", "py-src/**/*.pyi"]
+line-length = 160
+target-version = "py313"
+
+[tool.ruff.lint]
+ignore = [
+    "E501",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+line-ending = "auto"

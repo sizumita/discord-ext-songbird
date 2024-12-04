@@ -8,8 +8,16 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="5c75eaf3-a403-4fb9-9733-ddcc0c55088c" name="変更" comment="">
+      <change afterPath="$PROJECT_DIR$/.github/rust.json" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/.github/workflows/ci.yml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/.github/workflows/release.yml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/discord-ext-songbird.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/discord-ext-songbird.iml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.toml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/py-src/discord/ext/songbird/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/py-src/discord/ext/songbird/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/py-src/discord/ext/songbird/backend.pyi" beforeDir="false" afterPath="$PROJECT_DIR$/py-src/discord/ext/songbird/backend.pyi" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/py-src/discord/ext/songbird/client.py" beforeDir="false" afterPath="$PROJECT_DIR$/py-src/discord/ext/songbird/client.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/py-src/discord/ext/songbird/stream.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/pyproject.toml" beforeDir="false" afterPath="$PROJECT_DIR$/pyproject.toml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -34,6 +42,7 @@
   <component name="PropertiesComponent"><![CDATA[{
   "keyToString": {
     "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.git.unshallow": "true",
     "RunOnceActivity.rust.reset.selective.auto.import": "true",
     "git-widget-placeholder": "master",
     "last_opened_file_path": "/Users/sizumita/Workspace/sizumita/discord-ext-songbird",
@@ -67,7 +76,8 @@
       <option name="presentableId" value="Default" />
       <updated>1733263931500</updated>
       <workItem from="1733263932786" duration="2000" />
-      <workItem from="1733263944029" duration="2501000" />
+      <workItem from="1733263944029" duration="4419000" />
+      <workItem from="1733271181231" duration="3644000" />
     </task>
     <servers />
   </component>

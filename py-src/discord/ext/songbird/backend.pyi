@@ -1,4 +1,4 @@
-from typing import Dict, Any, List, Callable, Type, Optional, Coroutine
+from typing import Any, Callable, Optional, Coroutine
 
 UpdateHook = Callable[[Optional[int], bool, bool], Coroutine[Any, Any, None]]
 
