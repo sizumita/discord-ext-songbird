@@ -38,8 +38,8 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Install the project
-        run: uv sync --all-extras --dev
+      - name: Syncing uv project
+        run: uv sync --all-extras --dev --no-install-project
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -84,8 +84,8 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Install the project
-        run: uv sync --all-extras --dev
+      - name: Syncing uv project
+        run: uv sync --all-extras --dev --no-install-project
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -124,8 +124,8 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Install the project
-        run: uv sync --all-extras --dev
+      - name: Syncing uv project
+        run: uv sync --all-extras --dev --no-install-project
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
@@ -166,8 +166,8 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Install the project
-        run: uv sync --all-extras --dev
+      - name: Syncing uv project
+        run: uv sync --all-extras --dev --no-install-project
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1

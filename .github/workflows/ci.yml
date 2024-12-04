@@ -25,8 +25,8 @@ jobs:
           version: "latest"
           python-version: ${{ matrix.python-version }}
 
-      - name: Install the project
-        run: uv sync --all-extras --dev
+      - name: Syncing uv project
+        run: uv sync --all-extras --dev --no-install-project
 
       - name: Run ruff
         run: uvx ruff check --output-format=github .
