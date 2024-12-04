@@ -1,8 +1,8 @@
-from typing import Union
+from typing import Union, Optional
 
 from .backend import SongbirdBackend
 import discord
-from discord.types.voice import VoiceServerUpdate as VoiceServerUpdatePayload, GuildVoiceState as GuildVoiceStatePayload
+from discord.types.voice import VoiceServerUpdate as VoiceServerUpdatePayload, GuildVoiceState as GuildVoiceStatePayload  # type: ignore
 
 
 class SongbirdClient(discord.VoiceProtocol):
@@ -25,13 +25,32 @@ class SongbirdClient(discord.VoiceProtocol):
         await self.songbird.leave()
 
     async def on_voice_state_update(self, data: GuildVoiceStatePayload) -> None:
-        channel_id = None if data['channel_id'] is None else int(data['channel_id'])
-        session_id = data['session_id']
+        channel_id = None if data["channel_id"] is None else int(data["channel_id"])
+        session_id = data["session_id"]
         await self.songbird.on_voice_state_update(session_id, channel_id)
 
     async def on_voice_server_update(self, data: VoiceServerUpdatePayload) -> None:
         await self.songbird.on_server_update(data["endpoint"], data["token"])
 
-    async def update_hook(self, channel_id: int, self_mute: bool, self_deaf: bool) -> None:
-        await self.channel.guild.change_voice_state(channel=None if channel_id == -1 else discord.Object(id=channel_id), self_mute=self_mute, self_deaf=self_deaf)
+    async def update_hook(self, channel_id: Optional[int], self_mute: bool, self_deaf: bool) -> None:
+        await self.channel.guild.change_voice_state(
+            channel=None if channel_id is None else discord.Object(id=channel_id), self_mute=self_mute, self_deaf=self_deaf
+        )
 
+    async def mute(self, mute: bool) -> None:
+        await self.songbird.mute(mute=mute)
+
+    async def deafen(self, deaf: bool) -> None:
+        await self.songbird.deafen(deaf=deaf)
+
+    async def is_mute(self) -> bool:
+        return await self.songbird.is_mute()
+
+    async def is_deaf(self) -> bool:
+        return await self.songbird.is_deaf()
+
+    async def move_to(self, channel: Optional[discord.abc.Snowflake]) -> None:
+        if channel is None:
+            await self.disconnect(force=True)
+        else:
+            await self.songbird.move_to(channel.id)

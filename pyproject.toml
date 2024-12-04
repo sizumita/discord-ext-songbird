@@ -44,3 +44,11 @@ ignore = [
 [tool.ruff.format]
 quote-style = "double"
 line-ending = "auto"
+
+[tool.pyright]
+include = ["py-src"]
+reportMissingImports = "error"
+reportMissingTypeStubs = "error"
+pythonVersion = "3.13"
+# because of discord.* occurs error
+reportAttributeAccessIssue = false

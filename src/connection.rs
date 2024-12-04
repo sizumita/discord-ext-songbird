@@ -1,6 +1,6 @@
 use crate::error::{SongbirdError, SongbirdResult};
 use async_trait::async_trait;
-use pyo3::{IntoPyObject, Py, PyAny, Python};
+use pyo3::{Py, PyAny, Python};
 use songbird::error::{JoinError, JoinResult};
 use songbird::id::{ChannelId, GuildId};
 use songbird::shards::{Shard, VoiceUpdate};
@@ -40,6 +40,28 @@ impl VoiceConnection {
         }
     }
 
+    pub async fn update_server(&self, endpoint: String, token: String) -> SongbirdResult<()> {
+        let Some(handler) = &mut *self.call.lock().await else {
+            return Err(SongbirdError::ConnectionNotStarted);
+        };
+        handler.update_server(endpoint, token);
+        Ok(())
+    }
+
+    pub async fn update_state<C>(
+        &self,
+        session_id: String,
+        channel_id: Option<C>,
+    ) -> SongbirdResult<()>
+    where
+        C: Into<ChannelId> + Debug,
+    {
+        let Some(handler) = &mut *self.call.lock().await else {
+            return Err(SongbirdError::ConnectionNotStarted);
+        };
+        Ok(handler.update_state(session_id, channel_id))
+    }
+
     pub async fn connect(
         &self,
         timeout: f32,
@@ -48,7 +70,7 @@ impl VoiceConnection {
     ) -> SongbirdResult<()> {
         let joined = {
             let Some(handler) = &mut *self.call.lock().await else {
-                unreachable!()
+                return Err(SongbirdError::ConnectionNotStarted);
             };
             let config = handler
                 .config()
@@ -70,26 +92,48 @@ impl VoiceConnection {
         Ok(handler.leave().await?)
     }
 
-    pub async fn update_server(&self, endpoint: String, token: String) -> SongbirdResult<()> {
-        let Some(handler) = &mut *self.call.lock().await else {
-            return Err(SongbirdError::ConnectionNotStarted);
-        };
-        handler.update_server(endpoint, token);
-        Ok(())
+    pub async fn mute(&self, mute: bool) -> SongbirdResult<()> {
+        if let Some(handler) = &mut *self.call.lock().await {
+            Ok(handler.mute(mute).await?)
+        } else {
+            Err(SongbirdError::ConnectionNotStarted)
+        }
     }
 
-    pub async fn update_state<C>(
-        &self,
-        session_id: String,
-        channel_id: Option<C>,
-    ) -> SongbirdResult<()>
+    pub async fn deafen(&self, deaf: bool) -> SongbirdResult<()> {
+        if let Some(handler) = &mut *self.call.lock().await {
+            Ok(handler.deafen(deaf).await?)
+        } else {
+            Err(SongbirdError::ConnectionNotStarted)
+        }
+    }
+
+    pub async fn is_deaf(&self) -> SongbirdResult<bool> {
+        if let Some(handler) = &mut *self.call.lock().await {
+            Ok(handler.is_deaf())
+        } else {
+            Err(SongbirdError::ConnectionNotStarted)
+        }
+    }
+
+    pub async fn is_mute(&self) -> SongbirdResult<bool> {
+        if let Some(handler) = &mut *self.call.lock().await {
+            Ok(handler.is_mute())
+        } else {
+            Err(SongbirdError::ConnectionNotStarted)
+        }
+    }
+
+    pub async fn move_to<C>(&self, channel_id: C) -> SongbirdResult<()>
     where
         C: Into<ChannelId> + Debug,
     {
-        let Some(handler) = &mut *self.call.lock().await else {
-            return Err(SongbirdError::ConnectionNotStarted);
-        };
-        Ok(handler.update_state(session_id, channel_id))
+        if let Some(handler) = &mut *self.call.lock().await {
+            let r = handler.join(channel_id).await?;
+            Ok(r.await?)
+        } else {
+            Err(SongbirdError::ConnectionNotStarted)
+        }
     }
 }
 
@@ -117,9 +161,9 @@ impl VoiceUpdate for DpyVoiceUpdate {
         self_mute: bool,
     ) -> JoinResult<()> {
         let hook_awaited = Python::with_gil(|py| {
-            let channel_id = channel_id
-                .map(|x| x.0.into_pyobject(py))
-                .unwrap_or_else(|| (-1i32).into_pyobject(py))?;
+            let channel_id = channel_id.map(|x| x.0.get());
+            // .map(|x| x.0.into_pyobject(py))
+            // .unwrap_or_else(|| (-1i32).into_pyobject(py))?;
             pyo3_async_runtimes::tokio::into_future(
                 self.update_hook
                     .call1(py, (channel_id, self_deaf, self_mute))

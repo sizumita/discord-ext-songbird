@@ -6,7 +6,7 @@ import os
 
 client = discord.Client(intents=discord.Intents.default())
 
-CHANNEL_ID = 1311019617740783747
+CHANNEL_ID = 1313754366368550953
 
 @client.event
 async def on_ready():

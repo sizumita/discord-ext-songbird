@@ -1,4 +1,5 @@
 use crate::connection::{DpyVoiceUpdate, VoiceConnection};
+use crate::error::{SongbirdError, SongbirdResult};
 use pyo3::{pyclass, pymethods, Bound, Py, PyAny, PyResult, Python};
 use pyo3_async_runtimes::tokio::future_into_py;
 use std::num::NonZeroU64;
@@ -12,13 +13,8 @@ pub struct SongbirdBackend {
 #[pymethods]
 impl SongbirdBackend {
     #[new]
-    pub fn new<'py>(py: Python<'py>, channel_id: u64) -> PyResult<Self> {
-        use std::panic;
-
-        panic::set_hook(Box::new(|panic_info| {
-            println!("{}", panic_info);
-        }));
-        let connection = Arc::new(VoiceConnection::new(NonZeroU64::new(channel_id).unwrap()));
+    pub fn new<'py>(channel_id: u64) -> PyResult<Self> {
+        let connection = Arc::new(VoiceConnection::new(non_zero_u64(channel_id)?));
         Ok(Self { connection })
     }
 
@@ -33,8 +29,8 @@ impl SongbirdBackend {
         future_into_py(py, async move {
             conn.start(
                 DpyVoiceUpdate::new(conn.clone(), shard_hook),
-                NonZeroU64::new(client_id).unwrap(),
-                NonZeroU64::new(guild_id).unwrap(),
+                non_zero_u64(client_id)?,
+                non_zero_u64(guild_id)?,
             )
             .await;
             Ok(())
@@ -63,7 +59,7 @@ impl SongbirdBackend {
     ) -> PyResult<Bound<'py, PyAny>> {
         let conn = self.connection.clone();
         future_into_py(py, async move {
-            conn.update_state(session_id, channel_id.map(|x| NonZeroU64::new(x).unwrap()))
+            conn.update_state(session_id, channel_id.and_then(|x| NonZeroU64::new(x)))
                 .await?;
             Ok(())
         })
@@ -86,4 +82,38 @@ impl SongbirdBackend {
         let conn = self.connection.clone();
         future_into_py(py, async move { Ok(conn.leave().await?) })
     }
+
+    pub fn mute<'py>(&self, py: Python<'py>, mute: bool) -> PyResult<Bound<'py, PyAny>> {
+        let conn = self.connection.clone();
+        future_into_py(py, async move { Ok(conn.mute(mute).await?) })
+    }
+
+    pub fn deafen<'py>(&self, py: Python<'py>, deaf: bool) -> PyResult<Bound<'py, PyAny>> {
+        let conn = self.connection.clone();
+        future_into_py(py, async move { Ok(conn.deafen(deaf).await?) })
+    }
+
+    pub fn is_deaf<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let conn = self.connection.clone();
+        future_into_py(py, async move { Ok(conn.is_deaf().await?) })
+    }
+
+    pub fn is_mute<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let conn = self.connection.clone();
+        future_into_py(py, async move { Ok(conn.is_mute().await?) })
+    }
+
+    pub fn move_to<'py>(&self, py: Python<'py>, channel_id: u64) -> PyResult<Bound<'py, PyAny>> {
+        let conn = self.connection.clone();
+        future_into_py(py, async move {
+            Ok(conn.move_to(non_zero_u64(channel_id)?).await?)
+        })
+    }
+}
+
+#[inline]
+fn non_zero_u64(val: u64) -> SongbirdResult<NonZeroU64> {
+    NonZeroU64::new(val)
+        .map(|x| Ok(x))
+        .unwrap_or_else(|| Err(SongbirdError::InvalidId))
 }

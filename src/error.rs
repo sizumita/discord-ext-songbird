@@ -1,3 +1,4 @@
+use pyo3::exceptions::PyValueError;
 use pyo3::{create_exception, PyErr};
 use songbird::error::JoinError;
 use thiserror::Error;
@@ -8,6 +9,8 @@ pub enum SongbirdError {
     ConnectionNotStarted,
     #[error("Passing Message failed")]
     JoinError(#[from] JoinError),
+    #[error("Id is invalid")]
+    InvalidId,
 }
 
 create_exception!(module, PySongbirdError, pyo3::exceptions::PyException);
@@ -22,6 +25,7 @@ impl From<SongbirdError> for PyErr {
                 PyConnectionNotInitialized::new_err(error.to_string())
             }
             SongbirdError::JoinError(e) => PyJoinError::new_err(e.to_string()),
+            SongbirdError::InvalidId => PyValueError::new_err("Id is not in valid range"),
         }
     }
 }

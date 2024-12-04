@@ -30,6 +30,9 @@ jobs:
 
       - name: Run ruff
         run: uvx ruff check --output-format=github .
+
+      - name: Run ruff formatter
+        run: uvx ruff format --diff
   lint_rust:
     name: Lint rust
     runs-on: ubuntu-latest
