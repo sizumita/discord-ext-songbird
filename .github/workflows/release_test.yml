@@ -222,4 +222,4 @@ jobs:
           MATURIN_PYPI_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
         with:
           command: upload
-          args: --repository testpypi --non-interactive --skip-existing wheels-*/*
+          args: --repository=testpypi --non-interactive --skip-existing wheels-*/*
