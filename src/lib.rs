@@ -8,7 +8,6 @@ mod source;
 mod track;
 
 use pyo3::prelude::*;
-use tracing_subscriber::fmt;
 
 /// A Python module implemented in Rust.
 #[pymodule]

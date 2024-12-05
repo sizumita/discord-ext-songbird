@@ -1,11 +1,8 @@
 pub mod raw;
 
-use crate::buffer::PyBufferIO;
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyNotImplemented;
-use songbird::input::core::io::MediaSource;
-use songbird::input::{AudioStream, AudioStreamError, Compose, Input};
+use songbird::input::{Compose, Input};
 
 #[pyclass(subclass)]
 pub struct AudioSource {}

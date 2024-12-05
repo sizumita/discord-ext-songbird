@@ -31,7 +31,7 @@ impl QueueHandler {
         let track = into_track.get().build()?;
         future_into_py(py, async move {
             let handle = conn.enqueue(track).await?;
-            Ok(PlayerHandler::from_handle(handle, conn.clone())?)
+            PlayerHandler::from_handle(handle, conn.clone())
         })
     }
 

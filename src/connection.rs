@@ -3,9 +3,8 @@ use async_trait::async_trait;
 use pyo3::{Py, PyAny, Python};
 use songbird::error::{JoinError, JoinResult};
 use songbird::id::{ChannelId, GuildId};
-use songbird::input::Input;
 use songbird::shards::{Shard, VoiceUpdate};
-use songbird::tracks::{Track, TrackHandle, TrackQueue};
+use songbird::tracks::{Track, TrackHandle};
 use songbird::{Call, Config};
 use std::fmt::Debug;
 use std::num::NonZeroU64;
@@ -61,7 +60,8 @@ impl VoiceConnection {
         let Some(handler) = &mut *self.call.lock().await else {
             return Err(SongbirdError::ConnectionNotStarted);
         };
-        Ok(handler.update_state(session_id, channel_id))
+        handler.update_state(session_id, channel_id);
+        Ok(())
     }
 
     pub async fn connect(
@@ -156,7 +156,8 @@ impl VoiceConnection {
 
     pub fn stop_queue(&self) -> SongbirdResult<()> {
         if let Some(handler) = &mut *self.call.blocking_lock() {
-            Ok(handler.queue().stop())
+            handler.queue().stop();
+            Ok(())
         } else {
             Err(SongbirdError::ConnectionNotStarted)
         }
@@ -188,14 +189,12 @@ impl VoiceConnection {
 }
 
 pub struct DpyVoiceUpdate {
-    conn: Arc<VoiceConnection>,
     update_hook: Py<PyAny>,
 }
 
 impl DpyVoiceUpdate {
-    pub fn new(conn: Arc<VoiceConnection>, hook: Py<PyAny>) -> Self {
+    pub fn new(hook: Py<PyAny>) -> Self {
         Self {
-            conn,
             update_hook: hook,
         }
     }

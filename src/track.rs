@@ -17,6 +17,7 @@ pub struct IntoTrack {
 #[pymethods]
 impl IntoTrack {
     #[new]
+    #[pyo3(signature = (source, volume, is_loop, loop_count=None))]
     fn new(source: Py<PyAny>, volume: f32, is_loop: bool, loop_count: Option<usize>) -> Self {
         Self {
             source,
@@ -32,7 +33,7 @@ impl IntoTrack {
         let input = Python::with_gil(|py| {
             let inner = self.source.call_method0(py, "get_source")?;
             let composed = inner.downcast_bound::<SourceComposed>(py)?;
-            PyResult::<Input>::Ok(Input::from(composed.get().0.input()))
+            PyResult::<Input>::Ok(composed.get().0.input())
         })?;
         let track =
             Track::new(input)

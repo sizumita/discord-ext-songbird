@@ -1,12 +1,8 @@
 use crate::connection::{DpyVoiceUpdate, VoiceConnection};
 use crate::error::{SongbirdError, SongbirdResult};
-use crate::player::PlayerHandler;
 use crate::queue::QueueHandler;
-use crate::source::{AudioSource, SourceComposed};
-use pyo3::prelude::PyAnyMethods;
-use pyo3::{pyclass, pymethods, Bound, IntoPyObject, Py, PyAny, PyResult, Python};
+use pyo3::{pyclass, pymethods, Bound, Py, PyAny, PyResult, Python};
 use pyo3_async_runtimes::tokio::future_into_py;
-use songbird::input::Input;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
@@ -20,7 +16,7 @@ pub struct SongbirdBackend {
 #[pymethods]
 impl SongbirdBackend {
     #[new]
-    pub fn new<'py>(py: Python<'py>, channel_id: u64) -> PyResult<Self> {
+    pub fn new(py: Python<'_>, channel_id: u64) -> PyResult<Self> {
         let connection = Arc::new(VoiceConnection::new(non_zero_u64(channel_id)?));
         let handler = QueueHandler::new(connection.clone());
         Ok(Self {
@@ -39,7 +35,7 @@ impl SongbirdBackend {
         let conn = self.connection.clone();
         future_into_py(py, async move {
             conn.start(
-                DpyVoiceUpdate::new(conn.clone(), shard_hook),
+                DpyVoiceUpdate::new(shard_hook),
                 non_zero_u64(client_id)?,
                 non_zero_u64(guild_id)?,
             )
@@ -70,7 +66,7 @@ impl SongbirdBackend {
     ) -> PyResult<Bound<'py, PyAny>> {
         let conn = self.connection.clone();
         future_into_py(py, async move {
-            conn.update_state(session_id, channel_id.and_then(|x| NonZeroU64::new(x)))
+            conn.update_state(session_id, channel_id.and_then(NonZeroU64::new))
                 .await?;
             Ok(())
         })
@@ -123,6 +119,6 @@ impl SongbirdBackend {
 #[inline]
 fn non_zero_u64(val: u64) -> SongbirdResult<NonZeroU64> {
     NonZeroU64::new(val)
-        .map(|x| Ok(x))
+        .map(Ok)
         .unwrap_or_else(|| Err(SongbirdError::InvalidId))
 }
