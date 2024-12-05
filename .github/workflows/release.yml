@@ -131,9 +131,6 @@ jobs:
       - name: Syncing uv project
         run: uv sync --all-extras --dev --no-install-project
 
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
-
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:

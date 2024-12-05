@@ -37,19 +37,92 @@ class RawBufferSource(AudioSource):
 class PlayerHandler:
     queue: QueueHandler
 
-    def play(self) -> None: ...
-    def stop(self) -> None: ...
-    def set_volume(self, volume: float) -> None: ...
+    def play(self) -> None:
+        """
+        Start playing the track that this handler is handling.
+
+        Returns
+        -------
+        None
+        """
+        ...
+
+    def stop(self) -> None:
+        """
+        Stop playing the track that this handler is handling.
+
+        Returns
+        -------
+        None
+        """
+        ...
+
+    def set_volume(self, volume: float) -> None:
+        """
+        Set the volume of the track that this handler is handling.
+
+        Parameters
+        ----------
+        volume : float
+            The volume to set between 0.0 and 1.0
+
+        Returns
+        -------
+        None
+        """
+        ...
 
 class QueueHandler:
-    def enqueue(self, track: Track) -> None: ...
-    def dequeue(self, index: int) -> None: ...
-    def skip(self) -> None: ...
-    def stop(self) -> None: ...
+    def enqueue(self, track: Track) -> None:
+        """
+        Add a track to the queue.
+
+        Parameters
+        ----------
+        track : Track
+            The track to add to the queue.
+
+        Returns
+        -------
+        None
+        """
+        ...
+    def dequeue(self, index: int) -> None:
+        """
+
+        Exclude track from the queue.
+
+        Parameters
+        ----------
+        index
+
+        Returns
+        -------
+
+        """
+        ...
+    def skip(self) -> None:
+        """
+
+        Skip current playing track.
+
+        Returns
+        -------
+        """
+        ...
+    def stop(self) -> None:
+        """
+        Stop playing from the queue.
+        Returns
+        -------
+        """
+        ...
     def resume(self) -> None:
         """
-        Resumes the queue.
-        :return:
+        Resumes playing the queue.
+
+        Returns
+        -------
         """
         ...
 

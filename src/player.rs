@@ -4,6 +4,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use songbird::tracks::TrackHandle;
 use std::sync::Arc;
+use crate::error::SongbirdError;
 
 #[pyclass(frozen)]
 pub struct PlayerHandler {
@@ -21,17 +22,20 @@ impl PlayerHandler {
         ))
     }
 
-    fn play(&self) {
-        println!("play");
-        self.handle.play().unwrap()
+    fn play(&self) -> PyResult<()> {
+        Ok(self.handle.play().map_err(SongbirdError::from)?)
     }
 
-    fn stop(&self) {
-        self.handle.stop().unwrap()
+    fn stop(&self) -> PyResult<()> {
+        Ok(self.handle.stop().map_err(SongbirdError::from)?)
     }
 
-    fn set_volume(&self, volume: f32) {
-        self.handle.set_volume(volume).unwrap()
+    fn pause(&self) -> PyResult<()> {
+        Ok(self.handle.pause().map_err(SongbirdError::from)?)
+    }
+
+    fn set_volume(&self, volume: f32) -> PyResult<()> {
+        Ok(self.handle.set_volume(volume).map_err(SongbirdError::from)?)
     }
 }
 
