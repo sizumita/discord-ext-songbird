@@ -8,8 +8,7 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="5c75eaf3-a403-4fb9-9733-ddcc0c55088c" name="変更" comment="">
-      <change beforePath="$PROJECT_DIR$/py-src/discord/ext/songbird/backend.pyi" beforeDir="false" afterPath="$PROJECT_DIR$/py-src/discord/ext/songbird/backend.pyi" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/source/raw.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/source/raw.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.github/workflows/release.yml" beforeDir="false" afterPath="$PROJECT_DIR$/.github/workflows/release.yml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
