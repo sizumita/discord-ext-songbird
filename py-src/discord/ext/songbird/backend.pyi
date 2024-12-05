@@ -35,11 +35,25 @@ class RawBufferSource(AudioSource):
     def __init__(self, source: io.BufferedIOBase): ...
 
 class PlayerHandler:
+    """
+    A handler to control the playing track. One handler is created per track.
+    """
+
     queue: QueueHandler
 
     def play(self) -> None:
         """
         Start playing the track that this handler is handling.
+
+        Returns
+        -------
+        None
+        """
+        ...
+
+    def pause(self) -> None:
+        """
+        Pause playing the track that this handler is handling.
 
         Returns
         -------
@@ -72,6 +86,41 @@ class PlayerHandler:
         """
         ...
 
+    def enable_loop(self) -> None:
+        """
+        Enable infinite looping for the track that this handler is handling.
+
+        Returns
+        -------
+        None
+        """
+        ...
+
+    def disable_loop(self) -> None:
+        """
+        Disable infinitelooping for the track that this handler is handling.
+
+        Returns
+        -------
+        None
+        """
+        ...
+
+    def loop_for(self, count: int) -> None:
+        """
+        Enable finite looping for the track that this handler is handling.
+
+        Parameters
+        ----------
+        count : int
+            The number of times to loop the track.
+
+        Returns
+        -------
+        None
+        """
+        ...
+
 class QueueHandler:
     def enqueue(self, track: Track) -> None:
         """
@@ -87,6 +136,7 @@ class QueueHandler:
         None
         """
         ...
+
     def dequeue(self, index: int) -> None:
         """
 

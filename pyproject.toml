@@ -38,7 +38,7 @@ module-name = "discord.ext.songbird.backend"
 features = ["pyo3/extension-module"]
 
 [tool.ruff]
-include = ["py-src/**/*.py", "py-src/**/*.pyi"]
+include = ["py-src/**/*.py", "py-src/**/*.pyi", "examples/**/*.py"]
 line-length = 160
 target-version = "py313"
 

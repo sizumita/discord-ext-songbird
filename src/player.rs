@@ -40,6 +40,18 @@ impl PlayerHandler {
             .set_volume(volume)
             .map_err(SongbirdError::from)?)
     }
+
+    fn enable_loop(&self) -> PyResult<()> {
+        Ok(self.handle.enable_loop().map_err(SongbirdError::from)?)
+    }
+
+    fn disable_loop(&self) -> PyResult<()> {
+        Ok(self.handle.disable_loop().map_err(SongbirdError::from)?)
+    }
+
+    fn loop_for(&self, count: usize) -> PyResult<()> {
+        Ok(self.handle.loop_for(count).map_err(SongbirdError::from)?)
+    }
 }
 
 impl PlayerHandler {
