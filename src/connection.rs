@@ -194,9 +194,7 @@ pub struct DpyVoiceUpdate {
 
 impl DpyVoiceUpdate {
     pub fn new(hook: Py<PyAny>) -> Self {
-        Self {
-            update_hook: hook,
-        }
+        Self { update_hook: hook }
     }
 }
 
