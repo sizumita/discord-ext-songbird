@@ -7,18 +7,7 @@
     <cargoProject FILE="$PROJECT_DIR$/Cargo.toml" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="5c75eaf3-a403-4fb9-9733-ddcc0c55088c" name="変更" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/py-src/discord/ext/songbird/backend.pyi" beforeDir="false" afterPath="$PROJECT_DIR$/py-src/discord/ext/songbird/backend.pyi" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/client.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/client.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/connection.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/connection.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/lib.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/queue.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/queue.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/source.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/source.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/source/raw.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/source/raw.rs" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/track.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/track.rs" afterDir="false" />
-    </list>
+    <list default="true" id="5c75eaf3-a403-4fb9-9733-ddcc0c55088c" name="変更" comment="" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -132,6 +121,6 @@
     <option name="version" value="3" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
-    <SUITE FILE_PATH="coverage/discord_ext_songbird$basic.coverage" NAME="basic のカバレッジ結果" MODIFIED="1733362953598" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/discord_ext_songbird$basic.coverage" NAME="basic のカバレッジ結果" MODIFIED="1733379148280" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>
