@@ -8,12 +8,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="5c75eaf3-a403-4fb9-9733-ddcc0c55088c" name="変更" comment="">
-      <change afterPath="$PROJECT_DIR$/examples/track_handling.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/examples/basic.py" beforeDir="false" afterPath="$PROJECT_DIR$/examples/basic.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/py-src/discord/ext/songbird/backend.pyi" beforeDir="false" afterPath="$PROJECT_DIR$/py-src/discord/ext/songbird/backend.pyi" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/pyproject.toml" beforeDir="false" afterPath="$PROJECT_DIR$/pyproject.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/player.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/player.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/source/raw.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/source/raw.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -48,7 +44,7 @@
     &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.rust.reset.selective.auto.import&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;feature/examples&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
     &quot;last_opened_file_path&quot;: &quot;/Users/sizumita/Workspace/sizumita/discord-ext-songbird&quot;,
     &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
     &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
@@ -123,7 +119,7 @@
       <workItem from="1733307109080" duration="27520000" />
       <workItem from="1733379339258" duration="871000" />
       <workItem from="1733380217475" duration="1527000" />
-      <workItem from="1733388923112" duration="2707000" />
+      <workItem from="1733388923112" duration="7828000" />
     </task>
     <servers />
   </component>

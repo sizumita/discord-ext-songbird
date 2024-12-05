@@ -32,6 +32,10 @@ class AudioSource:
     def get_source(self) -> SourceComposed: ...
 
 class RawBufferSource(AudioSource):
+    """
+    Creates an AudioSource from raw data source.
+    The source must be a Stream of either pcm, wav, mp3, or ogg opus format.
+    """
     def __init__(self, source: io.BufferedIOBase): ...
 
 class PlayerHandler:
@@ -39,7 +43,16 @@ class PlayerHandler:
     A handler to control the playing track. One handler is created per track.
     """
 
-    queue: QueueHandler
+    @property
+    def queue(self) -> QueueHandler:
+        """
+        Returns the queue that this handler belongs to.
+
+        Returns
+        -------
+        QueueHandler
+        """
+        ...
 
     def play(self) -> None:
         """

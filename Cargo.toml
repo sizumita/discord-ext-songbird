@@ -2,7 +2,7 @@
 name = "discord-ext-songbird"
 description = "Library to replace the voice backend of discord.py with Songbird."
 readme = "README.md"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/sizumita/discord-ext-songbird"
@@ -25,4 +25,4 @@ pyo3-async-runtimes = { version = "0.23.0", features = ["tokio", "tokio-runtime"
 async-trait = "0.1.83"
 thiserror = "2.0.4"
 tracing-subscriber = "0.3.19"
-symphonia = { features = ["wav", "pcm"], version = "0.5.2" }
+symphonia = { features = ["wav", "pcm", "mp3"], version = "0.5.2" }
