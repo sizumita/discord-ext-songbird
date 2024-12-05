@@ -24,7 +24,6 @@ impl io::Read for PyBufferIO {
             } else {
                 buf.len()
             };
-            println!("{len} bytes read");
             buf[..len].copy_from_slice(&bytes[..len]);
             Ok(len)
         })?;

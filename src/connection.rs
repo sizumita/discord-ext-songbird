@@ -5,7 +5,7 @@ use songbird::error::{JoinError, JoinResult};
 use songbird::id::{ChannelId, GuildId};
 use songbird::input::Input;
 use songbird::shards::{Shard, VoiceUpdate};
-use songbird::tracks::TrackHandle;
+use songbird::tracks::{Track, TrackHandle, TrackQueue};
 use songbird::{Call, Config};
 use std::fmt::Debug;
 use std::num::NonZeroU64;
@@ -110,16 +110,16 @@ impl VoiceConnection {
         }
     }
 
-    pub async fn is_deaf(&self) -> SongbirdResult<bool> {
-        if let Some(handler) = &mut *self.call.lock().await {
+    pub fn is_deaf(&self) -> SongbirdResult<bool> {
+        if let Some(handler) = &mut *self.call.blocking_lock() {
             Ok(handler.is_deaf())
         } else {
             Err(SongbirdError::ConnectionNotStarted)
         }
     }
 
-    pub async fn is_mute(&self) -> SongbirdResult<bool> {
-        if let Some(handler) = &mut *self.call.lock().await {
+    pub fn is_mute(&self) -> SongbirdResult<bool> {
+        if let Some(handler) = &mut *self.call.blocking_lock() {
             Ok(handler.is_mute())
         } else {
             Err(SongbirdError::ConnectionNotStarted)
@@ -138,9 +138,49 @@ impl VoiceConnection {
         }
     }
 
-    pub async fn play(&self, input: Input) -> SongbirdResult<TrackHandle> {
+    pub async fn enqueue(&self, track: Track) -> SongbirdResult<TrackHandle> {
         if let Some(handler) = &mut *self.call.lock().await {
-            Ok(handler.play_input(input))
+            Ok(handler.enqueue(track).await)
+        } else {
+            Err(SongbirdError::ConnectionNotStarted)
+        }
+    }
+
+    pub fn skip_queue(&self) -> SongbirdResult<()> {
+        if let Some(handler) = &mut *self.call.blocking_lock() {
+            Ok(handler.queue().skip()?)
+        } else {
+            Err(SongbirdError::ConnectionNotStarted)
+        }
+    }
+
+    pub fn stop_queue(&self) -> SongbirdResult<()> {
+        if let Some(handler) = &mut *self.call.blocking_lock() {
+            Ok(handler.queue().stop())
+        } else {
+            Err(SongbirdError::ConnectionNotStarted)
+        }
+    }
+
+    pub fn resume_queue(&self) -> SongbirdResult<()> {
+        if let Some(handler) = &mut *self.call.blocking_lock() {
+            Ok(handler.queue().resume()?)
+        } else {
+            Err(SongbirdError::ConnectionNotStarted)
+        }
+    }
+
+    pub fn get_current_player(&self) -> SongbirdResult<Option<TrackHandle>> {
+        if let Some(handler) = &mut *self.call.blocking_lock() {
+            Ok(handler.queue().current())
+        } else {
+            Err(SongbirdError::ConnectionNotStarted)
+        }
+    }
+
+    pub fn dequeue(&self, index: usize) -> SongbirdResult<Option<TrackHandle>> {
+        if let Some(handler) = &mut *self.call.blocking_lock() {
+            Ok(handler.queue().dequeue(index).map(|x| x.handle()))
         } else {
             Err(SongbirdError::ConnectionNotStarted)
         }

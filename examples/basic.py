@@ -1,4 +1,3 @@
-import asyncio
 import io
 
 import discord
@@ -6,12 +5,13 @@ from discord.ext import songbird
 import os
 
 sine: io.BytesIO
-with open("natori.wav", "rb") as f:
+with open("examples/mono.wav", "rb") as f:
     sine = io.BytesIO(f.read())
 
 
 client = discord.Client(intents=discord.Intents.default())
 
+# Change channel id you want to join
 CHANNEL_ID = 1313754366368550953
 
 @client.event
@@ -19,13 +19,10 @@ async def on_ready():
     print("ready")
     channel: discord.VoiceChannel = client.get_channel(CHANNEL_ID)
     voice_client: songbird.SongbirdClient = await channel.connect(cls=songbird.SongbirdClient)
-    await asyncio.sleep(2)
     source = songbird.RawBufferSource(sine)
-    print("is muted: ", await voice_client.is_mute())
+    track = songbird.Track(source).set_volume(0.5)
 
-    handler = await voice_client.play(source)
-    print(handler)
-    handler.play()
+    await voice_client.queue.enqueue(track)
 
 
 client.run(os.environ["DISCORD_BOT_TOKEN"])

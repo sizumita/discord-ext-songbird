@@ -1,6 +1,6 @@
 from typing import Union, Optional
 
-from .backend import SongbirdBackend, AudioSource
+from .backend import SongbirdBackend, QueueHandler
 import discord
 from discord.types.voice import VoiceServerUpdate as VoiceServerUpdatePayload, GuildVoiceState as GuildVoiceStatePayload  # type: ignore
 
@@ -14,6 +14,10 @@ class SongbirdClient(discord.VoiceProtocol):
         channel_id = getattr(channel, "id", None)
         assert channel_id is not None
         self.songbird = SongbirdBackend(channel_id)
+
+    @property
+    def queue(self) -> QueueHandler:
+        return self.songbird.queue
 
     async def connect(self, *, timeout: float, reconnect: bool, self_deaf: bool = False, self_mute: bool = False) -> None:
         guild_id, key_type = self.channel._get_voice_client_key()
@@ -43,17 +47,14 @@ class SongbirdClient(discord.VoiceProtocol):
     async def deafen(self, deaf: bool) -> None:
         await self.songbird.deafen(deaf=deaf)
 
-    async def is_mute(self) -> bool:
-        return await self.songbird.is_mute()
+    def is_mute(self) -> bool:
+        return self.songbird.is_mute()
 
-    async def is_deaf(self) -> bool:
-        return await self.songbird.is_deaf()
+    def is_deaf(self) -> bool:
+        return self.songbird.is_deaf()
 
     async def move_to(self, channel: Optional[discord.abc.Snowflake]) -> None:
         if channel is None:
             await self.disconnect(force=True)
         else:
             await self.songbird.move_to(channel.id)
-
-    async def play(self, source: AudioSource):
-        return await self.songbird.play_source(source)

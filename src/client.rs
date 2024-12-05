@@ -1,26 +1,32 @@
 use crate::connection::{DpyVoiceUpdate, VoiceConnection};
 use crate::error::{SongbirdError, SongbirdResult};
 use crate::player::PlayerHandler;
+use crate::queue::QueueHandler;
 use crate::source::{AudioSource, SourceComposed};
 use pyo3::prelude::PyAnyMethods;
-use pyo3::{pyclass, pymethods, Bound, IntoPyObject, IntoPyObjectExt, Py, PyAny, PyResult, Python};
+use pyo3::{pyclass, pymethods, Bound, IntoPyObject, Py, PyAny, PyResult, Python};
 use pyo3_async_runtimes::tokio::future_into_py;
 use songbird::input::Input;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[pyclass]
 pub struct SongbirdBackend {
     connection: Arc<VoiceConnection>,
+    #[pyo3(get)]
+    queue: Py<QueueHandler>,
 }
 
 #[pymethods]
 impl SongbirdBackend {
     #[new]
-    pub fn new<'py>(channel_id: u64) -> PyResult<Self> {
+    pub fn new<'py>(py: Python<'py>, channel_id: u64) -> PyResult<Self> {
         let connection = Arc::new(VoiceConnection::new(non_zero_u64(channel_id)?));
-        Ok(Self { connection })
+        let handler = QueueHandler::new(connection.clone());
+        Ok(Self {
+            connection,
+            queue: Py::new(py, handler)?,
+        })
     }
 
     pub fn start<'py>(
@@ -83,26 +89,6 @@ impl SongbirdBackend {
         })
     }
 
-    pub fn play_source<'py>(
-        &self,
-        py: Python<'py>,
-        source: Bound<'py, AudioSource>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let conn = self.connection.clone();
-        let inner = source.call_method0("get_source")?;
-        let composed = inner.downcast_exact::<SourceComposed>()?;
-        let c = composed.get();
-        let input = Input::from(composed.get().0.input());
-        println!("source {:?}", source);
-        future_into_py(py, async move {
-            let handler = PlayerHandler {
-                handle: conn.play(input).await?,
-            };
-            handler.handle.enable_loop().unwrap();
-            Ok(handler)
-        })
-    }
-
     pub fn leave<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let conn = self.connection.clone();
         future_into_py(py, async move { Ok(conn.leave().await?) })
@@ -118,14 +104,12 @@ impl SongbirdBackend {
         future_into_py(py, async move { Ok(conn.deafen(deaf).await?) })
     }
 
-    pub fn is_deaf<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let conn = self.connection.clone();
-        future_into_py(py, async move { Ok(conn.is_deaf().await?) })
+    pub fn is_deaf(&self) -> PyResult<bool> {
+        Ok(self.connection.is_deaf()?)
     }
 
-    pub fn is_mute<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let conn = self.connection.clone();
-        future_into_py(py, async move { Ok(conn.is_mute().await?) })
+    pub fn is_mute(&self) -> PyResult<bool> {
+        Ok(self.connection.is_mute()?)
     }
 
     pub fn move_to<'py>(&self, py: Python<'py>, channel_id: u64) -> PyResult<Bound<'py, PyAny>> {
