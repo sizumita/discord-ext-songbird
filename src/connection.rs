@@ -5,7 +5,7 @@ use songbird::error::{JoinError, JoinResult};
 use songbird::id::{ChannelId, GuildId};
 use songbird::shards::{Shard, VoiceUpdate};
 use songbird::tracks::{Track, TrackHandle};
-use songbird::{Call, Config};
+use songbird::{Call, Config, CoreEvent};
 use std::fmt::Debug;
 use std::num::NonZeroU64;
 use std::sync::Arc;

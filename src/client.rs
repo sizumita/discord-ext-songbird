@@ -6,12 +6,14 @@ use pyo3::{pyclass, pymethods, Bound, Py, PyAny, PyResult, Python};
 use pyo3_async_runtimes::tokio::future_into_py;
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use crate::event_receiver::VoiceEventReceiver;
 
 #[pyclass]
 pub struct SongbirdBackend {
     connection: Arc<VoiceConnection>,
     #[pyo3(get)]
     queue: Py<QueueHandler>,
+    event_receiver: Arc<VoiceEventReceiver>,
 }
 
 #[pymethods]
@@ -23,6 +25,7 @@ impl SongbirdBackend {
         Ok(Self {
             connection,
             queue: Py::new(py, handler)?,
+            event_receiver: Arc::new(VoiceEventReceiver::new()),
         })
     }
 
@@ -117,6 +120,10 @@ impl SongbirdBackend {
         future_into_py(py, async move {
             Ok(conn.move_to(non_zero_u64(channel_id)?).await?)
         })
+    }
+
+    pub fn register_receiver(&self) {
+
     }
 }
 
