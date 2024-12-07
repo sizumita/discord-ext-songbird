@@ -31,16 +31,19 @@ impl RawBufferSource {
         Python::with_gil(|py| {
             Py::new(
                 py,
-                SourceComposed(Box::new(RawSourceInner(Arc::new(
-                    self.source.clone_ref(py),
-                )))),
+                SourceComposed(Box::new(RawSourceInner(self.source.clone_ref(py)))),
             )
         })
     }
 }
 
-#[derive(Clone)]
-struct RawSourceInner(Arc<Py<PyAny>>);
+struct RawSourceInner(Py<PyAny>);
+
+impl Clone for RawSourceInner {
+    fn clone(&self) -> Self {
+        Self(Python::with_gil(|py| self.0.clone_ref(py)))
+    }
+}
 
 impl IntoSongbirdSource for RawSourceInner {
     fn input(&self) -> Input {

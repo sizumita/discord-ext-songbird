@@ -39,7 +39,7 @@ features = ["pyo3/extension-module"]
 
 [tool.ruff]
 include = ["py-src/**/*.py", "py-src/**/*.pyi", "examples/**/*.py"]
-line-length = 160
+line-length = 120
 target-version = "py313"
 
 [tool.ruff.lint]

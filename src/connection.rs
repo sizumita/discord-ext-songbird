@@ -27,12 +27,12 @@ impl VoiceConnection {
 
     pub async fn start(
         &self,
+        config: Config,
         updater: DpyVoiceUpdate,
         client_id: NonZeroU64,
         guild_id: NonZeroU64,
     ) {
         let shard = Shard::Generic(Arc::new(updater));
-        let config = Config::default();
 
         let call = Call::from_config(guild_id, shard, client_id, config);
         {
