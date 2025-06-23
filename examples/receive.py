@@ -75,7 +75,7 @@ async def on_message(message):
 
     elif message.content == "!leave":
         if message.guild.voice_client:
-            await message.guild.voice_client.disconnect()
+            await message.guild.voice_client.disconnect(force=false)
             await message.reply("Left the voice channel!")
         else:
             await message.reply("I'm not in a voice channel!")

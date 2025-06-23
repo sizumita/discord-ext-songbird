@@ -279,12 +279,33 @@ class VoiceReceiver(ABC):
     """Base class for receiving voice data from Discord voice channels."""
 
     def voice_tick(self, tick: VoiceTick) -> None:
-        """Called when a voice tick is received.
+        """Called when a voice tick is received from the voice connection.
+        
+        This method is called periodically (typically every 20ms) with voice data
+        from all users currently speaking in the voice channel. Each tick contains
+        both raw RTP packet data and decoded PCM audio data when available.
 
         Parameters
         ----------
         tick: VoiceTick
             The voice tick containing audio data from all speaking users.
+            
+            - tick.speaking: Dict mapping SSRC (Synchronization Source) to VoiceData
+              for each user currently transmitting audio in this tick.
+            - tick.silent: List of SSRCs that were speaking in previous ticks but
+              are silent in this tick.
+              
+            For each VoiceData in tick.speaking:
+            - packet: Raw RTP packet data including sequence number, timestamp,
+              and payload. Available when decode_mode is Pass or Decrypt.
+            - decoded_voice: Decoded 16-bit PCM audio data at 48kHz sample rate.
+              Available when decode_mode is Decode. The data is interleaved for
+              stereo channels or mono for single channel.
+        
+        Note
+        ----
+        The SSRC (Synchronization Source) is a unique identifier for each audio
+        stream. Use speaking_update() to map SSRCs to Discord user IDs.
         """
         pass
 
