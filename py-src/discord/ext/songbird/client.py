@@ -163,17 +163,17 @@ class SongbirdClient(discord.VoiceProtocol):
             await self.disconnect(force=True)
         else:
             await self.songbird.move_to(channel.id)
-    
+
     async def register_receiver(self, receiver: VoiceReceiver) -> None:
         """|coro|
-        
+
         Register a voice receiver to handle incoming voice data.
-        
+
         Parameters
         ----------
         receiver: VoiceReceiver
             An instance of a class that inherits from VoiceReceiver to handle voice events.
-        
+
         Returns
         -------
         None
