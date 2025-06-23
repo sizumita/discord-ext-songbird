@@ -1,3 +1,4 @@
+use crate::config::ConfigBuilder;
 use crate::connection::{DpyVoiceUpdate, VoiceConnection};
 use crate::error::{SongbirdError, SongbirdResult};
 use crate::queue::QueueHandler;
@@ -28,13 +29,16 @@ impl SongbirdBackend {
     pub fn start<'py>(
         &self,
         py: Python<'py>,
+        config: &Bound<'py, ConfigBuilder>,
         shard_hook: Py<PyAny>,
         client_id: u64,
         guild_id: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let conn = self.connection.clone();
+        let cfg = config.borrow().config.clone();
         future_into_py(py, async move {
             conn.start(
+                cfg,
                 DpyVoiceUpdate::new(shard_hook),
                 non_zero_u64(client_id)?,
                 non_zero_u64(guild_id)?,

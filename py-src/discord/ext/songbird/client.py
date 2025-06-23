@@ -1,6 +1,7 @@
-from typing import Union, Optional
+from __future__ import annotations
+from typing import Union, Optional, Callable
 
-from .backend import SongbirdBackend, QueueHandler
+from .backend import SongbirdBackend, QueueHandler, ConfigBuilder
 import discord
 from discord.types.voice import VoiceServerUpdate as VoiceServerUpdatePayload, GuildVoiceState as GuildVoiceStatePayload  # type: ignore
 
@@ -14,6 +15,30 @@ class SongbirdClient(discord.VoiceProtocol):
         channel_id = getattr(channel, "id", None)
         assert channel_id is not None
         self.songbird = SongbirdBackend(channel_id)
+        self.config = ConfigBuilder()
+
+    @classmethod
+    def WithConfig(cls, config: ConfigBuilder) -> Callable[[discord.Client, discord.abc.Connectable], SongbirdClient]:
+        """
+        Get SongbirdClient class with coustom config.
+
+        Parameters
+        ----------
+        config: ConfigBuilder
+            custom config
+
+        Returns
+        -------
+        SongbirdClient
+            class initializer with custom config.
+        """
+
+        def inner(client: discord.Client, channel: discord.abc.Connectable) -> SongbirdClient:
+            self_ = SongbirdClient(client, channel)
+            self_.config = config
+            return self_
+
+        return inner
 
     @property
     def queue(self) -> QueueHandler:
@@ -27,11 +52,13 @@ class SongbirdClient(discord.VoiceProtocol):
         """
         return self.songbird.queue
 
-    async def connect(self, *, timeout: float, reconnect: bool, self_deaf: bool = False, self_mute: bool = False) -> None:
+    async def connect(
+        self, *, timeout: float, reconnect: bool, self_deaf: bool = False, self_mute: bool = False
+    ) -> None:
         guild_id, key_type = self.channel._get_voice_client_key()
         assert key_type == "guild_id"
         assert self.client.application_id is not None
-        await self.songbird.start(self.update_hook, self.client.application_id, guild_id)
+        await self.songbird.start(self.config, self.update_hook, self.client.application_id, guild_id)
         await self.songbird.connect(timeout, self_deaf, self_mute)
 
     async def disconnect(self, *, force: bool) -> None:
@@ -59,7 +86,9 @@ class SongbirdClient(discord.VoiceProtocol):
 
     async def update_hook(self, channel_id: Optional[int], self_mute: bool, self_deaf: bool) -> None:
         await self.channel.guild.change_voice_state(
-            channel=None if channel_id is None else discord.Object(id=channel_id), self_mute=self_mute, self_deaf=self_deaf
+            channel=None if channel_id is None else discord.Object(id=channel_id),
+            self_mute=self_mute,
+            self_deaf=self_deaf,
         )
 
     async def mute(self, mute: bool) -> None:

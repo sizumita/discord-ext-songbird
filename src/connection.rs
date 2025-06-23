@@ -5,7 +5,7 @@ use songbird::error::{JoinError, JoinResult};
 use songbird::id::{ChannelId, GuildId};
 use songbird::shards::{Shard, VoiceUpdate};
 use songbird::tracks::{Track, TrackHandle};
-use songbird::{Call, Config};
+use songbird::{Call, Config, CoreEvent};
 use std::fmt::Debug;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -27,12 +27,12 @@ impl VoiceConnection {
 
     pub async fn start(
         &self,
+        config: Config,
         updater: DpyVoiceUpdate,
         client_id: NonZeroU64,
         guild_id: NonZeroU64,
     ) {
         let shard = Shard::Generic(Arc::new(updater));
-        let config = Config::default();
 
         let call = Call::from_config(guild_id, shard, client_id, config);
         {

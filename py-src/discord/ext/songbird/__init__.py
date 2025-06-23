@@ -1,27 +1,27 @@
 from .backend import (
-    SongbirdBackend,
-    SongbirdError,
-    JoinError,
-    ConnectionNotInitialized,
     AudioSource,
-    SourceComposed,
     RawBufferSource,
+    PlayerHandler,
     QueueHandler,
-    IntoTrack,
+    VoiceEventReceiver,
+    ConfigBuilder,
+    PyCryptoMode,
+    PyDecodeMode,
+    PyChannels,
 )
 from .client import SongbirdClient
 from .track import Track
 
 __all__ = [
-    "SongbirdBackend",
-    "SongbirdError",
-    "JoinError",
-    "ConnectionNotInitialized",
     "SongbirdClient",
-    "AudioSource",
-    "SourceComposed",
-    "RawBufferSource",
-    "QueueHandler",
     "Track",
-    "IntoTrack",
+    "AudioSource",
+    "RawBufferSource",
+    "PlayerHandler",
+    "QueueHandler",
+    "VoiceEventReceiver",
+    "ConfigBuilder",
+    "PyCryptoMode",
+    "PyDecodeMode",
+    "PyChannels",
 ]
