@@ -3,7 +3,6 @@ mod client;
 mod config;
 mod connection;
 mod error;
-mod event_receiver;
 mod player;
 mod queue;
 mod source;
