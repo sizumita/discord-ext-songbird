@@ -228,22 +228,22 @@ class PyChannels:
 
 class RtpData:
     """Raw RTP packet data."""
-    
+
     @property
     def sequence(self) -> int:
         """The RTP sequence number."""
         ...
-    
-    @property 
+
+    @property
     def timestamp(self) -> int:
         """The RTP timestamp."""
         ...
-    
+
     @property
     def payload(self) -> bytes:
         """The RTP payload (audio data)."""
         ...
-    
+
     @property
     def packet(self) -> bytes:
         """The complete RTP packet."""
@@ -251,12 +251,12 @@ class RtpData:
 
 class VoiceData:
     """Voice data received from a user."""
-    
+
     @property
     def packet(self) -> Optional[RtpData]:
         """Raw RTP packet data if available."""
         ...
-    
+
     @property
     def decoded_voice(self) -> Optional[bytes]:
         """Decoded PCM audio data if available."""
@@ -264,12 +264,12 @@ class VoiceData:
 
 class VoiceTick:
     """A single tick of voice data from all speaking users."""
-    
+
     @property
     def speaking(self) -> Dict[int, VoiceData]:
         """Dictionary mapping SSRC to voice data for all currently speaking users."""
         ...
-    
+
     @property
     def silent(self) -> List[int]:
         """List of SSRCs that are silent in this tick."""
@@ -280,7 +280,7 @@ class VoiceReceiver(ABC):
 
     def voice_tick(self, tick: VoiceTick) -> None:
         """Called when a voice tick is received from the voice connection.
-        
+
         This method is called periodically (typically every 20ms) with voice data
         from all users currently speaking in the voice channel. Each tick contains
         both raw RTP packet data and decoded PCM audio data when available.
@@ -289,19 +289,19 @@ class VoiceReceiver(ABC):
         ----------
         tick: VoiceTick
             The voice tick containing audio data from all speaking users.
-            
+
             - tick.speaking: Dict mapping SSRC (Synchronization Source) to VoiceData
               for each user currently transmitting audio in this tick.
             - tick.silent: List of SSRCs that were speaking in previous ticks but
               are silent in this tick.
-              
+
             For each VoiceData in tick.speaking:
             - packet: Raw RTP packet data including sequence number, timestamp,
               and payload. Available when decode_mode is Pass or Decrypt.
             - decoded_voice: Decoded 16-bit PCM audio data at 48kHz sample rate.
               Available when decode_mode is Decode. The data is interleaved for
               stereo channels or mono for single channel.
-        
+
         Note
         ----
         The SSRC (Synchronization Source) is a unique identifier for each audio

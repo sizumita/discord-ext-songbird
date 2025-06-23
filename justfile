@@ -1,8 +1,8 @@
 fmt:
     cargo fmt
-    uvx ruff check --fix
+    uvx ruff format
 check:
     cargo clippy
-    uvx ruff check
+    uvx ruff check py-src
 build:
     uvx maturin develop
