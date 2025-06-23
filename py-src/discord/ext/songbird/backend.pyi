@@ -1,5 +1,6 @@
 import io
-from typing import Any, Callable, Optional, Coroutine, TYPE_CHECKING, Self
+from abc import ABC
+from typing import Any, Callable, Optional, Coroutine, TYPE_CHECKING, Self, Dict, List
 
 if TYPE_CHECKING:
     from .track import Track
@@ -224,3 +225,91 @@ class PyDecodeMode:
 class PyChannels:
     class Mono: ...
     class Stereo: ...
+
+class RtpData:
+    """Raw RTP packet data."""
+    
+    @property
+    def sequence(self) -> int:
+        """The RTP sequence number."""
+        ...
+    
+    @property 
+    def timestamp(self) -> int:
+        """The RTP timestamp."""
+        ...
+    
+    @property
+    def payload(self) -> bytes:
+        """The RTP payload (audio data)."""
+        ...
+    
+    @property
+    def packet(self) -> bytes:
+        """The complete RTP packet."""
+        ...
+
+class VoiceData:
+    """Voice data received from a user."""
+    
+    @property
+    def packet(self) -> Optional[RtpData]:
+        """Raw RTP packet data if available."""
+        ...
+    
+    @property
+    def decoded_voice(self) -> Optional[bytes]:
+        """Decoded PCM audio data if available."""
+        ...
+
+class VoiceTick:
+    """A single tick of voice data from all speaking users."""
+    
+    @property
+    def speaking(self) -> Dict[int, VoiceData]:
+        """Dictionary mapping SSRC to voice data for all currently speaking users."""
+        ...
+    
+    @property
+    def silent(self) -> List[int]:
+        """List of SSRCs that are silent in this tick."""
+        ...
+
+class VoiceReceiver(ABC):
+    """Base class for receiving voice data from Discord voice channels."""
+
+    def voice_tick(self, tick: VoiceTick) -> None:
+        """Called when a voice tick is received.
+
+        Parameters
+        ----------
+        tick: VoiceTick
+            The voice tick containing audio data from all speaking users.
+        """
+        pass
+
+    def speaking_update(self, ssrc: int, user_id: int, speaking: bool) -> None:
+        """Called when a user starts or stops speaking.
+
+        Parameters
+        ----------
+        ssrc: int
+            The synchronization source identifier.
+        user_id: int
+            The Discord user ID.
+        speaking: bool
+            Whether the user is speaking.
+        """
+        pass
+
+    def driver_connect(self) -> None:
+        """Called when the driver successfully connects to voice."""
+        pass
+
+    def driver_disconnect(self) -> None:
+        """Called when the driver disconnects from voice."""
+        pass
+
+    def driver_reconnect(self) -> None:
+        """Called when the driver reconnects to voice."""
+        pass

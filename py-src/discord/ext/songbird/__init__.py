@@ -13,7 +13,6 @@ from .backend import (
 )
 from .client import SongbirdClient
 from .track import Track
-from .receiver import VoiceReceiver
 
 __all__ = [
     "SongbirdClient",
