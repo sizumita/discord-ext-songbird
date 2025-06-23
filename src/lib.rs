@@ -5,9 +5,9 @@ mod connection;
 mod error;
 mod player;
 mod queue;
+mod sink;
 mod source;
 mod track;
-mod sink;
 
 use pyo3::prelude::*;
 

@@ -1,11 +1,9 @@
 use pyo3::prelude::*;
-use songbird::EventContext;
 use songbird::events::context_data::VoiceTick;
+use songbird::EventContext;
 
 #[pyclass(subclass)]
-pub struct AudioSink {
-
-}
+pub struct AudioSink {}
 
 #[pymethods]
 impl AudioSink {
@@ -16,6 +14,5 @@ impl AudioSink {
 }
 
 impl AudioSink {
-    pub fn receive_tick(&mut self, tick: &VoiceTick) {
-    }
+    pub fn receive_tick(&mut self, tick: &VoiceTick) {}
 }
