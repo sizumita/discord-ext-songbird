@@ -8,16 +8,22 @@ class VoiceReceiver(songbird.VoiceReceiver):
     def __init__(self):
         self.ssrc_to_user = {}
         
-    async def voice_packet(self, ssrc: int, packet: songbird.VoicePacket) -> None:
-        """Handle incoming voice packets."""
-        print(f"Received voice packet from SSRC: {ssrc}")
-        print(f"  Sequence: {packet.sequence}, Timestamp: {packet.timestamp}")
-        print(f"  RTP data length: {len(packet.rtp_data)} bytes")
-        print(f"  Opus data length: {len(packet.opus_data)} bytes")
-        if packet.decoded_voice:
-            print(f"  Decoded voice data length: {len(packet.decoded_voice)} bytes (16-bit PCM)")
+    def voice_tick(self, tick) -> None:
+        """Handle incoming voice tick."""
+        for ssrc, voice_data in tick.speaking:
+            print(f"Received voice data from SSRC: {ssrc}")
+            if voice_data.packet:
+                print(f"  RTP sequence: {voice_data.packet.sequence}")
+                print(f"  RTP timestamp: {voice_data.packet.timestamp}")
+                print(f"  RTP payload length: {len(voice_data.packet.payload)} bytes")
+                print(f"  RTP packet length: {len(voice_data.packet.packet)} bytes")
+            if voice_data.decoded_voice:
+                print(f"  Decoded voice data length: {len(voice_data.decoded_voice)} bytes (16-bit PCM)")
+        
+        if tick.silent:
+            print(f"Silent SSRCs: {tick.silent}")
     
-    async def speaking_update(self, ssrc: int, user_id: int, speaking: bool) -> None:
+    def speaking_update(self, ssrc: int, user_id: int, speaking: bool) -> None:
         """Handle speaking state updates."""
         if user_id:
             self.ssrc_to_user[ssrc] = user_id
@@ -28,15 +34,15 @@ class VoiceReceiver(songbird.VoiceReceiver):
             user_str = f"User {user_id}" if user_id else "Unknown user"
             print(f"{user_str} (SSRC: {ssrc}) stopped speaking")
     
-    async def driver_connect(self) -> None:
+    def driver_connect(self) -> None:
         """Handle driver connection."""
         print("Voice driver connected")
     
-    async def driver_disconnect(self) -> None:
+    def driver_disconnect(self) -> None:
         """Handle driver disconnection."""
         print("Voice driver disconnected")
     
-    async def driver_reconnect(self) -> None:
+    def driver_reconnect(self) -> None:
         """Handle driver reconnection."""
         print("Voice driver reconnected")
 

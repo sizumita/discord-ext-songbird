@@ -22,7 +22,9 @@ fn discord_ext_songbird_backend(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyRe
     m.add_class::<player::PlayerHandler>()?;
     m.add_class::<queue::QueueHandler>()?;
     m.add_class::<track::IntoTrack>()?;
-    m.add_class::<receiver::PyVoicePacket>()?;
+    m.add_class::<receiver::VoiceTick>()?;
+    m.add_class::<receiver::VoiceData>()?;
+    m.add_class::<receiver::RtpData>()?;
     m.add_class::<config::ConfigBuilder>()?;
     m.add_class::<config::crypto_mode::PyCryptoMode>()?;
     m.add_class::<config::decode_mode::PyDecodeMode>()?;

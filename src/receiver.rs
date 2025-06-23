@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use pyo3_async_runtimes::tokio::into_future;
 use songbird::{
     events::{EventContext, EventHandler},
     model::payload::Speaking,
@@ -10,30 +9,31 @@ use songbird::{
 
 #[pyclass]
 #[derive(Clone)]
-pub struct PyVoicePacket {
+pub struct VoiceTick {
     #[pyo3(get)]
-    pub ssrc: u32,
+    pub speaking: Vec<(u32, VoiceData)>,
+    pub silent: std::collections::HashSet<u32>,
+}
+
+#[pymethods]
+impl VoiceTick {
+    #[getter]
+    fn silent(&self, py: Python<'_>) -> pyo3::PyResult<pyo3::PyObject> {
+        let set = pyo3::types::PySet::new(py, &self.silent)?;
+        Ok(set.into())
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct VoiceData {
     #[pyo3(get)]
-    pub sequence: Option<u16>,
-    #[pyo3(get)]
-    pub timestamp: Option<u32>,
-    pub opus_data: Vec<u8>,
-    pub rtp_data: Vec<u8>,
+    pub packet: Option<RtpData>,
     pub decoded_voice: Option<Vec<i16>>,
 }
 
 #[pymethods]
-impl PyVoicePacket {
-    #[getter]
-    fn opus_data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.opus_data)
-    }
-
-    #[getter]
-    fn rtp_data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.rtp_data)
-    }
-
+impl VoiceData {
     #[getter]
     fn decoded_voice<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
         self.decoded_voice.as_ref().map(|voice| {
@@ -43,6 +43,30 @@ impl PyVoicePacket {
                 .collect();
             PyBytes::new(py, &bytes)
         })
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
+pub struct RtpData {
+    #[pyo3(get)]
+    pub sequence: u16,
+    #[pyo3(get)]
+    pub timestamp: u32,
+    pub payload: Vec<u8>,
+    pub packet: Vec<u8>,
+}
+
+#[pymethods]
+impl RtpData {
+    #[getter]
+    fn payload<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.payload)
+    }
+
+    #[getter]
+    fn packet<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.packet)
     }
 }
 
@@ -71,52 +95,47 @@ impl EventHandler for ReceiverAdapter {
 
         match ctx {
             EventContext::VoiceTick(tick) => {
-                // Handle speaking users (those with voice data)
-                for (ssrc, voice_data) in &tick.speaking {
-                    let (sequence, timestamp, opus_data, rtp_data) =
-                        if let Some(packet) = &voice_data.packet {
-                            let rtp_packet = packet.rtp();
-                            let payload_start = packet.payload_offset;
-                            let payload_end = packet.packet.len() - packet.payload_end_pad;
-                            let payload = if payload_start < payload_end {
-                                packet.packet[payload_start..payload_end].to_vec()
-                            } else {
-                                Vec::new()
-                            };
-                            (
-                                Some(rtp_packet.get_sequence().into()),
-                                Some(rtp_packet.get_timestamp().into()),
-                                payload,
-                                packet.packet.to_vec(),
-                            )
-                        } else {
-                            // Packet was lost, but we might have decoded audio
-                            (None, None, Vec::new(), Vec::new())
-                        };
+                let mut speaking_data = Vec::new();
+                let silent_data: std::collections::HashSet<u32> = tick.silent.iter().cloned().collect();
 
-                    let packet = PyVoicePacket {
-                        ssrc: *ssrc,
-                        sequence,
-                        timestamp,
-                        opus_data,
-                        rtp_data,
+                // Convert speaking users data
+                for (ssrc, voice_data) in &tick.speaking {
+                    let rtp_packet = if let Some(packet) = &voice_data.packet {
+                        let rtp_packet = packet.rtp();
+                        let payload_start = packet.payload_offset;
+                        let payload_end = packet.packet.len() - packet.payload_end_pad;
+                        let payload = if payload_start < payload_end {
+                            packet.packet[payload_start..payload_end].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        
+                        Some(RtpData {
+                            sequence: rtp_packet.get_sequence().into(),
+                            timestamp: rtp_packet.get_timestamp().into(),
+                            payload,
+                            packet: packet.packet.to_vec(),
+                        })
+                    } else {
+                        None
+                    };
+
+                    let py_voice_data = VoiceData {
+                        packet: rtp_packet,
                         decoded_voice: voice_data.decoded_voice.clone(),
                     };
 
-                    let ssrc = *ssrc;
-
-                    if let Ok(future) = Python::with_gil(|py| {
-                        // Call the Python method and get the coroutine
-                        py_receiver
-                            .call_method1(py, "voice_packet", (ssrc, packet))
-                            .and_then(|coro| {
-                                let bound_coro = coro.into_bound(py);
-                                into_future(bound_coro)
-                            })
-                    }) {
-                        let _ = future.await;
-                    }
+                    speaking_data.push((*ssrc, py_voice_data));
                 }
+
+                let py_voice_tick = VoiceTick {
+                    speaking: speaking_data,
+                    silent: silent_data,
+                };
+
+                Python::with_gil(|py| {
+                    let _ = py_receiver.call_method1(py, "voice_tick", (py_voice_tick,));
+                });
             }
             EventContext::SpeakingStateUpdate(Speaking {
                 ssrc,
@@ -128,52 +147,24 @@ impl EventHandler for ReceiverAdapter {
                 let is_speaking = !speaking.is_empty();
                 let data = (*ssrc, user_id.map(|id| id.0), is_speaking);
 
-                if let Ok(future) = Python::with_gil(|py| {
-                    py_receiver
-                        .call_method1(py, "speaking_update", data)
-                        .and_then(|coro| {
-                            let bound_coro = coro.into_bound(py);
-                            into_future(bound_coro)
-                        })
-                }) {
-                    let _ = future.await;
-                }
+                Python::with_gil(|py| {
+                    let _ = py_receiver.call_method1(py, "speaking_update", data);
+                });
             }
             EventContext::DriverConnect(_) => {
-                if let Ok(future) = Python::with_gil(|py| {
-                    py_receiver
-                        .call_method0(py, "driver_connect")
-                        .and_then(|coro| {
-                            let bound_coro = coro.into_bound(py);
-                            into_future(bound_coro)
-                        })
-                }) {
-                    let _ = future.await;
-                }
+                Python::with_gil(|py| {
+                    let _ = py_receiver.call_method0(py, "driver_connect");
+                });
             }
             EventContext::DriverDisconnect(_) => {
-                if let Ok(future) = Python::with_gil(|py| {
-                    py_receiver
-                        .call_method0(py, "driver_disconnect")
-                        .and_then(|coro| {
-                            let bound_coro = coro.into_bound(py);
-                            into_future(bound_coro)
-                        })
-                }) {
-                    let _ = future.await;
-                }
+                Python::with_gil(|py| {
+                    let _ = py_receiver.call_method0(py, "driver_disconnect");
+                });
             }
             EventContext::DriverReconnect(_) => {
-                if let Ok(future) = Python::with_gil(|py| {
-                    py_receiver
-                        .call_method0(py, "driver_reconnect")
-                        .and_then(|coro| {
-                            let bound_coro = coro.into_bound(py);
-                            into_future(bound_coro)
-                        })
-                }) {
-                    let _ = future.await;
-                }
+                Python::with_gil(|py| {
+                    let _ = py_receiver.call_method0(py, "driver_reconnect");
+                });
             }
             _ => {}
         }
