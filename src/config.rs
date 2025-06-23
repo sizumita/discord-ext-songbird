@@ -6,7 +6,7 @@ use crate::config::decode_mode::{PyChannels, PyDecodeMode};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 use pyo3::IntoPyObjectExt;
-use songbird::driver::{CryptoMode, DecodeMode};
+use songbird::driver::DecodeMode;
 use songbird::Config;
 
 #[pyclass]

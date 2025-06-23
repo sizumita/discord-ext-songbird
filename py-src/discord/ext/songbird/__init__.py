@@ -3,7 +3,6 @@ from .backend import (
     RawBufferSource,
     PlayerHandler,
     QueueHandler,
-    VoiceEventReceiver,
     ConfigBuilder,
     PyCryptoMode,
     PyDecodeMode,
@@ -11,6 +10,7 @@ from .backend import (
 )
 from .client import SongbirdClient
 from .track import Track
+from .receiver import VoiceReceiver, VoicePacket
 
 __all__ = [
     "SongbirdClient",
@@ -19,7 +19,8 @@ __all__ = [
     "RawBufferSource",
     "PlayerHandler",
     "QueueHandler",
-    "VoiceEventReceiver",
+    "VoiceReceiver",
+    "VoicePacket",
     "ConfigBuilder",
     "PyCryptoMode",
     "PyDecodeMode",

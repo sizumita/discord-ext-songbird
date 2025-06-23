@@ -1,11 +1,12 @@
 use crate::error::{SongbirdError, SongbirdResult};
+use crate::receiver::ReceiverAdapter;
 use async_trait::async_trait;
 use pyo3::{Py, PyAny, Python};
 use songbird::error::{JoinError, JoinResult};
 use songbird::id::{ChannelId, GuildId};
 use songbird::shards::{Shard, VoiceUpdate};
 use songbird::tracks::{Track, TrackHandle};
-use songbird::{Call, Config, CoreEvent};
+use songbird::{Call, Config, CoreEvent, Event};
 use std::fmt::Debug;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -133,6 +134,22 @@ impl VoiceConnection {
         if let Some(handler) = &mut *self.call.lock().await {
             let r = handler.join(channel_id).await?;
             Ok(r.await?)
+        } else {
+            Err(SongbirdError::ConnectionNotStarted)
+        }
+    }
+
+    pub async fn register_receiver(&self, receiver: ReceiverAdapter) -> SongbirdResult<()> {
+        if let Some(handler) = &mut *self.call.lock().await {
+            handler.add_global_event(
+                Event::Core(CoreEvent::SpeakingStateUpdate),
+                receiver.clone(),
+            );
+            handler.add_global_event(Event::Core(CoreEvent::VoiceTick), receiver.clone());
+            handler.add_global_event(Event::Core(CoreEvent::DriverConnect), receiver.clone());
+            handler.add_global_event(Event::Core(CoreEvent::DriverReconnect), receiver.clone());
+            handler.add_global_event(Event::Core(CoreEvent::DriverDisconnect), receiver);
+            Ok(())
         } else {
             Err(SongbirdError::ConnectionNotStarted)
         }
