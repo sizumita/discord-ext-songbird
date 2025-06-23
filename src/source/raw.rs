@@ -6,7 +6,6 @@ use pyo3::{PyTraverseError, PyVisit};
 use songbird::input::core::io::MediaSource;
 use songbird::input::core::probe::Hint;
 use songbird::input::{AudioStream, AudioStreamError, Compose, Input};
-use std::sync::Arc;
 
 /// Creates an AudioSource from raw data source.
 /// The source must be a Stream of either pcm, wav, mp3, or ogg opus format.

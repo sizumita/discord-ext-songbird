@@ -15,9 +15,6 @@ source venv/bin/activate
 
 # Build and install the Rust extension locally
 maturin develop
-
-# Build release version
-maturin build --release
 ```
 
 ### Code Quality
@@ -79,3 +76,4 @@ python examples/track_handling.py
 - Voice receiving functionality is still work in progress
 - Examples require a valid Discord bot token
 - The backend.so file is generated during build and should not be committed
+- venv dir is venv
