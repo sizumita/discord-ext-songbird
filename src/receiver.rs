@@ -96,7 +96,8 @@ impl EventHandler for ReceiverAdapter {
         match ctx {
             EventContext::VoiceTick(tick) => {
                 let mut speaking_data = Vec::new();
-                let silent_data: std::collections::HashSet<u32> = tick.silent.iter().cloned().collect();
+                let silent_data: std::collections::HashSet<u32> =
+                    tick.silent.iter().cloned().collect();
 
                 // Convert speaking users data
                 for (ssrc, voice_data) in &tick.speaking {
@@ -109,7 +110,7 @@ impl EventHandler for ReceiverAdapter {
                         } else {
                             Vec::new()
                         };
-                        
+
                         Some(RtpData {
                             sequence: rtp_packet.get_sequence().into(),
                             timestamp: rtp_packet.get_timestamp().into(),
