@@ -82,9 +82,4 @@ async def on_message(message):
 
 
 if __name__ == "__main__":
-    token = os.environ.get("DISCORD_BOT_TOKEN")
-    if not token:
-        print("Please set DISCORD_BOT_TOKEN environment variable")
-        exit(1)
-
-    client.run(token)
+    client.run(os.environ["DISCORD_BOT_TOKEN"])

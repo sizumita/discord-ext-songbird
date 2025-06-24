@@ -10,6 +10,7 @@ from .backend import (
     VoiceTick,
     VoiceData,
     RtpData,
+    VoiceReceiver,
 )
 from .client import SongbirdClient
 from .track import Track

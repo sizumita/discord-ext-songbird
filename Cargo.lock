@@ -485,15 +485,12 @@ name = "discord-ext-songbird"
 version = "0.2.1"
 dependencies = [
  "async-trait",
- "discortp",
  "pyo3",
  "pyo3-async-runtimes",
  "songbird",
  "symphonia",
  "thiserror 2.0.12",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

@@ -19,7 +19,9 @@ CHANNEL_ID = 1313754366368550953
 @client.event
 async def on_ready():
     print("ready")
-    channel: discord.VoiceChannel = client.get_channel(CHANNEL_ID)
+    channel = client.get_channel(CHANNEL_ID)
+    if not isinstance(channel, discord.VoiceChannel):
+        return
     voice_client = await channel.connect(cls=songbird.SongbirdClient)
     source = songbird.RawBufferSource(sine)
     track = songbird.Track(source)

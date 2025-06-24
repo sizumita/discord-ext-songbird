@@ -11,7 +11,9 @@ CHANNEL_ID = 1313754366368550953
 @client.event
 async def on_ready():
     print("ready")
-    channel: discord.VoiceChannel = client.get_channel(CHANNEL_ID)
+    channel = client.get_channel(CHANNEL_ID)
+    if not isinstance(channel, discord.VoiceChannel):
+        return
     await channel.connect(cls=songbird.SongbirdClient.WithConfig(songbird.ConfigBuilder.send_only()))
 
 

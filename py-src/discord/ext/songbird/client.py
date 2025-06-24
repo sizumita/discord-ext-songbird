@@ -1,8 +1,7 @@
 from __future__ import annotations
 from typing import Union, Optional, Callable
 
-from .backend import SongbirdBackend, QueueHandler, ConfigBuilder
-from .receiver import VoiceReceiver
+from .backend import SongbirdBackend, QueueHandler, ConfigBuilder, VoiceReceiver
 import discord
 from discord.types.voice import VoiceServerUpdate as VoiceServerUpdatePayload, GuildVoiceState as GuildVoiceStatePayload  # type: ignore
 
