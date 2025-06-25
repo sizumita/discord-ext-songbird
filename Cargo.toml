@@ -2,7 +2,7 @@
 name = "discord-ext-songbird"
 description = "Library to replace the voice backend of discord.py with Songbird."
 readme = "README.md"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/sizumita/discord-ext-songbird"
