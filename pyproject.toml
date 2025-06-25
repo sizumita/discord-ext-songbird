@@ -27,7 +27,6 @@ build-backend = "maturin"
 dev = [
     "hatchling>=1.26.3",
     "maturin>=1.7.6",
-    "memray>=1.17.2",
 ]
 
 [tool.maturin]
