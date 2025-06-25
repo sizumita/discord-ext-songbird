@@ -1,3 +1,4 @@
+use crate::client::SongbirdBackend;
 use async_trait::async_trait;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -6,6 +7,7 @@ use songbird::{
     model::payload::Speaking,
     Event,
 };
+use std::sync::Arc;
 
 #[pyclass]
 #[derive(Clone)]
@@ -70,29 +72,48 @@ impl RtpData {
     }
 }
 
-pub struct ReceiverAdapter {
-    py_receiver: PyObject,
-}
+#[pyclass(subclass)]
+pub struct VoiceReceiver();
 
-impl ReceiverAdapter {
-    pub fn new(py_receiver: PyObject) -> Self {
-        Self { py_receiver }
+#[pymethods]
+impl VoiceReceiver {
+    #[new]
+    fn new() -> Self {
+        Self()
+    }
+
+    fn voice_tick<'py>(slf: PyRef<'py, Self>, tick: PyRef<'py, VoiceTick>) -> PyResult<()> {
+        Ok(())
+    }
+
+    fn speaking_update<'py>(slf: PyRef<'py, Self>, ssrc: i32, speaking: bool) -> PyResult<()> {
+        Ok(())
+    }
+
+    fn driver_connect(slf: PyRef<'_, Self>) -> PyResult<()> {
+        Ok(())
+    }
+
+    fn driver_disconnect(slf: PyRef<'_, Self>) -> PyResult<()> {
+        Ok(())
+    }
+
+    fn driver_reconnect(slf: PyRef<'_, Self>) -> PyResult<()> {
+        Ok(())
     }
 }
 
-impl Clone for ReceiverAdapter {
-    fn clone(&self) -> Self {
-        Python::with_gil(|py| Self {
-            py_receiver: self.py_receiver.clone_ref(py),
-        })
+pub struct ReceiverAdapter(Arc<Py<VoiceReceiver>>);
+
+impl ReceiverAdapter {
+    pub fn new(receiver: Arc<Py<VoiceReceiver>>) -> Self {
+        Self(receiver)
     }
 }
 
 #[async_trait]
 impl EventHandler for ReceiverAdapter {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        let py_receiver = Python::with_gil(|py| self.py_receiver.clone_ref(py));
-
         match ctx {
             EventContext::VoiceTick(tick) => {
                 let mut speaking_data = Vec::new();
@@ -135,7 +156,7 @@ impl EventHandler for ReceiverAdapter {
                 };
 
                 Python::with_gil(|py| {
-                    let _ = py_receiver.call_method1(py, "voice_tick", (py_voice_tick,));
+                    let _ = self.0.bind(py).call_method1("voice_tick", (py_voice_tick,));
                 });
             }
             EventContext::SpeakingStateUpdate(Speaking {
@@ -149,22 +170,22 @@ impl EventHandler for ReceiverAdapter {
                 let data = (*ssrc, user_id.map(|id| id.0), is_speaking);
 
                 Python::with_gil(|py| {
-                    let _ = py_receiver.call_method1(py, "speaking_update", data);
+                    let _ = self.0.bind(py).call_method1("speaking_update", data);
                 });
             }
             EventContext::DriverConnect(_) => {
                 Python::with_gil(|py| {
-                    let _ = py_receiver.call_method0(py, "driver_connect");
+                    let _ = self.0.bind(py).call_method0("driver_connect");
                 });
             }
             EventContext::DriverDisconnect(_) => {
                 Python::with_gil(|py| {
-                    let _ = py_receiver.call_method0(py, "driver_disconnect");
+                    let _ = self.0.bind(py).call_method0("driver_disconnect");
                 });
             }
             EventContext::DriverReconnect(_) => {
                 Python::with_gil(|py| {
-                    let _ = py_receiver.call_method0(py, "driver_reconnect");
+                    let _ = self.0.bind(py).call_method0("driver_reconnect");
                 });
             }
             _ => {}

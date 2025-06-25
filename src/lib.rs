@@ -24,6 +24,7 @@ fn discord_ext_songbird_backend(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyRe
     m.add_class::<track::IntoTrack>()?;
     m.add_class::<receiver::VoiceTick>()?;
     m.add_class::<receiver::VoiceData>()?;
+    m.add_class::<receiver::VoiceReceiver>()?;
     m.add_class::<receiver::RtpData>()?;
     m.add_class::<config::ConfigBuilder>()?;
     m.add_class::<config::crypto_mode::PyCryptoMode>()?;

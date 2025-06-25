@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use songbird::driver::CryptoMode;
 
 /// See [`songbird::driver::CryptoMode`]
-#[pyclass(frozen, eq, eq_int)]
+#[pyclass(name = "CryptoMode", frozen, eq, eq_int)]
 #[derive(PartialEq)]
 pub enum PyCryptoMode {
     /// See [`songbird::driver::CryptoMode::Aes256Gcm`]

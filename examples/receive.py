@@ -6,6 +6,7 @@ from discord.ext import songbird
 class VoiceReceiver(songbird.VoiceReceiver):
     def __init__(self):
         self.ssrc_to_user = {}
+        super().__init__()
 
     def voice_tick(self, tick) -> None:
         """Handle incoming voice tick."""
@@ -63,7 +64,8 @@ async def on_message(message):
     if message.content == "!join":
         if message.author.voice and message.author.voice.channel:
             channel = message.author.voice.channel
-            voice_client = await channel.connect(cls=songbird.SongbirdClient)
+            cfg = songbird.ConfigBuilder().decode_mode(songbird.DecodeMode.Decode)
+            voice_client = await channel.connect(cls=songbird.SongbirdClient.WithConfig(cfg))
 
             # Create and register the voice receiver
             receiver = VoiceReceiver()

@@ -4,7 +4,7 @@ use crate::queue::QueueHandler;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use songbird::tracks::TrackHandle;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 #[pyclass(frozen)]
 pub struct PlayerHandler {
@@ -55,7 +55,7 @@ impl PlayerHandler {
 }
 
 impl PlayerHandler {
-    pub fn from_handle(handle: TrackHandle, conn: Arc<VoiceConnection>) -> PyResult<Self> {
+    pub fn from_handle(handle: TrackHandle, conn: Weak<VoiceConnection>) -> PyResult<Self> {
         Ok(Self {
             handle,
             queue: Python::with_gil(|py| Py::new(py, QueueHandler::new(conn)))?,

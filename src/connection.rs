@@ -1,7 +1,7 @@
 use crate::error::{SongbirdError, SongbirdResult};
-use crate::receiver::ReceiverAdapter;
+use crate::receiver::{ReceiverAdapter, VoiceReceiver};
 use async_trait::async_trait;
-use pyo3::{Py, PyAny, Python};
+use pyo3::{Py, PyAny, PyRef, Python};
 use songbird::error::{JoinError, JoinResult};
 use songbird::id::{ChannelId, GuildId};
 use songbird::shards::{Shard, VoiceUpdate};
@@ -139,16 +139,29 @@ impl VoiceConnection {
         }
     }
 
-    pub async fn register_receiver(&self, receiver: ReceiverAdapter) -> SongbirdResult<()> {
+    pub async fn register_receiver<'py>(&self, receiver: Py<VoiceReceiver>) -> SongbirdResult<()> {
+        let receiver = Arc::new(receiver);
         if let Some(handler) = &mut *self.call.lock().await {
             handler.add_global_event(
                 Event::Core(CoreEvent::SpeakingStateUpdate),
-                receiver.clone(),
+                ReceiverAdapter::new(receiver.clone()),
             );
-            handler.add_global_event(Event::Core(CoreEvent::VoiceTick), receiver.clone());
-            handler.add_global_event(Event::Core(CoreEvent::DriverConnect), receiver.clone());
-            handler.add_global_event(Event::Core(CoreEvent::DriverReconnect), receiver.clone());
-            handler.add_global_event(Event::Core(CoreEvent::DriverDisconnect), receiver);
+            handler.add_global_event(
+                Event::Core(CoreEvent::VoiceTick),
+                ReceiverAdapter::new(receiver.clone()),
+            );
+            handler.add_global_event(
+                Event::Core(CoreEvent::DriverConnect),
+                ReceiverAdapter::new(receiver.clone()),
+            );
+            handler.add_global_event(
+                Event::Core(CoreEvent::DriverReconnect),
+                ReceiverAdapter::new(receiver.clone()),
+            );
+            handler.add_global_event(
+                Event::Core(CoreEvent::DriverDisconnect),
+                ReceiverAdapter::new(receiver),
+            );
             Ok(())
         } else {
             Err(SongbirdError::ConnectionNotStarted)

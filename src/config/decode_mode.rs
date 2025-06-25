@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use songbird::driver::{Channels, DecodeMode};
 
 /// See [`songbird::driver::DecodeMode`]
-#[pyclass(frozen, eq, eq_int)]
+#[pyclass(name = "DecodeMode", frozen, eq, eq_int)]
 #[derive(PartialEq)]
 pub enum PyDecodeMode {
     /// See [`songbird::driver::DecodeMode::Pass`]
@@ -24,7 +24,7 @@ impl From<&'_ PyDecodeMode> for DecodeMode {
 }
 
 /// See [`songbird::driver::Channels`]
-#[pyclass(frozen, eq, eq_int)]
+#[pyclass(name = "Channels", frozen, eq, eq_int)]
 #[derive(PartialEq)]
 pub enum PyChannels {
     /// See [`songbird::driver::Channels::Mono`]

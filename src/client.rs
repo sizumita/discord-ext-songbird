@@ -2,8 +2,8 @@ use crate::config::ConfigBuilder;
 use crate::connection::{DpyVoiceUpdate, VoiceConnection};
 use crate::error::{SongbirdError, SongbirdResult};
 use crate::queue::QueueHandler;
-use crate::receiver::ReceiverAdapter;
-use pyo3::{pyclass, pymethods, Bound, Py, PyAny, PyResult, Python};
+use crate::receiver::{ReceiverAdapter, VoiceReceiver};
+use pyo3::{pyclass, pymethods, Bound, Py, PyAny, PyRef, PyResult, Python};
 use pyo3_async_runtimes::tokio::future_into_py;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 pub struct SongbirdBackend {
     connection: Arc<VoiceConnection>,
     #[pyo3(get)]
-    queue: Py<QueueHandler>,
+    queue: QueueHandler,
 }
 
 #[pymethods]
@@ -20,10 +20,10 @@ impl SongbirdBackend {
     #[new]
     pub fn new(py: Python<'_>, channel_id: u64) -> PyResult<Self> {
         let connection = Arc::new(VoiceConnection::new(non_zero_u64(channel_id)?));
-        let handler = QueueHandler::new(connection.clone());
+        let handler = QueueHandler::new(Arc::downgrade(&connection));
         Ok(Self {
             connection,
-            queue: Py::new(py, handler)?,
+            queue: handler,
         })
     }
 
@@ -123,12 +123,12 @@ impl SongbirdBackend {
     pub fn register_receiver<'py>(
         &self,
         py: Python<'py>,
-        receiver: Py<PyAny>,
+        receiver: Bound<'py, VoiceReceiver>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let conn = self.connection.clone();
-        let adapter = ReceiverAdapter::new(receiver);
+        let receiver = receiver.unbind();
         future_into_py(py, async move {
-            conn.register_receiver(adapter).await?;
+            conn.register_receiver(receiver).await?;
             Ok(())
         })
     }
