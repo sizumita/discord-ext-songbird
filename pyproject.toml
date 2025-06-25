@@ -11,8 +11,6 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: PyPy",
     "Development Status :: 4 - Beta",
     "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
 readme = "README.md"
@@ -29,6 +27,7 @@ build-backend = "maturin"
 dev = [
     "hatchling>=1.26.3",
     "maturin>=1.7.6",
+    "memray>=1.17.2",
 ]
 
 [tool.maturin]

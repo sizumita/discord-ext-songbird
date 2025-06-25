@@ -92,6 +92,7 @@ impl VoiceConnection {
         let Some(handler) = &mut *self.call.lock().await else {
             return Err(SongbirdError::ConnectionNotStarted);
         };
+        handler.remove_all_global_events();
         Ok(handler.leave().await?)
     }
 

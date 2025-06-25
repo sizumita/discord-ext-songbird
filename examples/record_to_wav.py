@@ -12,7 +12,7 @@ class VoiceRecorder(songbird.VoiceReceiver):
         self.ssrc_files = {}  # Map SSRC to file handles
         self.ssrc_data_sizes = {}  # Track data size for each SSRC
         self.active_ssrcs = set()  # Track SSRCs that have been seen
-        self.recording_dir = Path("recordings")
+        self.recording_dir = Path("target/recordings")
         self.recording_dir.mkdir(exist_ok=True)
 
         # Create session directory with timestamp
@@ -30,6 +30,9 @@ class VoiceRecorder(songbird.VoiceReceiver):
         self.silence_frame = b"\x00" * (self.sample_rate // 50 * self.bytes_per_frame)
 
         super().__init__()
+
+    def __del__(self):
+        print("Voice recorder destroyed")
 
     def _write_wav_header(self, file, num_samples, sample_rate=48000, channels=2, bits_per_sample=16):
         """Write WAV header to file."""
@@ -186,7 +189,7 @@ async def on_message(message):
 
     if message.content == "!join":
         if message.author.voice and message.author.voice.channel:
-            channel = message.author.voice.channel
+            channel: discord.VoiceChannel = message.author.voice.channel
             # Enable decode mode to receive decoded audio
             cfg = songbird.ConfigBuilder().decode_mode(songbird.DecodeMode.Decode)
             voice_client = await channel.connect(cls=songbird.SongbirdClient.WithConfig(cfg))

@@ -75,6 +75,7 @@ class SongbirdClient(discord.VoiceProtocol):
         -------
         """
         await self.songbird.leave()
+        self.cleanup()
 
     async def on_voice_state_update(self, data: GuildVoiceStatePayload) -> None:
         channel_id = None if data["channel_id"] is None else int(data["channel_id"])
