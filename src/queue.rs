@@ -4,7 +4,7 @@ use crate::track::IntoTrack;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
-use std::sync::{Arc, Weak};
+use std::sync::Weak;
 
 #[pyclass]
 #[derive(Clone)]

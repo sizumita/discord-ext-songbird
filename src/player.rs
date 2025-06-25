@@ -4,7 +4,7 @@ use crate::queue::QueueHandler;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use songbird::tracks::TrackHandle;
-use std::sync::{Arc, Weak};
+use std::sync::Weak;
 
 #[pyclass(frozen)]
 pub struct PlayerHandler {

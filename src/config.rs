@@ -28,7 +28,7 @@ impl ConfigBuilder {
     fn send_only<'py>(cls: &Bound<'py, PyType>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let mut slf = cls.call0()?.extract::<Self>()?;
         slf.config.decode_mode = DecodeMode::Pass;
-        Ok(slf.into_bound_py_any(py)?)
+        slf.into_bound_py_any(py)
     }
 
     fn crypto_mode<'py>(

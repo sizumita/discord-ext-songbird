@@ -1,4 +1,3 @@
-use crate::client::SongbirdBackend;
 use async_trait::async_trait;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -82,23 +81,23 @@ impl VoiceReceiver {
         Self()
     }
 
-    fn voice_tick<'py>(slf: PyRef<'py, Self>, tick: PyRef<'py, VoiceTick>) -> PyResult<()> {
+    fn voice_tick<'py>(_slf: PyRef<'py, Self>, _tick: PyRef<'py, VoiceTick>) -> PyResult<()> {
         Ok(())
     }
 
-    fn speaking_update<'py>(slf: PyRef<'py, Self>, ssrc: i32, speaking: bool) -> PyResult<()> {
+    fn speaking_update(_slf: PyRef<'_, Self>, _ssrc: i32, _speaking: bool) -> PyResult<()> {
         Ok(())
     }
 
-    fn driver_connect(slf: PyRef<'_, Self>) -> PyResult<()> {
+    fn driver_connect(_slf: PyRef<'_, Self>) -> PyResult<()> {
         Ok(())
     }
 
-    fn driver_disconnect(slf: PyRef<'_, Self>) -> PyResult<()> {
+    fn driver_disconnect(_slf: PyRef<'_, Self>) -> PyResult<()> {
         Ok(())
     }
 
-    fn driver_reconnect(slf: PyRef<'_, Self>) -> PyResult<()> {
+    fn driver_reconnect(_slf: PyRef<'_, Self>) -> PyResult<()> {
         Ok(())
     }
 }
