@@ -3,7 +3,8 @@ name = "discord-ext-songbird"
 requires-python = ">=3.11"
 dependencies = [
     "discord.py[voice]",
-    "audioop-lts; python_version >= '3.13'"
+    "audioop-lts; python_version >= '3.13'",
+    "typing-extensions>=4.15.0",
 ]
 classifiers = [
     "Programming Language :: Rust",
@@ -25,19 +26,18 @@ build-backend = "maturin"
 
 [dependency-groups]
 dev = [
-    "hatchling>=1.26.3",
-    "maturin>=1.7.6",
+    "hatchling>=1.28.0",
+    "maturin>=1.10.2",
 ]
 
 [tool.maturin]
 python-source = "py-src"
-module-name = "discord.ext.songbird.backend"
-features = ["pyo3/extension-module"]
+module-name = "discord.ext.songbird.native"
 
 [tool.ruff]
 include = ["py-src/**/*.py", "py-src/**/*.pyi", "examples/**/*.py"]
 line-length = 120
-target-version = "py313"
+target-version = "py314"
 
 [tool.ruff.lint]
 ignore = [
@@ -52,7 +52,7 @@ line-ending = "auto"
 include = ["py-src"]
 reportMissingImports = "error"
 reportMissingTypeStubs = "error"
-pythonVersion = "3.13"
+pythonVersion = "3.14"
 # because of discord.* occurs error
 reportAttributeAccessIssue = false
 

@@ -1,56 +1,16 @@
 from __future__ import annotations
 from typing import Union, Optional, Callable
+from . import native
 
-from .backend import SongbirdBackend, QueueHandler, ConfigBuilder, VoiceReceiver
 import discord
 from discord.types.voice import VoiceServerUpdate as VoiceServerUpdatePayload, GuildVoiceState as GuildVoiceStatePayload  # type: ignore
 
 
-class SongbirdClient(discord.VoiceProtocol):
+class SongbirdClient(discord.VoiceProtocol, native.SongbirdImpl):
     channel: Union[discord.VoiceChannel, discord.StageChannel]
 
     def __init__(self, client: discord.Client, channel: discord.abc.Connectable) -> None:
         super().__init__(client, channel)
-
-        channel_id = getattr(channel, "id", None)
-        assert channel_id is not None
-        self.songbird = SongbirdBackend(channel_id)
-        self.config = ConfigBuilder()
-
-    @classmethod
-    def WithConfig(cls, config: ConfigBuilder) -> Callable[[discord.Client, discord.abc.Connectable], SongbirdClient]:
-        """
-        Get SongbirdClient class with coustom config.
-
-        Parameters
-        ----------
-        config: ConfigBuilder
-            custom config
-
-        Returns
-        -------
-        SongbirdClient
-            class initializer with custom config.
-        """
-
-        def inner(client: discord.Client, channel: discord.abc.Connectable) -> SongbirdClient:
-            self_ = SongbirdClient(client, channel)
-            self_.config = config
-            return self_
-
-        return inner
-
-    @property
-    def queue(self) -> QueueHandler:
-        """
-        Get the queue handler for this voice client.
-
-        Returns
-        -------
-        QueueHandler
-            The queue handler that manages the audio queue for this voice client.
-        """
-        return self.songbird.queue
 
     async def connect(
         self, *, timeout: float, reconnect: bool, self_deaf: bool = False, self_mute: bool = False
@@ -58,8 +18,6 @@ class SongbirdClient(discord.VoiceProtocol):
         guild_id, key_type = self.channel._get_voice_client_key()
         assert key_type == "guild_id"
         assert self.client.application_id is not None
-        await self.songbird.start(self.config, self.update_hook, self.client.application_id, guild_id)
-        await self.songbird.connect(timeout, self_deaf, self_mute)
 
     async def disconnect(self, *, force: bool) -> None:
         """|coro|
@@ -163,19 +121,3 @@ class SongbirdClient(discord.VoiceProtocol):
             await self.disconnect(force=True)
         else:
             await self.songbird.move_to(channel.id)
-
-    async def register_receiver(self, receiver: VoiceReceiver) -> None:
-        """|coro|
-
-        Register a voice receiver to handle incoming voice data.
-
-        Parameters
-        ----------
-        receiver: VoiceReceiver
-            An instance of a class that inherits from VoiceReceiver to handle voice events.
-
-        Returns
-        -------
-        None
-        """
-        await self.songbird.register_receiver(receiver)
