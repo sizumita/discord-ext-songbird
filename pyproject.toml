@@ -5,6 +5,7 @@ dependencies = [
     "discord.py[voice]",
     "audioop-lts; python_version >= '3.13'",
     "typing-extensions>=4.15.0",
+    "ty>=0.0.8",
 ]
 classifiers = [
     "Programming Language :: Rust",
@@ -28,6 +29,8 @@ build-backend = "maturin"
 dev = [
     "hatchling>=1.28.0",
     "maturin>=1.10.2",
+    "ruff>=0.14.10",
+    "ty>=0.0.8",
 ]
 
 [tool.maturin]
@@ -40,6 +43,7 @@ line-length = 120
 target-version = "py314"
 
 [tool.ruff.lint]
+select = ["I"]
 ignore = [
     "E501",
 ]
@@ -47,14 +51,6 @@ ignore = [
 [tool.ruff.format]
 quote-style = "double"
 line-ending = "auto"
-
-[tool.pyright]
-include = ["py-src"]
-reportMissingImports = "error"
-reportMissingTypeStubs = "error"
-pythonVersion = "3.14"
-# because of discord.* occurs error
-reportAttributeAccessIssue = false
 
 [tool.ty.src]
 include = ["py-src", "examples"]

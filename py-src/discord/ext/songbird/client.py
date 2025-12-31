@@ -1,9 +1,12 @@
 from __future__ import annotations
-from typing import Union, Optional
-from .native import SongbirdImpl
+
+from typing import Optional, Union
 
 import discord
-from discord.types.voice import VoiceServerUpdate as VoiceServerUpdatePayload, GuildVoiceState as GuildVoiceStatePayload  # type: ignore
+from discord.types.voice import GuildVoiceState as GuildVoiceStatePayload
+from discord.types.voice import VoiceServerUpdate as VoiceServerUpdatePayload
+
+from .native import SongbirdImpl
 
 
 class SongbirdClient(discord.VoiceProtocol, SongbirdImpl):
@@ -15,7 +18,7 @@ class SongbirdClient(discord.VoiceProtocol, SongbirdImpl):
     async def connect(
         self, *, timeout: float, reconnect: bool, self_deaf: bool = False, self_mute: bool = False
     ) -> None:
-        await SongbirdImpl.connect(self, timeout, reconnect, self_deaf, self_mute)
+        await SongbirdImpl.connect(self, timeout=timeout, reconnect=reconnect, self_deaf=self_deaf, self_mute=self_mute)
 
     async def disconnect(self, *, force: bool) -> None:
         """|coro|
@@ -30,7 +33,7 @@ class SongbirdClient(discord.VoiceProtocol, SongbirdImpl):
         Returns
         -------
         """
-        await SongbirdImpl.disconnect(self, force)
+        await SongbirdImpl.disconnect(self, force=force)
         self.cleanup()
 
     async def on_voice_state_update(self, data: GuildVoiceStatePayload) -> None:
@@ -39,6 +42,8 @@ class SongbirdClient(discord.VoiceProtocol, SongbirdImpl):
         await self.update_state(session_id, channel_id)
 
     async def on_voice_server_update(self, data: VoiceServerUpdatePayload) -> None:
+        if data["endpoint"] is None:
+            raise ValueError("server update failed")
         await self.update_server(data["endpoint"], data["token"])
 
     async def update_hook(self, channel_id: Optional[int], self_mute: bool, self_deaf: bool) -> None:

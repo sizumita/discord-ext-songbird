@@ -2,20 +2,27 @@
 # ruff: noqa: E501, F401
 
 import builtins
-import discord
 import typing
+
+import discord
+
 from . import error
 
 class SongbirdImpl:
     def __new__(cls, client: discord.Client, connectable: discord.abc.Connectable) -> SongbirdImpl: ...
     def connect(
-        self, timeout: builtins.float, _reconnect: builtins.bool, self_deaf: builtins.bool, self_mute: builtins.bool
+        self,
+        *,
+        timeout: builtins.float,
+        reconnect: builtins.bool,
+        self_deaf: builtins.bool = False,
+        self_mute: builtins.bool = False,
     ) -> typing.Coroutine[typing.Any, typing.Any, None]: ...
-    async def disconnect(self, _force: builtins.bool) -> None: ...
+    async def disconnect(self, *, force: builtins.bool) -> None: ...
     async def update_server(self, endpoint: builtins.str, token: builtins.str) -> None: ...
     async def update_state(self, session_id: builtins.str, channel_id: int | None = None) -> None: ...
     async def update_hook(
-        self, _channel_id: typing.Optional[builtins.int], _self_mute: builtins.bool, _self_deaf: builtins.bool
+        self, channel_id: typing.Optional[builtins.int], self_mute: builtins.bool, self_deaf: builtins.bool
     ) -> None: ...
     async def deafen(self, self_deaf: builtins.bool) -> None:
         r"""

@@ -1,6 +1,5 @@
 from . import native
-
-from .client import SongbirdClient
+from .client import SongbirdClient as SongbirdClient
 
 __author__ = "sizumita"
 

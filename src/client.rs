@@ -84,14 +84,17 @@ impl SongbirdImpl {
         })
     }
 
+    #[pyo3(signature = (*, timeout, reconnect, self_deaf = false, self_mute = false))]
     fn connect<'py>(
         slf: PyRef<'py, Self>,
         py: Python<'py>,
         timeout: f32,
-        _reconnect: bool,
+        reconnect: bool,
         self_deaf: bool,
         self_mute: bool,
     ) -> PyResult<PyFuture<'py, ()>> {
+        let _ = reconnect;
+
         let config = Config::default().gateway_timeout(Some(Duration::from_secs_f32(timeout)));
         let self_call = slf.call.clone();
         let guild_id = slf.guild_id;
@@ -119,13 +122,15 @@ impl SongbirdImpl {
         .map(|x| x.into())
     }
 
-    async fn disconnect(&self, _force: bool) -> PyResult<()> {
+    #[pyo3(signature = (*, force))]
+    async fn disconnect(&self, force: bool) -> PyResult<()> {
+        let _ = force;
         let mut guard = self.call.lock().await;
         let call = guard.get_mut()?;
         call.leave().await.into_py()
     }
 
-    async fn update_server<'py>(&self, endpoint: String, token: String) -> PyResult<()> {
+    async fn update_server(&self, endpoint: String, token: String) -> PyResult<()> {
         let mut guard = self.call.lock().await;
         let call = guard.get_mut()?;
         call.update_server(endpoint, token);
@@ -144,11 +149,12 @@ impl SongbirdImpl {
         Ok(())
     }
 
+    #[allow(unused)]
     async fn update_hook(
         &self,
-        _channel_id: Option<u64>,
-        _self_mute: bool,
-        _self_deaf: bool,
+        channel_id: Option<u64>,
+        self_mute: bool,
+        self_deaf: bool,
     ) -> PyResult<()> {
         Err(pyo3::exceptions::PyNotImplementedError::new_err(
             "update_hook must be implemented in a subclass",
