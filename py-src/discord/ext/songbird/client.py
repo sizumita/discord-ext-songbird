@@ -30,7 +30,7 @@ class SongbirdClient(discord.VoiceProtocol, SongbirdImpl):
         Returns
         -------
         """
-        await self.songbird.leave()
+        await SongbirdImpl.disconnect(self, force)
         self.cleanup()
 
     async def on_voice_state_update(self, data: GuildVoiceStatePayload) -> None:

@@ -119,6 +119,12 @@ impl SongbirdImpl {
         .map(|x| x.into())
     }
 
+    async fn disconnect(&self, _force: bool) -> PyResult<()> {
+        let mut guard = self.call.lock().await;
+        let call = guard.get_mut()?;
+        call.leave().await.into_py()
+    }
+
     async fn update_server<'py>(&self, endpoint: String, token: String) -> PyResult<()> {
         let mut guard = self.call.lock().await;
         let call = guard.get_mut()?;
