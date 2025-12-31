@@ -30,7 +30,7 @@ jobs:
         run: uv sync --all-extras --dev --no-install-project --frozen
 
       - name: Run ruff
-        run: uv tool run ruff --output-format=github
+        run: uv tool run ruff check --output-format=github
 
       - name: Run ruff formatter
         run: uv tool run ruff format --diff
