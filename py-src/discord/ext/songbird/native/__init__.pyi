@@ -9,7 +9,24 @@ import discord
 from . import error
 
 class SongbirdImpl:
-    def __new__(cls, client: discord.Client, connectable: discord.abc.Connectable) -> SongbirdImpl: ...
+    r"""
+    Internal backend for Songbird voice connections.
+
+    This class is exposed to Python and used by `SongbirdClient` to manage
+    voice state and connection lifecycle.
+    """
+    def __new__(cls, client: discord.Client, connectable: discord.abc.Connectable) -> SongbirdImpl:
+        r"""
+        Create a new backend tied to a Discord client and connectable.
+
+        Parameters
+        ----------
+        client: discord.Client
+            The Discord client instance.
+
+        connectable: discord.abc.Connectable
+            A connectable voice target (e.g., VoiceChannel or StageChannel).
+        """
     def connect(
         self,
         *,
@@ -17,13 +34,103 @@ class SongbirdImpl:
         reconnect: builtins.bool,
         self_deaf: builtins.bool = False,
         self_mute: builtins.bool = False,
-    ) -> typing.Coroutine[typing.Any, typing.Any, None]: ...
-    async def disconnect(self, *, force: builtins.bool) -> None: ...
-    async def update_server(self, endpoint: builtins.str, token: builtins.str) -> None: ...
-    async def update_state(self, session_id: builtins.str, channel_id: int | None = None) -> None: ...
+    ) -> typing.Coroutine[typing.Any, typing.Any, None]:
+        r"""
+        |coro|
+
+        Connect to the voice channel associated with this backend.
+
+        Parameters
+        ----------
+        timeout: float
+            Gateway connection timeout in seconds.
+        reconnect: bool
+            Whether to allow to reconnect attempts (currently ignored).
+        self_deaf: bool
+            Whether to deafen this account after connecting.
+        self_mute: bool
+            Whether to mute this account after connecting.
+
+        Returns
+        -------
+        None
+        """
+    async def disconnect(self, *, force: builtins.bool) -> None:
+        r"""
+        |coro|
+
+        Disconnect from the current voice channel.
+
+        Parameters
+        ----------
+        force: bool
+            Whether to force disconnect (currently ignored).
+
+        Returns
+        -------
+        None
+        """
+    async def update_server(self, endpoint: builtins.str, token: builtins.str) -> None:
+        r"""
+        |coro|
+
+        Update voice server information.
+
+        This is typically invoked by discord.py during a voice handshake.
+
+        Parameters
+        ----------
+        endpoint: str
+            Voice server endpoint.
+        token: str
+            Voice session token.
+
+        Returns
+        -------
+        None
+        """
+    async def update_state(self, session_id: builtins.str, channel_id: int | None = None) -> None:
+        r"""
+        |coro|
+
+        Update voice state information.
+
+        This is typically invoked by discord.py after a VOICE_STATE_UPDATE.
+
+        Parameters
+        ----------
+        session_id: str
+            Voice session ID.
+        channel_id: int | None
+            Channel ID, or None if disconnecting.
+
+        Returns
+        -------
+        None
+        """
     async def update_hook(
         self, channel_id: typing.Optional[builtins.int], self_mute: builtins.bool, self_deaf: builtins.bool
-    ) -> None: ...
+    ) -> None:
+        r"""
+        |coro|
+
+        Hook invoked when discord.py updates voice state.
+
+        Subclasses should override this to integrate with their event loop.
+
+        Parameters
+        ----------
+        channel_id: int | None
+            Channel ID, or None if disconnecting.
+        self_mute: bool
+            Whether the account is self-muted.
+        self_deaf: bool
+            Whether the account is self-deafened.
+
+        Returns
+        -------
+        None
+        """
     async def deafen(self, self_deaf: builtins.bool) -> None:
         r"""
         |coro|

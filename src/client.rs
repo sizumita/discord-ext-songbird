@@ -40,6 +40,10 @@ impl CallWrapper {
 
 #[gen_stub_pyclass]
 #[pyclass(subclass)]
+/// Internal backend for Songbird voice connections.
+///
+/// This class is exposed to Python and used by `SongbirdClient` to manage
+/// voice state and connection lifecycle.
 pub struct SongbirdImpl {
     channel_id: ChannelId,
     guild_id: GuildId,
@@ -51,6 +55,14 @@ pub struct SongbirdImpl {
 #[pymethods]
 impl SongbirdImpl {
     #[new]
+    /// Create a new backend tied to a Discord client and connectable.
+    ///
+    /// Parameters
+    /// ----------
+    /// client: discord.Client
+    ///     The Discord client instance.
+    /// connectable: discord.abc.Connectable
+    ///     A connectable voice target (e.g., VoiceChannel or StageChannel).
     fn new(
         #[gen_stub(override_type(type_repr="discord.Client", imports=("discord")))] client: &Bound<
             PyAny,
@@ -93,6 +105,24 @@ impl SongbirdImpl {
     }
 
     #[pyo3(signature = (*, timeout, reconnect, self_deaf = false, self_mute = false))]
+    /// |coro|
+    ///
+    /// Connect to the voice channel associated with this backend.
+    ///
+    /// Parameters
+    /// ----------
+    /// timeout: float
+    ///     Gateway connection timeout in seconds.
+    /// reconnect: bool
+    ///     Whether to allow to reconnect attempts (currently ignored).
+    /// self_deaf: bool
+    ///     Whether to deafen this account after connecting.
+    /// self_mute: bool
+    ///     Whether to mute this account after connecting.
+    ///
+    /// Returns
+    /// -------
+    /// None
     fn connect<'py>(
         slf: PyRef<'py, Self>,
         py: Python<'py>,
@@ -149,6 +179,18 @@ impl SongbirdImpl {
     }
 
     #[pyo3(signature = (*, force))]
+    /// |coro|
+    ///
+    /// Disconnect from the current voice channel.
+    ///
+    /// Parameters
+    /// ----------
+    /// force: bool
+    ///     Whether to force disconnect (currently ignored).
+    ///
+    /// Returns
+    /// -------
+    /// None
     async fn disconnect(&self, force: bool) -> PyResult<()> {
         log::debug!(
             "Disconnecting voice for guild {} (force={})",
@@ -160,6 +202,22 @@ impl SongbirdImpl {
         call.leave().await.into_py()
     }
 
+    /// |coro|
+    ///
+    /// Update voice server information.
+    ///
+    /// This is typically invoked by discord.py during a voice handshake.
+    ///
+    /// Parameters
+    /// ----------
+    /// endpoint: str
+    ///     Voice server endpoint.
+    /// token: str
+    ///     Voice session token.
+    ///
+    /// Returns
+    /// -------
+    /// None
     async fn update_server(&self, endpoint: String, token: String) -> PyResult<()> {
         log::trace!(
             "Received voice server update for guild {} (endpoint={}, token_len={})",
@@ -174,6 +232,22 @@ impl SongbirdImpl {
     }
 
     #[pyo3(signature = (session_id, channel_id=None))]
+    /// |coro|
+    ///
+    /// Update voice state information.
+    ///
+    /// This is typically invoked by discord.py after a VOICE_STATE_UPDATE.
+    ///
+    /// Parameters
+    /// ----------
+    /// session_id: str
+    ///     Voice session ID.
+    /// channel_id: int | None
+    ///     Channel ID, or None if disconnecting.
+    ///
+    /// Returns
+    /// -------
+    /// None
     async fn update_state(
         &self,
         session_id: String,
@@ -192,6 +266,24 @@ impl SongbirdImpl {
     }
 
     #[allow(unused)]
+    /// |coro|
+    ///
+    /// Hook invoked when discord.py updates voice state.
+    ///
+    /// Subclasses should override this to integrate with their event loop.
+    ///
+    /// Parameters
+    /// ----------
+    /// channel_id: int | None
+    ///     Channel ID, or None if disconnecting.
+    /// self_mute: bool
+    ///     Whether the account is self-muted.
+    /// self_deaf: bool
+    ///     Whether the account is self-deafened.
+    ///
+    /// Returns
+    /// -------
+    /// None
     async fn update_hook(
         &self,
         channel_id: Option<u64>,

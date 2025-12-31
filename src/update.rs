@@ -26,24 +26,22 @@ impl VoiceUpdate for VoiceUpdater {
         let future = Python::attach(|py| -> PyResult<_> {
             let coroutine = self
                 .0
-                .call_method1(
-                    py,
-                    "update_hook",
-                    (channel_id_value, self_mute, self_deaf),
-                )?
+                .call_method1(py, "update_hook", (channel_id_value, self_mute, self_deaf))?
                 .into_bound(py);
             pyo3_async_runtimes::tokio::into_future(coroutine)
         })
         .map_err(|err| {
-            log::warn!("Failed to schedule update_hook (guild {}): {}", guild_id, err);
+            log::warn!(
+                "Failed to schedule update_hook (guild {}): {}",
+                guild_id,
+                err
+            );
             songbird::error::JoinError::Dropped
         })?;
-        future
-            .await
-            .map_err(|err| {
-                log::warn!("update_hook failed (guild {}): {}", guild_id, err);
-                songbird::error::JoinError::Dropped
-            })?;
+        future.await.map_err(|err| {
+            log::warn!("update_hook failed (guild {}): {}", guild_id, err);
+            songbird::error::JoinError::Dropped
+        })?;
         Ok(())
     }
 }
