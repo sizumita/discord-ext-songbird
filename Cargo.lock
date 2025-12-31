@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "discord-ext-songbird"
-version = "0.3.0"
+version = "0.4.0-alpha"
 dependencies = [
  "async-trait",
  "env_logger",
