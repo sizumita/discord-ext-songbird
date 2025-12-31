@@ -15,7 +15,7 @@ A high-performance voice backend for [discord.py](https://github.com/rapptz/disc
 - **Voice Receiving**: Real-time voice data reception and processing
 - **Flexible Audio Sources**: Support for various audio input formats
 - **Volume Control**: Per-track volume adjustment
-- **Python 3.10+ Support**: Compatible with modern Python versions
+- **Python 3.13+ Support**: Compatible with modern Python versions
 
 ## Installation
 
