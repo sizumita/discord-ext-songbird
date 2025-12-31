@@ -8,22 +8,26 @@ from . import error
 
 class SongbirdImpl:
     def __new__(cls, client: discord.Client, connectable: discord.abc.Connectable) -> SongbirdImpl: ...
-    def connect(self, timeout: builtins.float, _reconnect: builtins.bool, self_deaf: builtins.bool, self_mute: builtins.bool) -> typing.Coroutine[typing.Any, typing.Any, None]: ...
+    def connect(
+        self, timeout: builtins.float, _reconnect: builtins.bool, self_deaf: builtins.bool, self_mute: builtins.bool
+    ) -> typing.Coroutine[typing.Any, typing.Any, None]: ...
     async def disconnect(self, _force: builtins.bool) -> None: ...
     async def update_server(self, endpoint: builtins.str, token: builtins.str) -> None: ...
     async def update_state(self, session_id: builtins.str, channel_id: int | None = None) -> None: ...
-    async def update_hook(self, _channel_id: typing.Optional[builtins.int], _self_mute: builtins.bool, _self_deaf: builtins.bool) -> None: ...
+    async def update_hook(
+        self, _channel_id: typing.Optional[builtins.int], _self_mute: builtins.bool, _self_deaf: builtins.bool
+    ) -> None: ...
     async def deafen(self, self_deaf: builtins.bool) -> None:
         r"""
         |coro|
-        
+
         Deafen or undeafen this account.
-        
+
         Parameters
         ----------
         self_deaf: bool
             Whether to deafen or undeafen this account.
-        
+
         Returns
         -------
         None
@@ -31,14 +35,14 @@ class SongbirdImpl:
     async def mute(self, self_mute: builtins.bool) -> None:
         r"""
         |coro|
-        
+
         Mute or unmute this account.
-        
+
         Parameters
         ----------
         self_mute: bool
             Whether to mute or unmute this account.
-        
+
         Returns
         -------
         None
@@ -46,7 +50,7 @@ class SongbirdImpl:
     def is_mute(self) -> builtins.bool:
         r"""
         Check if this account is muted.
-        
+
         Returns
         -------
         bool
@@ -55,7 +59,7 @@ class SongbirdImpl:
     def is_deaf(self) -> builtins.bool:
         r"""
         Check if this account is deafened.
-        
+
         Returns
         -------
         bool
@@ -64,13 +68,12 @@ class SongbirdImpl:
     def move_to(self, channel: discord.abc.Snowflake) -> typing.Coroutine[typing.Any, typing.Any, None]:
         r"""
         |coro|
-        
+
         Move this account to another voice channel.
-        
+
         Parameters
         ----------
         channel: discord.abc.Snowflake | None
             The channel to move to.
             If None, disconnects from voice.
         """
-

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Union, Optional, Callable
+from typing import Union, Optional
 from .native import SongbirdImpl
 
 import discord
