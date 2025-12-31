@@ -1,80 +1,31 @@
-# AGENTS.md
+# Repository Guidelines
 
-This file provides guidance to coding agents when working in this repository.
+This repository hosts a hybrid Rust/Python voice backend for `discord.py`, built with PyO3 and `maturin`.
 
-## Project Overview
+## Project Structure & Module Organization
+- `src/`: Rust backend (PyO3 module, voice connection logic, queue/track handling). Stub generation lives in `src/bin/stub_gen.rs`.
+- `py-src/discord/ext/songbird/`: Python API layer, type stubs (`.pyi`), and `py.typed` marker; native stubs live under `native/`.
+- `examples/`: runnable bot examples (`basic.py`, `track_handling.py`, `receive.py`).
+- Build metadata: `Cargo.toml`, `pyproject.toml`, `build.rs`, `justfile`. Build outputs go to `target/` and should not be committed.
 
-This is discord-ext-songbird, a Python library that replaces the voice backend of discord.py with Songbird (a Rust-based voice library). It's a hybrid Python/Rust project using PyO3 for Python bindings.
+## Build, Test, and Development Commands
+- `uv sync --all-extras --dev --no-install-project`: install dev dependencies.
+- `uvx maturin develop`: build and install the Rust extension into the active virtualenv.
+- `just build`: runs stub generation then builds wheels (`cargo run --bin stub_gen`, `uvx maturin build`).
+- `just fmt`: `cargo fmt` + `ruff format` for Python.
+- `just check`: `cargo clippy` + `ruff check` + `uvx ty check`.
+- `python examples/basic.py`: run a sample bot after setting `DISCORD_BOT_TOKEN`.
 
-## Development Commands
+## Coding Style & Naming Conventions
+- Rust: `rustfmt` defaults via `cargo fmt`; `clippy` for linting.
+- Python: 4-space indent, line length 120, double quotes per Ruff config. Use `ruff format` and `ruff check`.
+- Naming: snake_case for functions/modules, PascalCase for types/classes (e.g., `SongbirdClient`).
 
-### Build and Install
-```bash
-# Activate virtual environment
-source venv/bin/activate
+## Testing Guidelines
+There is no dedicated automated test suite today. Use `just check` for lint/type checks and validate behavior with `examples/`. If adding tests, place Python tests under `tests/` with `test_*.py` naming, and Rust unit tests in the corresponding `src/` modules.
 
-# Build and install the Rust extension locally
-maturin develop
-```
+## Commit & Pull Request Guidelines
+Git history shows short, descriptive subjects and often an emoji prefix followed by a colon (e.g., `:sparkles: Refactor ...`). Follow that style when possible, keep commits focused, and avoid generated artifacts. PRs should include a clear summary, steps to verify (commands run), and call out any API or behavior changes; update docs or stubs when APIs move.
 
-### Code Quality
-```bash
-# Run Rust formatter
-cargo fmt
-
-# Run Python formatter and linter
-ruff format py-src examples
-ruff check py-src examples
-
-# Type checking
-pyright
-```
-
-### Running Examples
-```bash
-# Set DISCORD_BOT_TOKEN environment variable first
-export DISCORD_BOT_TOKEN="your_token_here"
-
-# Run basic example
-python examples/basic.py
-
-# Other examples
-python examples/custom_config.py
-python examples/receive.py
-python examples/track_handling.py
-```
-
-## Architecture
-
-### Rust Backend (`src/`)
-- `lib.rs`: PyO3 module definition, exports all Python-accessible classes
-- `client.rs`: Core `SongbirdBackend` implementation managing voice connections
-- `source.rs`: Audio source abstractions (AudioSource, SourceComposed)
-- `source/raw.rs`: RawBufferSource for raw audio data
-- `track.rs`: Track management and playback control
-- `queue.rs`: Queue handler for managing audio tracks
-- `player.rs`: Player handler for controlling playback
-- `config/`: Configuration builders for crypto and decode modes
-- `connection.rs`: Voice connection management
-
-### Python Frontend (`py-src/discord/ext/songbird/`)
-- `client.py`: `SongbirdClient` - main interface extending discord.VoiceProtocol
-- `track.py`: Python wrapper for track objects
-- `__init__.py`: Public API exports
-- `backend.pyi`: Type stubs for Rust backend
-
-## Key Design Patterns
-
-1. VoiceProtocol integration: SongbirdClient implements discord.py's VoiceProtocol interface.
-2. Async bridge: Uses pyo3-async-runtimes to bridge Python async/await with Tokio.
-3. Builder pattern: ConfigBuilder allows customizing voice connection settings.
-4. Queue system: Tracks are enqueued and played sequentially through QueueHandler.
-
-## Important Notes
-
-- The project uses maturin for building Python wheels from Rust code.
-- Requires Python 3.10+ and supports up to Python 3.13.
-- Voice receiving functionality is still work in progress.
-- Examples require a valid Discord bot token.
-- The backend.so file is generated during build and should not be committed.
-- venv dir is venv.
+## Security & Configuration Tips
+Keep tokens out of code and use environment variables (e.g., `DISCORD_BOT_TOKEN`). Do not commit built artifacts like `backend.so` or anything in `target/`.

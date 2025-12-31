@@ -132,6 +132,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
+name = "arc-swap"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51d03449bb8ca2cc2ef70869af31463d1ae5ccc8fa3e334b307203fbf815207e"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -690,10 +699,12 @@ version = "0.4.0-alpha"
 dependencies = [
  "async-trait",
  "env_logger",
+ "log",
  "pyo3",
  "pyo3-arrow",
  "pyo3-async-runtimes",
  "pyo3-build-config",
+ "pyo3-log",
  "pyo3-stub-gen",
  "songbird",
  "symphonia",
@@ -2190,6 +2201,17 @@ checksum = "1c85c9cbfaddf651b1221594209aed57e9e5cff63c4d11d1feead529b872a089"
 dependencies = [
  "libc",
  "pyo3-build-config",
+]
+
+[[package]]
+name = "pyo3-log"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f8bae9ad5ba08b0b0ed2bb9c2bdbaeccc69cafca96d78cf0fbcea0d45d122bb"
+dependencies = [
+ "arc-swap",
+ "log",
+ "pyo3",
 ]
 
 [[package]]

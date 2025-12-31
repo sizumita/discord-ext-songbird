@@ -24,6 +24,12 @@ mod native {
         #[pymodule_export]
         use crate::error::PySongbirdError;
     }
+
+    #[pymodule_init]
+    fn init(_: &Bound<'_, PyModule>) -> PyResult<()> {
+        pyo3_log::init();
+        Ok(())
+    }
 }
 
 define_stub_info_gatherer!(stub_info);

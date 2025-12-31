@@ -70,11 +70,19 @@ impl SongbirdImpl {
             )
         };
         if &key_type != "guild_id" {
+            log::debug!("Unsupported voice client key type: {}", key_type);
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "Only guild voice connections are supported",
             ));
         }
         let application_id = client.getattr("application_id")?.extract::<NonZeroU64>()?;
+
+        log::debug!(
+            "Initialized SongbirdImpl (guild {}, channel {}, application {})",
+            guild_id,
+            channel_id,
+            application_id
+        );
 
         Ok(Self {
             channel_id,
@@ -93,13 +101,21 @@ impl SongbirdImpl {
         self_deaf: bool,
         self_mute: bool,
     ) -> PyResult<PyFuture<'py, ()>> {
-        let _ = reconnect;
-
         let config = Config::default().gateway_timeout(Some(Duration::from_secs_f32(timeout)));
         let self_call = slf.call.clone();
         let guild_id = slf.guild_id;
         let channel_id = slf.channel_id;
         let application_id = slf.application_id;
+
+        log::debug!(
+            "Connecting voice (guild {}, channel {}, timeout={}s, reconnect={}, self_deaf={}, self_mute={})",
+            guild_id,
+            channel_id,
+            timeout,
+            reconnect,
+            self_deaf,
+            self_mute
+        );
 
         let shard = Shard::Generic(Arc::new(VoiceUpdater(slf.into_py_any(py)?.into_any())));
 
@@ -109,6 +125,11 @@ impl SongbirdImpl {
                 let mut guard = self_call.lock().await;
                 guard.set(call);
             }
+            log::trace!(
+                "Joining voice channel {} for guild {}",
+                channel_id,
+                guild_id
+            );
             let joined = {
                 let mut guard = self_call.lock().await;
                 let call = guard.get_mut()?;
@@ -117,6 +138,11 @@ impl SongbirdImpl {
                 call.join(channel_id).await.into_py()?
             };
             joined.await.into_py()?;
+            log::debug!(
+                "Connected to voice channel {} for guild {}",
+                channel_id,
+                guild_id
+            );
             Ok(())
         })
         .map(|x| x.into())
@@ -124,13 +150,23 @@ impl SongbirdImpl {
 
     #[pyo3(signature = (*, force))]
     async fn disconnect(&self, force: bool) -> PyResult<()> {
-        let _ = force;
+        log::debug!(
+            "Disconnecting voice for guild {} (force={})",
+            self.guild_id,
+            force
+        );
         let mut guard = self.call.lock().await;
         let call = guard.get_mut()?;
         call.leave().await.into_py()
     }
 
     async fn update_server(&self, endpoint: String, token: String) -> PyResult<()> {
+        log::trace!(
+            "Received voice server update for guild {} (endpoint={}, token_len={})",
+            self.guild_id,
+            endpoint,
+            token.len()
+        );
         let mut guard = self.call.lock().await;
         let call = guard.get_mut()?;
         call.update_server(endpoint, token);
@@ -143,6 +179,12 @@ impl SongbirdImpl {
         session_id: String,
         #[gen_stub(override_type(type_repr = "int | None"))] channel_id: Option<NonZeroU64>,
     ) -> PyResult<()> {
+        log::trace!(
+            "Received voice state update for guild {} (session_id_len={}, channel_id={:?})",
+            self.guild_id,
+            session_id.len(),
+            channel_id
+        );
         let mut guard = self.call.lock().await;
         let call = guard.get_mut()?;
         call.update_state(session_id, channel_id);
@@ -174,6 +216,11 @@ impl SongbirdImpl {
     /// -------
     /// None
     async fn deafen(&self, self_deaf: bool) -> PyResult<()> {
+        log::trace!(
+            "Setting self_deaf={} for guild {}",
+            self_deaf,
+            self.guild_id
+        );
         let mut guard = self.call.lock().await;
         let call = guard.get_mut()?;
         call.deafen(self_deaf).await.into_py()
@@ -192,6 +239,11 @@ impl SongbirdImpl {
     /// -------
     /// None
     async fn mute(&self, self_mute: bool) -> PyResult<()> {
+        log::trace!(
+            "Setting self_mute={} for guild {}",
+            self_mute,
+            self.guild_id
+        );
         let mut guard = self.call.lock().await;
         let call = guard.get_mut()?;
         call.mute(self_mute).await.into_py()
@@ -239,6 +291,11 @@ impl SongbirdImpl {
         let call = self.call.clone();
         if let Some(channel) = channel {
             let id = channel.getattr("id")?.extract::<NonZeroU64>()?;
+            log::debug!(
+                "Moving voice connection for guild {} to channel {}",
+                self.guild_id,
+                id
+            );
             future_into_py(py, async move {
                 let mut guard = call.lock().await;
                 let call = guard.get_mut()?;
@@ -247,6 +304,10 @@ impl SongbirdImpl {
             })
             .map(|x| x.into())
         } else {
+            log::debug!(
+                "Leaving voice channel for guild {} via move_to(None)",
+                self.guild_id
+            );
             future_into_py(py, async move {
                 let mut guard = call.lock().await;
                 let call = guard.get_mut()?;
