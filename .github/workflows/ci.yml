@@ -8,13 +8,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  lint_python:
-    name: Lint Python ${{ matrix.python-version }}
+  check_python:
+    name: Check Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version:
           - "3.13"
+          - "3.14"
     steps:
       - uses: actions/checkout@v4
 
@@ -26,15 +27,18 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Syncing uv project
-        run: uv sync --all-extras --dev --no-install-project
+        run: uv sync --all-extras --dev --no-install-project --frozen
 
       - name: Run ruff
-        run: uvx ruff check --output-format=github .
+        run: uv tool run ruff --output-format=github
 
       - name: Run ruff formatter
-        run: uvx ruff format --diff
-  lint_rust:
-    name: Lint rust
+        run: uv tool run ruff format --diff
+
+      - name: Run ty
+        run: uv tool run ty check --output-format=github --python-version ${{ matrix.python-version }}
+  check_rust:
+    name: Check rust
     runs-on: ubuntu-latest
 
     steps:
