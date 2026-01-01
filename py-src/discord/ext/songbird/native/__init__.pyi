@@ -5,8 +5,9 @@ import builtins
 import typing
 
 import discord
+from discord.ext.songbird.native.receive import SinkBase
 
-from . import error
+from . import error, receive
 
 class SongbirdImpl:
     r"""
@@ -23,7 +24,6 @@ class SongbirdImpl:
         ----------
         client: discord.Client
             The Discord client instance.
-
         connectable: discord.abc.Connectable
             A connectable voice target (e.g., VoiceChannel or StageChannel).
         """
@@ -191,3 +191,4 @@ class SongbirdImpl:
             The channel to move to.
             If None, disconnects from voice.
         """
+    def listen(self, sink: SinkBase) -> None: ...

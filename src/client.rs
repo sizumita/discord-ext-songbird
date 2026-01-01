@@ -1,11 +1,14 @@
 use crate::error::IntoPyResult;
 use crate::future::PyFuture;
+use crate::receive::buffer::BufferWrapper;
+use crate::receive::sink::SinkBase;
 use crate::update::VoiceUpdater;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::types::PyTuple;
-use pyo3::{pyclass, pymethods, Bound, IntoPyObjectExt, PyAny, PyRef, PyResult, Python};
+use pyo3::{pyclass, pymethods, Bound, IntoPyObjectExt, PyAny, PyRef, PyRefMut, PyResult, Python};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use songbird::driver::DecodeMode;
 use songbird::id::{ChannelId, GuildId, UserId};
 use songbird::shards::Shard;
 use songbird::{Call, Config};
@@ -131,7 +134,9 @@ impl SongbirdImpl {
         self_deaf: bool,
         self_mute: bool,
     ) -> PyResult<PyFuture<'py, ()>> {
-        let config = Config::default().gateway_timeout(Some(Duration::from_secs_f32(timeout)));
+        let config = Config::default()
+            .gateway_timeout(Some(Duration::from_secs_f32(timeout)))
+            .decode_mode(DecodeMode::Decode);
         let self_call = slf.call.clone();
         let guild_id = slf.guild_id;
         let channel_id = slf.channel_id;
@@ -408,5 +413,19 @@ impl SongbirdImpl {
             })
             .map(|x| x.into())
         }
+    }
+
+    fn listen<'py>(
+        &self,
+        py: Python<'py>,
+        mut sink: PyRefMut<'py, SinkBase>,
+    ) -> PyResult<PyFuture<'py, ()>> {
+        let mut guard = self.call.blocking_lock();
+        let call = guard.get_mut()?;
+
+        sink.receive_events.iter().for_each(|event| {
+            call.add_global_event(event.clone(), BufferWrapper(sink.get_subscriber()));
+        });
+        sink.start_system_event_loop(py).map(|x| x.into())
     }
 }

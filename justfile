@@ -8,3 +8,6 @@ check:
 build:
     cargo run --bin stub_gen
     uvx maturin build
+dev:
+    cargo run --bin stub_gen
+    uvx maturin develop

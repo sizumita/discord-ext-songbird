@@ -6,6 +6,10 @@ dependencies = [
     "audioop-lts; python_version >= '3.13'",
     "typing-extensions>=4.15.0",
     "ty>=0.0.8",
+    "pyarrow>=22.0.0",
+    "arro3-core>=0.6.5",
+    "arro3-io>=0.6.5",
+    "arro3-compute>=0.6.5",
 ]
 classifiers = [
     "Programming Language :: Rust",

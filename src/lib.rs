@@ -3,6 +3,7 @@
 mod client;
 mod error;
 mod future;
+mod receive;
 mod update;
 
 use crate::client::SongbirdImpl;
@@ -16,6 +17,16 @@ mod native {
 
     #[pymodule_export]
     use super::SongbirdImpl;
+
+    #[pymodule]
+    mod receive {
+        #[pymodule_export]
+        use crate::receive::sink::DefaultSink;
+        #[pymodule_export]
+        use crate::receive::sink::SinkBase;
+        #[pymodule_export]
+        use crate::receive::tick::VoiceTick;
+    }
 
     #[pymodule]
     mod error {

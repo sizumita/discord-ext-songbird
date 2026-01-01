@@ -20,6 +20,7 @@ name = "stub_gen"
 doc = false
 
 [dependencies]
+arrow = {version = "57.1.0"}
 log = "0.4.29"
 pyo3 = { version = "0.27.2", features = ["experimental-async"] }
 pyo3-log = "0.13.2"
@@ -32,6 +33,9 @@ async-trait = "0.1.83"
 thiserror = "2"
 symphonia = { features = ["wav", "pcm", "mp3"], version = "0.5.5" }
 env_logger = "0.11.8"
+tokio-stream = "0.1.17"
+async-stream = "0.3.6"
+futures = "0.3.31"
 
 [build-dependencies]
 pyo3-build-config = "0.27.2"
