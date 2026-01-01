@@ -40,11 +40,9 @@ impl VoiceTick {
             .speaking
             .iter()
             .filter_map(|(k, v)| {
-                if let Some(data) = &v.decoded_voice {
-                    Some((*k, Arc::new(Int16Array::from(data.clone()))))
-                } else {
-                    None
-                }
+                v.decoded_voice
+                    .as_ref()
+                    .map(|data| (*k, Arc::new(Int16Array::from(data.clone()))))
             })
             .collect::<HashMap<_, _>>();
         Self {

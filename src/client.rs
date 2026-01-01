@@ -439,7 +439,7 @@ impl SongbirdImpl {
         let call = guard.get_mut()?;
 
         sink.receive_events.iter().for_each(|event| {
-            call.add_global_event(event.clone(), BufferWrapper(sink.get_subscriber()));
+            call.add_global_event(*event, BufferWrapper(sink.get_subscriber()));
         });
         sink.start_system_event_loop(py).map(|x| x.into())
     }

@@ -37,13 +37,13 @@ impl EventHandler for DefaultBuffer {
             }
             EventContext::SpeakingStateUpdate(speaking) => {
                 self.system_tx
-                    .send(SystemEvent::SpeakingStateUpdate(speaking.clone()))
+                    .send(SystemEvent::SpeakingStateUpdate(*speaking))
                     .await
                     .unwrap();
             }
             EventContext::ClientDisconnect(disconnect) => {
                 self.system_tx
-                    .send(SystemEvent::ClientDisconnect(disconnect.user_id.clone()))
+                    .send(SystemEvent::ClientDisconnect(disconnect.user_id))
                     .await
                     .unwrap();
             }

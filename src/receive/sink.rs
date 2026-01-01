@@ -31,7 +31,7 @@ impl Drop for SinkBase {
 }
 
 impl SinkBase {
-    fn new<'py>(
+    fn new(
         can_multi_subscribe: bool,
         system_rx: mpsc::Receiver<SystemEvent>,
         subscriber: Arc<dyn EventHandler + Send>,

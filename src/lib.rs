@@ -15,6 +15,23 @@ use pyo3_stub_gen::define_stub_info_gatherer;
 mod native {
     use pyo3::prelude::*;
 
+    pyo3_stub_gen::module_doc!(
+        "discord.ext.songbird.native",
+        r#"{} v{}"#,
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    );
+
+    pyo3_stub_gen::module_variable!(
+        "discord.ext.songbird.native",
+        "VERSION",
+        &str,
+        env!("CARGO_PKG_VERSION")
+    );
+
+    #[pymodule_export]
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+
     #[pymodule_export]
     use super::SongbirdImpl;
 
