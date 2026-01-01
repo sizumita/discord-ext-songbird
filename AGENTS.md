@@ -21,6 +21,12 @@ This repository hosts a hybrid Rust/Python voice backend for `discord.py`, built
 - Python: 4-space indent, line length 120, double quotes per Ruff config. Use `ruff format` and `ruff check`.
 - Naming: snake_case for functions/modules, PascalCase for types/classes (e.g., `SongbirdClient`).
 
+## Tooling Preference (Serena)
+When analyzing or editing code, use Serena tools as the default approach. Prefer the JetBrains-backed
+symbol tools (e.g., `jet_brains_find_symbol`, `jet_brains_get_symbols_overview`,
+`jet_brains_find_referencing_symbols`) whenever possible to navigate and edit code precisely.
+Only fall back to plain text search when necessary.
+
 ## Testing Guidelines
 There is no dedicated automated test suite today. Use `just check` for lint/type checks and validate behavior with `examples/`. If adding tests, place Python tests under `tests/` with `test_*.py` naming, and Rust unit tests in the corresponding `src/` modules.
 

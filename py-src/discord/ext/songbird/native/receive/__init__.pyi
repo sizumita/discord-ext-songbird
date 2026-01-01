@@ -7,13 +7,67 @@ import typing
 import pyarrow
 
 class DefaultSink(SinkBase):
-    def __new__(cls) -> DefaultSink: ...
-    def __aiter__(self) -> DefaultSink: ...
-    def __anext__(self) -> typing.Coroutine[typing.Any, typing.Any, VoiceTick]: ...
+    def __new__(cls) -> DefaultSink:
+        r"""
+        Create a default receive sink.
+
+        This sink yields `VoiceTick` objects and tracks speaking state.
+
+        Returns
+        -------
+        DefaultSink
+            The created sink.
+        """
+    def __aiter__(self) -> DefaultSink:
+        r"""
+        Return this sink as an async iterator.
+
+        Returns
+        -------
+        DefaultSink
+            This sink instance.
+        """
+    def __anext__(self) -> typing.Coroutine[typing.Any, typing.Any, VoiceTick]:
+        r"""
+        |coro|
+
+        Await the next voice tick.
+
+        Returns
+        -------
+        VoiceTick
+            The next voice tick.
+
+        Raises
+        ------
+        StopAsyncIteration
+            If the sink is closed.
+        """
 
 class SinkBase:
-    def get_user_id(self, ssrc: builtins.int) -> typing.Optional[builtins.int]: ...
+    def get_user_id(self, ssrc: builtins.int) -> typing.Optional[builtins.int]:
+        r"""
+        Resolve a user ID for the given SSRC.
+
+        Parameters
+        ----------
+        ssrc: int
+            The SSRC to resolve.
+
+        Returns
+        -------
+        int | None
+            The user ID if known, otherwise None.
+        """
 
 @typing.final
 class VoiceTick:
-    def get_speakings(self) -> typing.Dict[int, pyarrow.Int16Array]: ...
+    def get_speakings(self) -> typing.Dict[int, pyarrow.Int16Array]:
+        r"""
+        Get decoded PCM frames for speakers in this tick.
+
+        Returns
+        -------
+        Dict[int, pyarrow.Int16Array]
+            Mapping of SSRC to PCM frames for users speaking this tick.
+        """

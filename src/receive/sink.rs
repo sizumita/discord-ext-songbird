@@ -88,6 +88,17 @@ impl SinkBase {
 #[gen_stub_pymethods]
 #[pymethods]
 impl SinkBase {
+    /// Resolve a user ID for the given SSRC.
+    ///
+    /// Parameters
+    /// ----------
+    /// ssrc: int
+    ///     The SSRC to resolve.
+    ///
+    /// Returns
+    /// -------
+    /// int | None
+    ///     The user ID if known, otherwise None.
     fn get_user_id(&self, ssrc: u32) -> PyResult<Option<u64>> {
         let ssrc_lock = self.ssrc.blocking_lock();
         if let Some(user_id) = ssrc_lock.get_user(&ssrc) {
@@ -109,6 +120,14 @@ pub struct DefaultSink {
 impl DefaultSink {
     #[gen_stub(override_return_type(type_repr = "DefaultSink"))]
     #[new]
+    /// Create a default receive sink.
+    ///
+    /// This sink yields `VoiceTick` objects and tracks speaking state.
+    ///
+    /// Returns
+    /// -------
+    /// DefaultSink
+    ///     The created sink.
     fn new() -> PyResult<(Self, SinkBase)> {
         let (voice_tx, mut voice_rx) = watch::channel(VoiceTick::default());
         let _ = voice_rx.borrow_and_update();
@@ -132,10 +151,29 @@ impl DefaultSink {
         ))
     }
 
+    /// Return this sink as an async iterator.
+    ///
+    /// Returns
+    /// -------
+    /// DefaultSink
+    ///     This sink instance.
     fn __aiter__(slf: PyRef<Self>) -> PyRef<Self> {
         slf
     }
 
+    /// |coro|
+    ///
+    /// Await the next voice tick.
+    ///
+    /// Returns
+    /// -------
+    /// VoiceTick
+    ///     The next voice tick.
+    ///
+    /// Raises
+    /// ------
+    /// StopAsyncIteration
+    ///     If the sink is closed.
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<PyFuture<'py, VoiceTick>> {
         let voice_rx = self.voice_rx.clone();
         future_into_py(py, async move {

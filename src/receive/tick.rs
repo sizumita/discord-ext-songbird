@@ -18,6 +18,12 @@ pub struct VoiceTick {
 #[pymethods]
 impl VoiceTick {
     #[gen_stub(override_return_type(type_repr = "typing.Dict[int, pyarrow.Int16Array]", imports = ("typing", "pyarrow")))]
+    /// Get decoded PCM frames for speakers in this tick.
+    ///
+    /// Returns
+    /// -------
+    /// Dict[int, pyarrow.Int16Array]
+    ///     Mapping of SSRC to PCM frames for users speaking this tick.
     fn get_speakings<'py>(&self, py: Python<'py>) -> PyResult<HashMap<u32, Bound<'py, PyAny>>> {
         let mut dict = HashMap::new();
         for (k, v) in self.speaking.iter() {

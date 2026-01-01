@@ -415,6 +415,21 @@ impl SongbirdImpl {
         }
     }
 
+    /// |coro|
+    ///
+    /// Register a receive sink for voice events.
+    ///
+    /// This attaches the sink's event handlers to the current call and starts
+    /// its internal system event loop.
+    ///
+    /// Parameters
+    /// ----------
+    /// sink: SinkBase
+    ///     The receive sink to register.
+    ///
+    /// Returns
+    /// -------
+    /// None
     fn listen<'py>(
         &self,
         py: Python<'py>,

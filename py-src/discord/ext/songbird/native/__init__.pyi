@@ -191,4 +191,21 @@ class SongbirdImpl:
             The channel to move to.
             If None, disconnects from voice.
         """
-    def listen(self, sink: SinkBase) -> None: ...
+    def listen(self, sink: SinkBase) -> typing.Coroutine[typing.Any, typing.Any, None]:
+        r"""
+        |coro|
+
+        Register a receive sink for voice events.
+
+        This attaches the sink's event handlers to the current call and starts
+        its internal system event loop.
+
+        Parameters
+        ----------
+        sink: SinkBase
+            The receive sink to register.
+
+        Returns
+        -------
+        None
+        """
