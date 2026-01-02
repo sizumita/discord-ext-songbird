@@ -5,69 +5,59 @@ import builtins
 import typing
 
 import pyarrow
+from discord.ext.songbird.native.model import PyAsyncIterator
 
-class DefaultSink(SinkBase):
-    def __new__(cls) -> DefaultSink:
-        r"""
-        Create a default receive sink.
+@typing.final
+class BufferSink(SinkBase):
+    def __new__(cls, max_in_seconds: typing.Optional[builtins.int] = None) -> typing.Self: ...
+    def stop(self) -> None: ...
+    def __getitem__(
+        self, key: VoiceKey
+    ) -> PyAsyncIterator[
+        typing.Optional[typing.Tuple[VoiceState.Speaking, pyarrow.Int16Array] | typing.Tuple[VoiceState.Silent, None]]
+    ]: ...
+    def __aiter__(self) -> PyAsyncIterator[VoiceTick]: ...
 
-        This sink yields `VoiceTick` objects and tracks speaking state.
+class SinkBase: ...
 
-        Returns
-        -------
-        DefaultSink
-            The created sink.
-        """
-    def __aiter__(self) -> DefaultSink:
-        r"""
-        Return this sink as an async iterator.
+class VoiceKey:
+    @typing.final
+    class User(VoiceKey):
+        __match_args__ = ("_0",)
+        @property
+        def _0(self) -> builtins.int: ...
+        def __new__(cls, _0: builtins.int) -> VoiceKey.User: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int) -> typing.Any: ...
 
-        Returns
-        -------
-        DefaultSink
-            This sink instance.
-        """
-    def __anext__(self) -> typing.Coroutine[typing.Any, typing.Any, VoiceTick]:
-        r"""
-        |coro|
+    @typing.final
+    class Unknown(VoiceKey):
+        __match_args__ = ("_0",)
+        @property
+        def _0(self) -> builtins.int: ...
+        def __new__(cls, _0: builtins.int) -> VoiceKey.Unknown: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int) -> typing.Any: ...
 
-        Await the next voice tick.
+    ...
 
-        Returns
-        -------
-        VoiceTick
-            The next voice tick.
+class VoiceState:
+    @typing.final
+    class Speaking(VoiceState):
+        __match_args__ = ()
+        def __new__(cls) -> VoiceState.Speaking: ...
 
-        Raises
-        ------
-        StopAsyncIteration
-            If the sink is closed.
-        """
+    @typing.final
+    class Silent(VoiceState):
+        __match_args__ = ()
+        def __new__(cls) -> VoiceState.Silent: ...
 
-class SinkBase:
-    def get_user_id(self, ssrc: builtins.int) -> typing.Optional[builtins.int]:
-        r"""
-        Resolve a user ID for the given SSRC.
-
-        Parameters
-        ----------
-        ssrc: int
-            The SSRC to resolve.
-
-        Returns
-        -------
-        int | None
-            The user ID if known, otherwise None.
-        """
+    ...
 
 @typing.final
 class VoiceTick:
-    def get_speakings(self) -> typing.Dict[int, pyarrow.Int16Array]:
-        r"""
-        Get decoded PCM frames for speakers in this tick.
-
-        Returns
-        -------
-        Dict[int, pyarrow.Int16Array]
-            Mapping of SSRC to PCM frames for users speaking this tick.
-        """
+    def get(
+        self, key: VoiceKey
+    ) -> typing.Optional[
+        typing.Tuple[VoiceState.Speaking, pyarrow.Int16Array] | typing.Tuple[VoiceState.Silent, None]
+    ]: ...

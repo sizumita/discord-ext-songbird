@@ -1,6 +1,6 @@
 from . import native
 from .client import SongbirdClient as SongbirdClient
-from .native import receive
+from .native import receive as receive
 
 __author__ = "sizumita"
 __version__ = native.VERSION

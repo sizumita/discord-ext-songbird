@@ -10,7 +10,7 @@ import typing
 import discord
 from discord.ext.songbird.native.receive import SinkBase
 
-from . import error, receive
+from . import error, model, receive
 
 VERSION: builtins.str = "0.4.0-alpha"
 
@@ -196,7 +196,7 @@ class SongbirdImpl:
             The channel to move to.
             If None, disconnects from voice.
         """
-    def listen(self, sink: SinkBase) -> typing.Coroutine[typing.Any, typing.Any, None]:
+    def listen(self, sink: SinkBase) -> None:
         r"""
         |coro|
 

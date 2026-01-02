@@ -1,53 +1,58 @@
 use arrow::array::Int16Array;
+use dashmap::DashMap;
 use pyo3::{pyclass, pymethods, Bound, PyAny, PyResult, Python};
 use pyo3_arrow::PyArray;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
-use songbird::events::context_data::VoiceTick as SongbirdVoiceTick;
-use std::collections::{HashMap, HashSet};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
+use std::collections::HashSet;
 use std::sync::Arc;
+
+#[gen_stub_pyclass_complex_enum]
+#[pyclass(module = "discord.ext.songbird.native.receive")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum VoiceKey {
+    User(u64),
+    Unknown(u32),
+}
+
+#[gen_stub_pyclass_complex_enum]
+#[pyclass(module = "discord.ext.songbird.native.receive")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoiceState {
+    Speaking,
+    Silent,
+}
 
 #[gen_stub_pyclass]
 #[pyclass(module = "discord.ext.songbird.native.receive")]
 #[derive(Default, Clone)]
 pub struct VoiceTick {
-    pub speaking: HashMap<u32, Arc<Int16Array>>,
-    pub silent: HashSet<u32>,
+    pub speaking: DashMap<VoiceKey, Arc<Int16Array>>,
+    pub silent: HashSet<VoiceKey>,
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
 impl VoiceTick {
-    #[gen_stub(override_return_type(type_repr = "typing.Dict[int, pyarrow.Int16Array]", imports = ("typing", "pyarrow")))]
-    /// Get decoded PCM frames for speakers in this tick.
-    ///
-    /// Returns
-    /// -------
-    /// Dict[int, pyarrow.Int16Array]
-    ///     Mapping of SSRC to PCM frames for users speaking this tick.
-    fn get_speakings<'py>(&self, py: Python<'py>) -> PyResult<HashMap<u32, Bound<'py, PyAny>>> {
-        let mut dict = HashMap::new();
-        for (k, v) in self.speaking.iter() {
-            let r = PyArray::from_array_ref(v.clone());
-            dict.insert(*k, r.into_arro3(py)?);
-        }
-        Ok(dict)
-    }
-}
-
-impl VoiceTick {
-    pub fn from_data(value: &SongbirdVoiceTick) -> Self {
-        let speaking = value
-            .speaking
-            .iter()
-            .filter_map(|(k, v)| {
-                v.decoded_voice
-                    .as_ref()
-                    .map(|data| (*k, Arc::new(Int16Array::from(data.clone()))))
-            })
-            .collect::<HashMap<_, _>>();
-        Self {
-            speaking,
-            silent: value.silent.clone(),
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Optional[typing.Tuple[VoiceState.Speaking, pyarrow.Int16Array] | typing.Tuple[VoiceState.Silent, None]]",
+        imports = ("typing", "pyarrow")
+    ))]
+    pub fn get<'py>(
+        &self,
+        py: Python<'py>,
+        key: &VoiceKey,
+    ) -> PyResult<Option<(VoiceState, Option<Bound<'py, PyAny>>)>> {
+        if let Some(data) = self.speaking.get(&key) {
+            Ok(Some((
+                VoiceState::Speaking,
+                Some(PyArray::from_array_ref(data.clone()).into_arro3(py)?),
+            )))
+        } else {
+            if let true = self.silent.contains(&key) {
+                Ok(Some((VoiceState::Silent, None)))
+            } else {
+                Ok(None)
+            }
         }
     }
 }

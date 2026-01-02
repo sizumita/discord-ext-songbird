@@ -861,6 +861,7 @@ dependencies = [
  "arrow",
  "async-stream",
  "async-trait",
+ "dashmap",
  "env_logger",
  "futures",
  "log",
@@ -3853,6 +3854,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 use crate::error::IntoPyResult;
-use crate::future::PyFuture;
-use crate::receive::buffer::BufferWrapper;
+use crate::model::PyFuture;
 use crate::receive::sink::SinkBase;
+use crate::receive::HandlerWrapper;
 use crate::update::VoiceUpdater;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::types::PyTuple;
@@ -430,17 +430,14 @@ impl SongbirdImpl {
     /// Returns
     /// -------
     /// None
-    fn listen<'py>(
-        &self,
-        py: Python<'py>,
-        mut sink: PyRefMut<'py, SinkBase>,
-    ) -> PyResult<PyFuture<'py, ()>> {
+    fn listen<'py>(&self, _py: Python<'py>, sink: PyRefMut<'py, SinkBase>) -> PyResult<()> {
         let mut guard = self.call.blocking_lock();
         let call = guard.get_mut()?;
 
         sink.receive_events.iter().for_each(|event| {
-            call.add_global_event(*event, BufferWrapper(sink.get_subscriber()));
+            call.add_global_event(*event, HandlerWrapper(sink.get_subscriber()));
         });
-        sink.start_system_event_loop(py).map(|x| x.into())
+
+        Ok(())
     }
 }

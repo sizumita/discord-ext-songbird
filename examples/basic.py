@@ -1,8 +1,10 @@
+import asyncio
 import logging
 import os
 
 import discord
 from discord.ext import songbird
+from discord.ext.songbird import receive
 
 FORMAT = "%(levelname)s %(name)s %(asctime)-15s %(filename)s:%(lineno)d %(message)s"
 logging.basicConfig(format=FORMAT)
@@ -21,12 +23,15 @@ async def on_ready():
     if isinstance(ch, discord.VoiceChannel):
         vc = await ch.connect(cls=songbird.SongbirdClient)
 
-        sink = songbird.native.receive.DefaultSink()
+        sink = receive.BufferSink()
         vc.listen(sink)
 
-        async for msg in sink:
-            if msg.get_speakings() != {}:
-                print("some speakers are speaking")
+        await asyncio.sleep(5)
+
+        sink.stop()
+
+        async for msg in sink[receive.VoiceKey.User(212513828641046529)]:
+            print(msg)
 
 
 client.run(os.environ["DISCORD_BOT_TOKEN"])
