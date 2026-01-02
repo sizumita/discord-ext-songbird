@@ -1,8 +1,11 @@
+use crate::model::ArrowArray;
 use arrow::array::Int16Array;
 use dashmap::DashMap;
 use pyo3::{pyclass, pymethods, Bound, PyAny, PyResult, Python};
 use pyo3_arrow::PyArray;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
+use pyo3_stub_gen::derive::{
+    gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pyclass_enum, gen_stub_pymethods,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -12,14 +15,6 @@ use std::sync::Arc;
 pub enum VoiceKey {
     User(u64),
     Unknown(u32),
-}
-
-#[gen_stub_pyclass_complex_enum]
-#[pyclass(module = "discord.ext.songbird.native.receive")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VoiceState {
-    Speaking,
-    Silent,
 }
 
 #[gen_stub_pyclass]
@@ -33,24 +28,42 @@ pub struct VoiceTick {
 #[gen_stub_pymethods]
 #[pymethods]
 impl VoiceTick {
-    #[gen_stub(override_return_type(
-        type_repr = "typing.Optional[typing.Tuple[VoiceState.Speaking, pyarrow.Int16Array] | typing.Tuple[VoiceState.Silent, None]]",
-        imports = ("typing", "pyarrow")
-    ))]
     pub fn get<'py>(
         &self,
         py: Python<'py>,
         key: &VoiceKey,
-    ) -> PyResult<Option<(VoiceState, Option<Bound<'py, PyAny>>)>> {
+    ) -> PyResult<Option<ArrowArray<'py, Int16Array>>> {
         if let Some(data) = self.speaking.get(key) {
-            Ok(Some((
-                VoiceState::Speaking,
-                Some(PyArray::from_array_ref(data.clone()).into_arro3(py)?),
-            )))
-        } else if self.silent.contains(key) {
-            Ok(Some((VoiceState::Silent, None)))
+            Ok(Some(
+                PyArray::from_array_ref(data.clone()).into_arro3(py)?.into(),
+            ))
         } else {
             Ok(None)
         }
+    }
+
+    pub fn is_silent(&self, key: &VoiceKey) -> bool {
+        self.silent.contains(key)
+    }
+
+    fn all_keys(&self) -> HashSet<VoiceKey> {
+        let mut all_keys: HashSet<VoiceKey> = self
+            .speaking
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        all_keys.extend(self.silent.iter().cloned());
+        all_keys
+    }
+
+    fn speaking_keys(&self) -> HashSet<VoiceKey> {
+        self.speaking
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
+    fn silent_keys(&self) -> HashSet<VoiceKey> {
+        self.silent.clone()
     }
 }

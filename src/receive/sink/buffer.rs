@@ -1,11 +1,11 @@
-use crate::model::{Generic, PyAsyncIterator};
+use crate::model::{ArrowArray, Generic, PyAsyncIterator};
 use crate::receive::sink::SinkBase;
 use crate::receive::tick::{VoiceKey, VoiceTick};
 use arrow::array::Int16Array;
 use async_stream::stream;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use pyo3::{pyclass, pymethods, IntoPyObjectExt, PyRef, PyResult, Python};
+use pyo3::{pyclass, pymethods, Bound, IntoPyObjectExt, PyAny, PyRef, PyResult, Python};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::{CoreEvent, Event, EventContext, EventHandler};
 use std::collections::{HashSet, VecDeque};
@@ -130,11 +130,10 @@ impl BufferSink {
         self.is_stopped.store(true, Ordering::Relaxed);
     }
 
-    #[gen_stub(override_return_type(
-        type_repr = "PyAsyncIterator[typing.Optional[typing.Tuple[VoiceState.Speaking, pyarrow.Int16Array] | typing.Tuple[VoiceState.Silent, None]]]",
-        imports = ("typing", "pyarrow")
-    ))]
-    fn __getitem__(&self, key: VoiceKey) -> PyResult<PyAsyncIterator> {
+    fn __getitem__(
+        &self,
+        key: VoiceKey,
+    ) -> PyResult<Generic<PyAsyncIterator, Option<ArrowArray<Int16Array>>>> {
         let ticks = self.ticks.clone();
         let s = stream! {
             loop {
@@ -153,7 +152,7 @@ impl BufferSink {
                 yield tick;
             }
         };
-        Ok(PyAsyncIterator::new(s))
+        Ok(Generic::new(PyAsyncIterator::new(s)))
     }
 
     fn __aiter__<'py>(slf: PyRef<'py, Self>) -> Generic<'py, PyAsyncIterator, VoiceTick> {
