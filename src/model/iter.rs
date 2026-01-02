@@ -11,9 +11,11 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_stream::{Stream, StreamExt};
 
+type AsyncStream = Arc<Mutex<Pin<Box<dyn Stream<Item = PyResult<Py<PyAny>>> + Send + 'static>>>>;
+
 #[pyclass(module = "discord.ext.songbird.native.model")]
 pub struct PyAsyncIterator {
-    stream: Arc<Mutex<Pin<Box<dyn Stream<Item = PyResult<Py<PyAny>>> + Send + 'static>>>>,
+    stream: AsyncStream,
 }
 
 impl PyStubType for PyAsyncIterator {

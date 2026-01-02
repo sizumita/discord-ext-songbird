@@ -115,7 +115,6 @@ impl BufferSink {
         Ok((
             Self { is_stopped, ticks },
             SinkBase::new(
-                true,
                 Arc::new(handler),
                 vec![
                     Event::Core(CoreEvent::VoiceTick),
@@ -144,7 +143,7 @@ impl BufferSink {
                     if let Some(tick) = guard.pop_front() {
                         Python::attach(|py| {
                             let k = tick.get(py, &key);
-                            k.map(|x| x.into_py_any(py)).flatten()
+                            k.and_then(|x| x.into_py_any(py))
                         })
                     } else {
                         drop(guard);

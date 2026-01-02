@@ -42,17 +42,15 @@ impl VoiceTick {
         py: Python<'py>,
         key: &VoiceKey,
     ) -> PyResult<Option<(VoiceState, Option<Bound<'py, PyAny>>)>> {
-        if let Some(data) = self.speaking.get(&key) {
+        if let Some(data) = self.speaking.get(key) {
             Ok(Some((
                 VoiceState::Speaking,
                 Some(PyArray::from_array_ref(data.clone()).into_arro3(py)?),
             )))
+        } else if self.silent.contains(key) {
+            Ok(Some((VoiceState::Silent, None)))
         } else {
-            if let true = self.silent.contains(&key) {
-                Ok(Some((VoiceState::Silent, None)))
-            } else {
-                Ok(None)
-            }
+            Ok(None)
         }
     }
 }
