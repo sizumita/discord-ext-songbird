@@ -110,6 +110,9 @@ impl EventHandler for BufferSinkHandler {
                 }
                 guard.push_back(tick);
             }
+            EventContext::ClientDisconnect(disconnect) => {
+                self.ssrc_map.retain(|_, v| !disconnect.user_id.0.eq(v));
+            }
             _ => {}
         }
         None
@@ -140,7 +143,7 @@ impl BufferSink {
         } else {
             VecDeque::new()
         }));
-        let handler = BufferSinkHandler::new(ticks.clone(), is_stopped.clone(), max_in_seconds);
+        let handler = BufferSinkHandler::new(ticks.clone(), is_stopped.clone(), max_ticks);
         Ok((
             Self { is_stopped, ticks },
             SinkBase::new(
