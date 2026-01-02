@@ -14,6 +14,11 @@ use tokio_stream::{Stream, StreamExt};
 type AsyncStream = Arc<Mutex<Pin<Box<dyn Stream<Item = PyResult<Py<PyAny>>> + Send + 'static>>>>;
 
 #[pyclass(module = "discord.ext.songbird.native.model")]
+/// Async iterator wrapper used by the native module.
+///
+/// Notes
+/// -----
+/// This is an internal type and not meant to be constructed directly.
 pub struct PyAsyncIterator {
     stream: AsyncStream,
 }
@@ -32,7 +37,7 @@ submit! {
         struct_id: TypeId::of::<PyAsyncIterator>,
         pyclass_name: "PyAsyncIterator[T]",
         module: Some("discord.ext.songbird.native.model"),
-        doc: "",
+        doc: "Async iterator wrapper used by the native module.\n\nNotes\n-----\nThis is an internal type and not meant to be constructed directly.",
         getters: &[],
         setters: &[],
         bases: &[],
@@ -59,11 +64,21 @@ impl PyAsyncIterator {
 #[pymethods]
 impl PyAsyncIterator {
     #[gen_stub(override_return_type(type_repr = "PyAsyncIterator[T]", imports = ("typing")))]
+    /// Return self as an async iterator.
+    ///
+    /// Returns
+    /// -------
+    /// PyAsyncIterator[T]
     fn __aiter__(slf: PyRef<Self>) -> PyRef<Self> {
         slf
     }
 
     #[gen_stub(override_return_type(type_repr = "typing.Coroutine[typing.Any, typing.Any, T]", imports = ("typing")))]
+    /// Await the next item from the iterator.
+    ///
+    /// Returns
+    /// -------
+    /// typing.Coroutine[typing.Any, typing.Any, T]
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<PyFuture<'py, PyAny>> {
         let stream = self.stream.clone();
         future_into_py(py, async move {

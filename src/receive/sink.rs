@@ -10,6 +10,12 @@ pub use buffer::BufferSink;
 
 #[gen_stub_pyclass]
 #[pyclass(subclass, module = "discord.ext.songbird.native.receive")]
+/// Base class for receive sinks.
+///
+/// Notes
+/// -----
+/// This is an internal type exposed to Python for sink registration.
+/// Custom sinks are not currently supported from Python.
 pub struct SinkBase {
     subscriber: Arc<dyn EventHandler + Send>,
     pub receive_events: HashSet<Event>,

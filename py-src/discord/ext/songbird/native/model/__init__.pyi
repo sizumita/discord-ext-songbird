@@ -5,5 +5,26 @@ import typing
 
 @typing.final
 class PyAsyncIterator[T]:
-    def __aiter__(self) -> PyAsyncIterator[T]: ...
-    def __anext__(self) -> typing.Coroutine[typing.Any, typing.Any, T]: ...
+    r"""
+    Async iterator wrapper used by the native module.
+
+    Notes
+    -----
+    This is an internal type and not meant to be constructed directly.
+    """
+    def __aiter__(self) -> PyAsyncIterator[T]:
+        r"""
+        Return self as an async iterator.
+
+        Returns
+        -------
+        PyAsyncIterator[T]
+        """
+    def __anext__(self) -> typing.Coroutine[typing.Any, typing.Any, T]:
+        r"""
+        Await the next item from the iterator.
+
+        Returns
+        -------
+        typing.Coroutine[typing.Any, typing.Any, T]
+        """

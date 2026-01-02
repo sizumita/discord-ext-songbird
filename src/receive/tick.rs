@@ -1,7 +1,8 @@
 use crate::model::ArrowArray;
 use arrow::array::Int16Array;
 use dashmap::DashMap;
-use pyo3::{pyclass, pymethods, Bound, PyAny, PyResult, Python};
+use pyo3::types::PyInt;
+use pyo3::{pyclass, pymethods, Bound, IntoPyObject, PyAny, PyResult, Python};
 use pyo3_arrow::PyArray;
 use pyo3_stub_gen::derive::{
     gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pyclass_enum, gen_stub_pymethods,
@@ -11,6 +12,17 @@ use std::sync::Arc;
 
 #[gen_stub_pyclass_complex_enum]
 #[pyclass(module = "discord.ext.songbird.native.receive")]
+/// Identifier for a voice source.
+///
+/// This is either a Discord user ID or an unknown SSRC.
+///
+/// Examples
+/// --------
+/// ```python
+/// key = receive.VoiceKey.User(1234)
+/// key.id()
+/// key.is_user()
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum VoiceKey {
     User(u64),
@@ -19,6 +31,16 @@ pub enum VoiceKey {
 
 #[gen_stub_pyclass]
 #[pyclass(module = "discord.ext.songbird.native.receive")]
+/// Snapshot of received voice data for a single tick.
+///
+/// Examples
+/// --------
+/// ```python
+/// key = receive.VoiceKey.User(user_id)
+/// pcm = tick.get(key)
+/// if pcm is None and tick.is_silent(key):
+///     print(\"silent\")
+/// ```
 #[derive(Default, Clone)]
 pub struct VoiceTick {
     pub speaking: DashMap<VoiceKey, Arc<Int16Array>>,
@@ -27,7 +49,81 @@ pub struct VoiceTick {
 
 #[gen_stub_pymethods]
 #[pymethods]
+impl VoiceKey {
+    /// Return the underlying integer identifier.
+    ///
+    /// For user keys this is the user ID, otherwise the SSRC value.
+    ///
+    /// Returns
+    /// -------
+    /// int
+    ///
+    /// Examples
+    /// --------
+    /// ```python
+    /// key = receive.VoiceKey.User(1234)
+    /// key.id()
+    /// ```
+    fn id<'py>(&self, py: Python<'py>) -> Bound<'py, PyInt> {
+        match self {
+            VoiceKey::User(user_id) => PyInt::new(py, *user_id),
+            VoiceKey::Unknown(ssrc) => PyInt::new(py, *ssrc),
+        }
+    }
+
+    /// Check whether this key represents a user ID.
+    ///
+    /// Returns
+    /// -------
+    /// bool
+    ///
+    /// Examples
+    /// --------
+    /// ```python
+    /// receive.VoiceKey.User(1).is_user()
+    /// ```
+    fn is_user(&self) -> bool {
+        matches!(self, VoiceKey::User(_))
+    }
+
+    /// Check whether this key represents an unknown SSRC.
+    ///
+    /// Returns
+    /// -------
+    /// bool
+    ///
+    /// Examples
+    /// --------
+    /// ```python
+    /// receive.VoiceKey.Unknown(42).is_unknown()
+    /// ```
+    fn is_unknown(&self) -> bool {
+        matches!(self, VoiceKey::Unknown(_))
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
 impl VoiceTick {
+    /// Get PCM audio for a key if it is speaking in this tick.
+    ///
+    /// Parameters
+    /// ----------
+    /// key : VoiceKey
+    ///     The user/ssrc key to query.
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.Int16Array | None
+    ///     PCM when speaking, otherwise None.
+    ///
+    /// Examples
+    /// --------
+    /// ```python
+    /// pcm = tick.get(receive.VoiceKey.User(user_id))
+    /// if pcm is not None:
+    ///     handle_pcm(pcm)
+    /// ```
     pub fn get<'py>(
         &self,
         py: Python<'py>,
@@ -42,10 +138,39 @@ impl VoiceTick {
         }
     }
 
+    /// Check whether a key is marked silent in this tick.
+    ///
+    /// Parameters
+    /// ----------
+    /// key : VoiceKey
+    ///     The user/ssrc key to query.
+    ///
+    /// Returns
+    /// -------
+    /// bool
+    ///
+    /// Examples
+    /// --------
+    /// ```python
+    /// if tick.is_silent(receive.VoiceKey.User(user_id)):
+    ///     ...
+    /// ```
     pub fn is_silent(&self, key: &VoiceKey) -> bool {
         self.silent.contains(key)
     }
 
+    /// Return all keys present in this tick (speaking + silent).
+    ///
+    /// Returns
+    /// -------
+    /// set[VoiceKey]
+    ///
+    /// Examples
+    /// --------
+    /// ```python
+    /// for key in tick.all_keys():
+    ///     ...
+    /// ```
     fn all_keys(&self) -> HashSet<VoiceKey> {
         let mut all_keys: HashSet<VoiceKey> = self
             .speaking
@@ -56,6 +181,18 @@ impl VoiceTick {
         all_keys
     }
 
+    /// Return keys that have PCM data in this tick.
+    ///
+    /// Returns
+    /// -------
+    /// set[VoiceKey]
+    ///
+    /// Examples
+    /// --------
+    /// ```python
+    /// for key in tick.speaking_keys():
+    ///     ...
+    /// ```
     fn speaking_keys(&self) -> HashSet<VoiceKey> {
         self.speaking
             .iter()
@@ -63,6 +200,18 @@ impl VoiceTick {
             .collect()
     }
 
+    /// Return keys marked silent in this tick.
+    ///
+    /// Returns
+    /// -------
+    /// set[VoiceKey]
+    ///
+    /// Examples
+    /// --------
+    /// ```python
+    /// for key in tick.silent_keys():
+    ///     ...
+    /// ```
     fn silent_keys(&self) -> HashSet<VoiceKey> {
         self.silent.clone()
     }

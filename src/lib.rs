@@ -17,9 +17,27 @@ mod native {
 
     pyo3_stub_gen::module_doc!(
         "discord.ext.songbird.native",
-        r#"{} v{}"#,
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION")
+        r#"
+Native backend for discord-ext-songbird.
+
+This module contains the Rust-backed implementation used by
+`discord.ext.songbird.SongbirdClient`. Most users should import from
+`discord.ext.songbird` instead of this module directly.
+
+Submodules
+----------
+receive
+    Voice receive types and sinks.
+error
+    Backend exceptions.
+model
+    Internal iterator helpers.
+
+Attributes
+----------
+VERSION : str
+    Package version string.
+"#
     );
 
     pyo3_stub_gen::module_variable!(

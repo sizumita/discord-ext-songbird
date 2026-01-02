@@ -20,6 +20,7 @@ This repository hosts a hybrid Rust/Python voice backend for `discord.py`, built
 - Rust: `rustfmt` defaults via `cargo fmt`; `clippy` for linting.
 - Python: 4-space indent, line length 120, double quotes per Ruff config. Use `ruff format` and `ruff check`.
 - Naming: snake_case for functions/modules, PascalCase for types/classes (e.g., `SongbirdClient`).
+- Docstrings: use NumPy-style sections (`Parameters`, `Returns`, `Notes`, `Examples`) for pyclass/pymethods.
 
 ## Tooling Preference (Serena)
 When analyzing or editing code, use Serena tools as the default approach. Prefer the JetBrains-backed

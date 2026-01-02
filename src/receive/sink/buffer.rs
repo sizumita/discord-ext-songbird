@@ -22,6 +22,25 @@ pub struct BufferSinkHandler {
 
 #[gen_stub_pyclass]
 #[pyclass(extends=SinkBase, module = "discord.ext.songbird.native.receive")]
+/// Buffering sink for received voice data.
+///
+/// Collects `VoiceTick` snapshots and exposes them via async iteration.
+///
+/// Examples
+/// --------
+/// ```python
+/// from discord.ext import songbird
+/// from discord.ext.songbird import receive
+///
+/// vc = await channel.connect(cls=songbird.SongbirdClient)
+/// sink = receive.BufferSink(max_in_seconds=5)
+/// vc.listen(sink)
+///
+/// async for tick in sink:
+///     pcm = tick.get(receive.VoiceKey.User(user_id))
+///     if pcm is not None:
+///         handle_pcm(pcm)
+/// ```
 pub struct BufferSink {
     is_stopped: Arc<AtomicBool>,
     ticks: Arc<Mutex<VecDeque<VoiceTick>>>,
@@ -103,6 +122,16 @@ impl BufferSink {
     #[gen_stub(override_return_type(type_repr = "typing.Self", imports = ("typing")))]
     #[new]
     #[pyo3(signature = (max_in_seconds = None))]
+    /// Create a new BufferSink.
+    ///
+    /// Parameters
+    /// ----------
+    /// max_in_seconds : int | None
+    ///     Maximum buffer size in seconds worth of ticks. If None, unbounded.
+    ///
+    /// Returns
+    /// -------
+    /// BufferSink
     fn new(max_in_seconds: Option<usize>) -> PyResult<(Self, SinkBase)> {
         let is_stopped = Arc::new(AtomicBool::new(false));
         let max_ticks = max_in_seconds.map(|secs| secs * 50);
@@ -126,10 +155,38 @@ impl BufferSink {
         ))
     }
 
+    /// Stop buffering new ticks.
+    ///
+    /// Notes
+    /// -----
+    /// This does not unregister the sink.
+    ///
+    /// Returns
+    /// -------
+    /// None
     fn stop(&self) {
         self.is_stopped.store(true, Ordering::Relaxed);
     }
 
+    /// Return an async iterator over PCM for a specific key.
+    ///
+    /// Parameters
+    /// ----------
+    /// key : VoiceKey
+    ///     The user/ssrc key to filter.
+    ///
+    /// Returns
+    /// -------
+    /// PyAsyncIterator[pyarrow.Int16Array | None]
+    ///
+    /// Examples
+    /// --------
+    /// ```python
+    /// key = receive.VoiceKey.User(user_id)
+    /// async for pcm in sink[key]:
+    ///     if pcm is not None:
+    ///         handle_pcm(pcm)
+    /// ```
     fn __getitem__(
         &self,
         key: VoiceKey,
@@ -155,6 +212,18 @@ impl BufferSink {
         Ok(Generic::new(PyAsyncIterator::new(s)))
     }
 
+    /// Return an async iterator over buffered `VoiceTick` entries.
+    ///
+    /// Returns
+    /// -------
+    /// PyAsyncIterator[VoiceTick]
+    ///
+    /// Examples
+    /// --------
+    /// ```python
+    /// async for tick in sink:
+    ///     ...
+    /// ```
     fn __aiter__<'py>(slf: PyRef<'py, Self>) -> Generic<'py, PyAsyncIterator, VoiceTick> {
         let ticks = slf.ticks.clone();
         let s = stream! {

@@ -62,9 +62,9 @@ impl SongbirdImpl {
     ///
     /// Parameters
     /// ----------
-    /// client: discord.Client
+    /// client : discord.Client
     ///     The Discord client instance.
-    /// connectable: discord.abc.Connectable
+    /// connectable : discord.abc.Connectable
     ///     A connectable voice target (e.g., VoiceChannel or StageChannel).
     fn new(
         #[gen_stub(override_type(type_repr="discord.Client", imports=("discord")))] client: &Bound<
@@ -114,13 +114,13 @@ impl SongbirdImpl {
     ///
     /// Parameters
     /// ----------
-    /// timeout: float
+    /// timeout : float
     ///     Gateway connection timeout in seconds.
-    /// reconnect: bool
+    /// reconnect : bool
     ///     Whether to allow to reconnect attempts (currently ignored).
-    /// self_deaf: bool
+    /// self_deaf : bool
     ///     Whether to deafen this account after connecting.
-    /// self_mute: bool
+    /// self_mute : bool
     ///     Whether to mute this account after connecting.
     ///
     /// Returns
@@ -190,7 +190,7 @@ impl SongbirdImpl {
     ///
     /// Parameters
     /// ----------
-    /// force: bool
+    /// force : bool
     ///     Whether to force disconnect (currently ignored).
     ///
     /// Returns
@@ -215,9 +215,9 @@ impl SongbirdImpl {
     ///
     /// Parameters
     /// ----------
-    /// endpoint: str
+    /// endpoint : str
     ///     Voice server endpoint.
-    /// token: str
+    /// token : str
     ///     Voice session token.
     ///
     /// Returns
@@ -245,9 +245,9 @@ impl SongbirdImpl {
     ///
     /// Parameters
     /// ----------
-    /// session_id: str
+    /// session_id : str
     ///     Voice session ID.
-    /// channel_id: int | None
+    /// channel_id : int | None
     ///     Channel ID, or None if disconnecting.
     ///
     /// Returns
@@ -279,11 +279,11 @@ impl SongbirdImpl {
     ///
     /// Parameters
     /// ----------
-    /// channel_id: int | None
+    /// channel_id : int | None
     ///     Channel ID, or None if disconnecting.
-    /// self_mute: bool
+    /// self_mute : bool
     ///     Whether the account is self-muted.
-    /// self_deaf: bool
+    /// self_deaf : bool
     ///     Whether the account is self-deafened.
     ///
     /// Returns
@@ -306,7 +306,7 @@ impl SongbirdImpl {
     ///
     /// Parameters
     /// ----------
-    /// self_deaf: bool
+    /// self_deaf : bool
     ///     Whether to deafen or undeafen this account.
     ///
     /// Returns
@@ -329,7 +329,7 @@ impl SongbirdImpl {
     ///
     /// Parameters
     /// ----------
-    /// self_mute: bool
+    /// self_mute : bool
     ///     Whether to mute or unmute this account.
     ///
     /// Returns
@@ -376,9 +376,13 @@ impl SongbirdImpl {
     ///
     /// Parameters
     /// ----------
-    /// channel: discord.abc.Snowflake | None
+    /// channel : discord.abc.Snowflake | None
     ///     The channel to move to.
     ///     If None, disconnects from voice.
+    ///
+    /// Returns
+    /// -------
+    /// None
     fn move_to<'py>(
         &self,
         py: Python<'py>,
@@ -424,12 +428,19 @@ impl SongbirdImpl {
     ///
     /// Parameters
     /// ----------
-    /// sink: SinkBase
+    /// sink : SinkBase
     ///     The receive sink to register.
     ///
     /// Returns
     /// -------
     /// None
+    ///
+    /// Examples
+    /// --------
+    /// ```python
+    /// sink = receive.BufferSink()
+    /// vc.listen(sink)
+    /// ```
     fn listen<'py>(&self, _py: Python<'py>, sink: PyRefMut<'py, SinkBase>) -> PyResult<()> {
         let mut guard = self.call.blocking_lock();
         let call = guard.get_mut()?;
