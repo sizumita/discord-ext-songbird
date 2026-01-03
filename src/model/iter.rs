@@ -1,5 +1,6 @@
 use crate::model::future::PyFuture;
-use pyo3::{pyclass, pymethods, Py, PyAny, PyRef, PyResult, Python};
+use futures::StreamExt;
+use pyo3::{pyclass, pymethods, IntoPyObjectExt, Py, PyAny, PyRef, PyResult, Python};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::gen_stub_pymethods;
 use pyo3_stub_gen::inventory::submit;
@@ -9,7 +10,7 @@ use std::any::TypeId;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio_stream::{Stream, StreamExt};
+use tokio_stream::Stream;
 
 type AsyncStream = Arc<Mutex<Pin<Box<dyn Stream<Item = PyResult<Py<PyAny>>> + Send + 'static>>>>;
 
@@ -50,7 +51,18 @@ submit! {
 }
 
 impl PyAsyncIterator {
-    pub fn new<S>(stream: S) -> Self
+    pub fn new<T, S>(stream: S) -> Self
+    where
+        S: Stream<Item = T> + Send + 'static,
+        for<'py> T: IntoPyObjectExt<'py>,
+    {
+        let stream = stream.map(|x| Python::attach(|py| x.into_py_any(py)));
+        Self {
+            stream: Arc::new(Mutex::new(Box::pin(stream))),
+        }
+    }
+
+    pub fn new_in_raw<S>(stream: S) -> Self
     where
         S: Stream<Item = PyResult<Py<PyAny>>> + Send + 'static,
     {

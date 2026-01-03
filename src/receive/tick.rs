@@ -2,11 +2,10 @@ use crate::model::ArrowArray;
 use arrow::array::Int16Array;
 use dashmap::DashMap;
 use pyo3::types::PyInt;
-use pyo3::{pyclass, pymethods, Bound, IntoPyObject, PyAny, PyResult, Python};
+use pyo3::{pyclass, pymethods, Bound, PyResult, Python};
 use pyo3_arrow::PyArray;
-use pyo3_stub_gen::derive::{
-    gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pyclass_enum, gen_stub_pymethods,
-};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
+use songbird::events::context_data::VoiceTick as SongbirdVoiceTick;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -214,5 +213,38 @@ impl VoiceTick {
     /// ```
     fn silent_keys(&self) -> HashSet<VoiceKey> {
         self.silent.clone()
+    }
+}
+
+impl VoiceTick {
+    pub fn from_parts(tick: &SongbirdVoiceTick, ssrc_data: &DashMap<u32, u64>) -> Self {
+        let mut silents = tick
+            .silent
+            .iter()
+            .map(|ssrc| {
+                if let Some(user_id) = ssrc_data.get(ssrc) {
+                    VoiceKey::User(*user_id)
+                } else {
+                    VoiceKey::Unknown(*ssrc)
+                }
+            })
+            .collect::<HashSet<_>>();
+        let payloads = DashMap::with_capacity(tick.speaking.len());
+        for (ssrc, data) in &tick.speaking {
+            let key = if let Some(user_id) = ssrc_data.get(ssrc) {
+                VoiceKey::User(*user_id)
+            } else {
+                VoiceKey::Unknown(*ssrc)
+            };
+            if let Some(decoded) = &data.decoded_voice {
+                payloads.insert(key, Arc::new(Int16Array::from(decoded.clone())));
+            } else {
+                silents.insert(key);
+            }
+        }
+        VoiceTick {
+            speaking: payloads,
+            silent: silents,
+        }
     }
 }

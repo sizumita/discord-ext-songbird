@@ -1,4 +1,5 @@
 mod buffer;
+mod stream;
 
 use pyo3::{pyclass, PyResult};
 use pyo3_stub_gen::derive::gen_stub_pyclass;
@@ -7,6 +8,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 pub use buffer::BufferSink;
+pub use stream::{PyStream, StreamSink};
 
 #[gen_stub_pyclass]
 #[pyclass(subclass, module = "discord.ext.songbird.native.receive")]

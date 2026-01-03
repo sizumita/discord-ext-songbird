@@ -64,7 +64,11 @@ VERSION : str
         #[pymodule_export]
         use crate::receive::sink::BufferSink;
         #[pymodule_export]
+        use crate::receive::sink::PyStream;
+        #[pymodule_export]
         use crate::receive::sink::SinkBase;
+        #[pymodule_export]
+        use crate::receive::sink::StreamSink;
         #[pymodule_export]
         use crate::receive::tick::VoiceKey;
         #[pymodule_export]

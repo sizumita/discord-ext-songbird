@@ -5,10 +5,10 @@ use arrow::array::Int16Array;
 use async_stream::stream;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use pyo3::{pyclass, pymethods, Bound, IntoPyObjectExt, PyAny, PyRef, PyResult, Python};
+use pyo3::{pyclass, pymethods, IntoPyObjectExt, PyRef, PyResult, Python};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::{CoreEvent, Event, EventContext, EventHandler};
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -74,34 +74,7 @@ impl EventHandler for BufferSinkHandler {
                 }
             }
             EventContext::VoiceTick(tick) => {
-                let mut silents = tick
-                    .silent
-                    .iter()
-                    .map(|ssrc| {
-                        if let Some(user_id) = self.ssrc_map.get(ssrc) {
-                            VoiceKey::User(*user_id)
-                        } else {
-                            VoiceKey::Unknown(*ssrc)
-                        }
-                    })
-                    .collect::<HashSet<_>>();
-                let payloads = DashMap::with_capacity(tick.speaking.len());
-                for (ssrc, data) in &tick.speaking {
-                    let key = if let Some(user_id) = self.ssrc_map.get(ssrc) {
-                        VoiceKey::User(*user_id)
-                    } else {
-                        VoiceKey::Unknown(*ssrc)
-                    };
-                    if let Some(decoded) = &data.decoded_voice {
-                        payloads.insert(key, Arc::new(Int16Array::from(decoded.clone())));
-                    } else {
-                        silents.insert(key);
-                    }
-                }
-                let tick = VoiceTick {
-                    speaking: payloads,
-                    silent: silents,
-                };
+                let tick = VoiceTick::from_parts(tick, &self.ssrc_map);
                 let mut guard = self.ticks.lock().await;
                 if let Some(max_in_seconds) = self.max_ticks {
                     while guard.len() >= max_in_seconds {
@@ -151,6 +124,7 @@ impl BufferSink {
                 vec![
                     Event::Core(CoreEvent::VoiceTick),
                     Event::Core(CoreEvent::SpeakingStateUpdate),
+                    Event::Core(CoreEvent::ClientDisconnect),
                 ]
                 .into_iter()
                 .collect(),
@@ -193,7 +167,7 @@ impl BufferSink {
     fn __getitem__(
         &self,
         key: VoiceKey,
-    ) -> PyResult<Generic<PyAsyncIterator, Option<ArrowArray<Int16Array>>>> {
+    ) -> PyResult<Generic<'_, PyAsyncIterator, Option<ArrowArray<'_, Int16Array>>>> {
         let ticks = self.ticks.clone();
         let s = stream! {
             loop {
@@ -212,7 +186,7 @@ impl BufferSink {
                 yield tick;
             }
         };
-        Ok(Generic::new(PyAsyncIterator::new(s)))
+        Ok(Generic::new(PyAsyncIterator::new_in_raw(s)))
     }
 
     /// Return an async iterator over buffered `VoiceTick` entries.
@@ -234,7 +208,7 @@ impl BufferSink {
                 let tick = {
                     let mut guard = ticks.lock().await;
                     if let Some(tick) = guard.pop_front() {
-                        Python::attach(|py| tick.into_py_any(py))
+                        tick
                     } else {
                         drop(guard);
                         break;
