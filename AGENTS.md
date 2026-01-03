@@ -7,6 +7,7 @@ This repository hosts a hybrid Rust/Python voice backend for `discord.py`, built
 - `py-src/discord/ext/songbird/`: Python API layer, type stubs (`.pyi`), and `py.typed` marker; native stubs live under `native/`.
 - `examples/`: runnable bot examples (`basic.py`, `track_handling.py`, `receive.py`).
 - Build metadata: `Cargo.toml`, `pyproject.toml`, `build.rs`, `justfile`. Build outputs go to `target/` and should not be committed.
+ - `py-src/discord/ext/songbird/native/`: **auto-generated** by `cargo stub`; do not edit manually.
 
 ## Build, Test, and Development Commands
 - `uv sync --all-extras --dev --no-install-project`: install dev dependencies.

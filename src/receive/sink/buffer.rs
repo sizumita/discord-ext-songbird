@@ -18,6 +18,7 @@ pub struct BufferSinkHandler {
     ssrc_map: DashMap<u32, u64>,
     ticks: Arc<Mutex<VecDeque<VoiceTick>>>,
     max_ticks: Option<usize>,
+    drop_oldest: bool,
 }
 
 #[gen_stub_pyclass]
@@ -33,7 +34,7 @@ pub struct BufferSinkHandler {
 /// from discord.ext.songbird import receive
 ///
 /// vc = await channel.connect(cls=songbird.SongbirdClient)
-/// sink = receive.BufferSink(max_in_seconds=5)
+/// sink = receive.BufferSink(max_duration_secs=5)
 /// vc.listen(sink)
 ///
 /// async for tick in sink:
@@ -51,12 +52,14 @@ impl BufferSinkHandler {
         ticks: Arc<Mutex<VecDeque<VoiceTick>>>,
         is_stopped: Arc<AtomicBool>,
         max_ticks: Option<usize>,
+        drop_oldest: bool,
     ) -> Self {
         Self {
             is_stopped,
             ssrc_map: DashMap::new(),
             ticks,
             max_ticks,
+            drop_oldest,
         }
     }
 }
@@ -74,13 +77,17 @@ impl EventHandler for BufferSinkHandler {
                 }
             }
             EventContext::VoiceTick(tick) => {
-                let tick = VoiceTick::from_parts(tick, &self.ssrc_map);
                 let mut guard = self.ticks.lock().await;
-                if let Some(max_in_seconds) = self.max_ticks {
-                    while guard.len() >= max_in_seconds {
-                        guard.pop_front();
+                if let Some(max_ticks) = self.max_ticks {
+                    if self.drop_oldest {
+                        while guard.len() >= max_ticks {
+                            guard.pop_front();
+                        }
+                    } else if guard.len() >= max_ticks {
+                        return None;
                     }
                 }
+                let tick = VoiceTick::from_parts(tick, &self.ssrc_map);
                 guard.push_back(tick);
             }
             EventContext::ClientDisconnect(disconnect) => {
@@ -97,26 +104,35 @@ impl EventHandler for BufferSinkHandler {
 impl BufferSink {
     #[gen_stub(override_return_type(type_repr = "typing.Self", imports = ("typing")))]
     #[new]
-    #[pyo3(signature = (max_in_seconds = None))]
+    #[pyo3(signature = (*, max_duration_secs = None, drop_oldest = true))]
     /// Create a new BufferSink.
     ///
     /// Parameters
     /// ----------
-    /// max_in_seconds : int | None
+    /// max_duration_secs : int | None
     ///     Maximum buffer size in seconds worth of ticks. If None, unbounded.
+    /// drop_oldest : bool, optional
+    ///     If True, drop the oldest ticks when the buffer is full. If False,
+    ///     drop new ticks instead.
+    ///
+    /// Notes
+    /// -----
+    /// Internally converted to a tick count based on 20 ms per tick (50 ticks/sec).
+    /// Parameters are keyword-only.
     ///
     /// Returns
     /// -------
     /// BufferSink
-    fn new(max_in_seconds: Option<usize>) -> PyResult<(Self, SinkBase)> {
+    fn new(max_duration_secs: Option<usize>, drop_oldest: bool) -> PyResult<(Self, SinkBase)> {
         let is_stopped = Arc::new(AtomicBool::new(false));
-        let max_ticks = max_in_seconds.map(|secs| secs * 50);
+        let max_ticks = max_duration_secs.map(|secs| secs * 50);
         let ticks = Arc::new(Mutex::new(if let Some(max) = max_ticks {
             VecDeque::with_capacity(max)
         } else {
             VecDeque::new()
         }));
-        let handler = BufferSinkHandler::new(ticks.clone(), is_stopped.clone(), max_ticks);
+        let handler =
+            BufferSinkHandler::new(ticks.clone(), is_stopped.clone(), max_ticks, drop_oldest);
         Ok((
             Self { is_stopped, ticks },
             SinkBase::new(

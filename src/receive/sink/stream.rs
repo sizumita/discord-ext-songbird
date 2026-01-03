@@ -15,6 +15,25 @@ use tokio_stream::wrappers::BroadcastStream;
 
 #[gen_stub_pyclass]
 #[pyclass(extends = SinkBase, module = "discord.ext.songbird.native.receive")]
+/// Streaming sink for received voice data.
+///
+/// Unlike `BufferSink`, this sink exposes a stream interface backed by a
+/// broadcast channel and supports concurrent consumers via permits.
+///
+/// Examples
+/// --------
+/// ```python
+/// from discord.ext import songbird
+/// from discord.ext.songbird import receive
+///
+/// vc = await channel.connect(cls=songbird.SongbirdClient)
+/// sink = receive.StreamSink()
+/// vc.listen(sink)
+///
+/// async with sink.stream() as stream:
+///     async for tick in stream:
+///         ...
+/// ```
 pub struct StreamSink {
     rx: broadcast::Receiver<Option<VoiceTick>>,
     weak_tx: broadcast::WeakSender<Option<VoiceTick>>,
@@ -23,6 +42,9 @@ pub struct StreamSink {
 
 #[gen_stub_pyclass]
 #[pyclass(name = "Stream", module = "discord.ext.songbird.native.receive")]
+/// Async stream handle returned by `StreamSink.stream()`.
+///
+/// This object is an async context manager that acquires a stream permit.
 pub struct PyStream {
     acquire: Option<OwnedSemaphorePermit>,
     sem: Arc<Semaphore>,
@@ -69,6 +91,21 @@ impl StreamSink {
     #[gen_stub(override_return_type(type_repr = "typing.Self", imports = ("typing")))]
     #[new]
     #[pyo3(signature = (*, retain = false, retain_secs = 15, max_concurrent = 50))]
+    /// Create a new StreamSink.
+    ///
+    /// Parameters
+    /// ----------
+    /// retain : bool, optional
+    ///     If True, ticks are retained even when no streams are active.
+    /// retain_secs : int, optional
+    ///     Retention window in seconds for the broadcast buffer.
+    ///     Internally converted to a tick count based on 20 ms per tick (50 ticks/sec).
+    /// max_concurrent : int, optional
+    ///     Maximum number of concurrent streams.
+    ///
+    /// Returns
+    /// -------
+    /// StreamSink
     fn new(retain: bool, retain_secs: usize, max_concurrent: usize) -> (StreamSink, SinkBase) {
         let (tx, rx) = broadcast::channel(retain_secs * 50);
         let sem = Arc::new(Semaphore::new(max_concurrent));
@@ -97,6 +134,21 @@ impl StreamSink {
         )
     }
 
+    /// Create an async stream handle.
+    ///
+    /// Use this with `async with` to acquire a stream permit.
+    ///
+    /// Returns
+    /// -------
+    /// Stream
+    ///
+    /// Examples
+    /// --------
+    /// ```python
+    /// async with sink.stream() as stream:
+    ///     async for tick in stream:
+    ///         ...
+    /// ```
     fn stream(&self) -> PyResult<PyStream> {
         Ok(PyStream {
             acquire: None,
@@ -109,6 +161,11 @@ impl StreamSink {
 #[gen_stub_pymethods]
 #[pymethods]
 impl PyStream {
+    /// Close the stream and release its permit.
+    ///
+    /// Returns
+    /// -------
+    /// None
     fn close<'py>(&mut self, py: Python<'py>) -> PyResult<PyFuture<'py, ()>> {
         if let Some(acq) = self.acquire.take() {
             drop(acq);
@@ -116,6 +173,11 @@ impl PyStream {
         future_into_py(py, async move { Ok(()) }).map(|x| x.into())
     }
 
+    /// Enter the async context and acquire a stream permit.
+    ///
+    /// Returns
+    /// -------
+    /// Stream
     fn __aenter__<'py>(mut slf: PyRefMut<Self>, py: Python<'py>) -> PyResult<PyFuture<'py, Self>> {
         if slf.acquire.is_some() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -132,6 +194,11 @@ impl PyStream {
         fut.map(|x| x.into())
     }
 
+    /// Return an async iterator over `VoiceTick` entries.
+    ///
+    /// Returns
+    /// -------
+    /// PyAsyncIterator[VoiceTick]
     fn __aiter__<'py>(slf: PyRef<'py, Self>) -> PyResult<Generic<'py, PyAsyncIterator, VoiceTick>> {
         let tx = slf.try_tx()?;
         let rx = tx.subscribe();
@@ -140,6 +207,11 @@ impl PyStream {
         Ok(Generic::new(PyAsyncIterator::new(stream)))
     }
 
+    /// Exit the async context and release the stream permit.
+    ///
+    /// Returns
+    /// -------
+    /// None
     fn __aexit__<'py>(
         &mut self,
         py: Python<'py>,
@@ -150,6 +222,25 @@ impl PyStream {
         self.close(py)
     }
 
+    /// Return an async iterator over PCM for a specific key.
+    ///
+    /// Parameters
+    /// ----------
+    /// key : VoiceKey
+    ///     The user/ssrc key to filter.
+    ///
+    /// Returns
+    /// -------
+    /// PyAsyncIterator[pyarrow.Int16Array | None]
+    ///
+    /// Examples
+    /// --------
+    /// ```python
+    /// async with sink.stream() as stream:
+    ///     async for pcm in stream[receive.VoiceKey.User(user_id)]:
+    ///         if pcm is not None:
+    ///             handle_pcm(pcm)
+    /// ```
     fn __getitem__(
         &self,
         key: VoiceKey,

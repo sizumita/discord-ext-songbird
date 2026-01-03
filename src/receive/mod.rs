@@ -16,6 +16,10 @@ Classes
 -------
 BufferSink
     Buffering sink that yields `VoiceTick` snapshots.
+StreamSink
+    Streaming sink that yields `VoiceTick` snapshots.
+Stream
+    Async stream handle returned by `StreamSink.stream()`.
 VoiceTick
     Per-tick snapshot of speaking and silent sources.
 VoiceKey
@@ -30,7 +34,7 @@ from discord.ext import songbird
 from discord.ext.songbird import receive
 
 vc = await channel.connect(cls=songbird.SongbirdClient)
-sink = receive.BufferSink(max_in_seconds=5)
+sink = receive.BufferSink(max_duration_secs=5)
 vc.listen(sink)
 
 async for tick in sink:

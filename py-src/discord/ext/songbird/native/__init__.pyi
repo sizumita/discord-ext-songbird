@@ -10,7 +10,7 @@ This module contains the Rust-backed implementation used by
 Submodules
 ----------
 receive
-    Voice receive types and sinks.
+    Voice receive types and sinks (BufferSink, StreamSink).
 error
     Backend exceptions.
 model

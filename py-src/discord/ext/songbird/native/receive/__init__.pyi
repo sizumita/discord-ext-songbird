@@ -10,6 +10,10 @@ Classes
 -------
 BufferSink
     Buffering sink that yields `VoiceTick` snapshots.
+StreamSink
+    Streaming sink that yields `VoiceTick` snapshots.
+Stream
+    Async stream handle returned by `StreamSink.stream()`.
 VoiceTick
     Per-tick snapshot of speaking and silent sources.
 VoiceKey
@@ -24,7 +28,7 @@ from discord.ext import songbird
 from discord.ext.songbird import receive
 
 vc = await channel.connect(cls=songbird.SongbirdClient)
-sink = receive.BufferSink(max_in_seconds=5)
+sink = receive.BufferSink(max_duration_secs=5)
 vc.listen(sink)
 
 async for tick in sink:
@@ -59,7 +63,7 @@ class BufferSink(SinkBase):
     from discord.ext.songbird import receive
 
     vc = await channel.connect(cls=songbird.SongbirdClient)
-    sink = receive.BufferSink(max_in_seconds=5)
+    sink = receive.BufferSink(max_duration_secs=5)
     vc.listen(sink)
 
     async for tick in sink:
@@ -68,14 +72,24 @@ class BufferSink(SinkBase):
             handle_pcm(pcm)
     ```
     """
-    def __new__(cls, max_in_seconds: typing.Optional[builtins.int] = None) -> typing.Self:
+    def __new__(
+        cls, *, max_duration_secs: typing.Optional[builtins.int] = None, drop_oldest: builtins.bool = True
+    ) -> typing.Self:
         r"""
         Create a new BufferSink.
 
         Parameters
         ----------
-        max_in_seconds : int | None
+        max_duration_secs : int | None
             Maximum buffer size in seconds worth of ticks. If None, unbounded.
+        drop_oldest : bool, optional
+            If True, drop the oldest ticks when the buffer is full. If False,
+            drop new ticks instead.
+
+        Notes
+        -----
+        Internally converted to a tick count based on 20 ms per tick (50 ticks/sec).
+        Parameters are keyword-only.
 
         Returns
         -------
@@ -145,20 +159,129 @@ class SinkBase:
 
 @typing.final
 class Stream:
-    def close(self) -> typing.Coroutine[typing.Any, typing.Any, None]: ...
-    def __aenter__(self) -> typing.Coroutine[typing.Any, typing.Any, Stream]: ...
-    def __aiter__(self) -> PyAsyncIterator[VoiceTick]: ...
+    r"""
+    Async stream handle returned by `StreamSink.stream()`.
+
+    This object is an async context manager that acquires a stream permit.
+    """
+    def close(self) -> typing.Coroutine[typing.Any, typing.Any, None]:
+        r"""
+        Close the stream and release its permit.
+
+        Returns
+        -------
+        None
+        """
+    def __aenter__(self) -> typing.Coroutine[typing.Any, typing.Any, Stream]:
+        r"""
+        Enter the async context and acquire a stream permit.
+
+        Returns
+        -------
+        Stream
+        """
+    def __aiter__(self) -> PyAsyncIterator[VoiceTick]:
+        r"""
+        Return an async iterator over `VoiceTick` entries.
+
+        Returns
+        -------
+        PyAsyncIterator[VoiceTick]
+        """
     def __aexit__(
         self, _exc_type: typing.Any, _exc_val: typing.Any, _exc_tb: typing.Any
-    ) -> typing.Coroutine[typing.Any, typing.Any, None]: ...
-    def __getitem__(self, key: VoiceKey) -> PyAsyncIterator[typing.Optional[pyarrow.Int16Array]]: ...
+    ) -> typing.Coroutine[typing.Any, typing.Any, None]:
+        r"""
+        Exit the async context and release the stream permit.
+
+        Returns
+        -------
+        None
+        """
+    def __getitem__(self, key: VoiceKey) -> PyAsyncIterator[typing.Optional[pyarrow.Int16Array]]:
+        r"""
+        Return an async iterator over PCM for a specific key.
+
+        Parameters
+        ----------
+        key : VoiceKey
+            The user/ssrc key to filter.
+
+        Returns
+        -------
+        PyAsyncIterator[pyarrow.Int16Array | None]
+
+        Examples
+        --------
+        ```python
+        async with sink.stream() as stream:
+            async for pcm in stream[receive.VoiceKey.User(user_id)]:
+                if pcm is not None:
+                    handle_pcm(pcm)
+        ```
+        """
 
 @typing.final
 class StreamSink(SinkBase):
+    r"""
+    Streaming sink for received voice data.
+
+    Unlike `BufferSink`, this sink exposes a stream interface backed by a
+    broadcast channel and supports concurrent consumers via permits.
+
+    Examples
+    --------
+    ```python
+    from discord.ext import songbird
+    from discord.ext.songbird import receive
+
+    vc = await channel.connect(cls=songbird.SongbirdClient)
+    sink = receive.StreamSink()
+    vc.listen(sink)
+
+    async with sink.stream() as stream:
+        async for tick in stream:
+            ...
+    ```
+    """
     def __new__(
         cls, *, retain: builtins.bool = False, retain_secs: builtins.int = 15, max_concurrent: builtins.int = 50
-    ) -> typing.Self: ...
-    def stream(self) -> Stream: ...
+    ) -> typing.Self:
+        r"""
+        Create a new StreamSink.
+
+        Parameters
+        ----------
+        retain : bool, optional
+            If True, ticks are retained even when no streams are active.
+        retain_secs : int, optional
+            Retention window in seconds for the broadcast buffer.
+            Internally converted to a tick count based on 20 ms per tick (50 ticks/sec).
+        max_concurrent : int, optional
+            Maximum number of concurrent streams.
+
+        Returns
+        -------
+        StreamSink
+        """
+    def stream(self) -> Stream:
+        r"""
+        Create an async stream handle.
+
+        Use this with `async with` to acquire a stream permit.
+
+        Returns
+        -------
+        Stream
+
+        Examples
+        --------
+        ```python
+        async with sink.stream() as stream:
+            async for tick in stream:
+                ...
+        ```
+        """
 
 class VoiceKey:
     r"""
@@ -219,6 +342,7 @@ class VoiceKey:
         receive.VoiceKey.Unknown(42).is_unknown()
         ```
         """
+    def __repr__(self) -> builtins.str: ...
     @typing.final
     class User(VoiceKey):
         __match_args__ = ("_0",)
