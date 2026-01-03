@@ -99,6 +99,13 @@ impl VoiceKey {
     fn is_unknown(&self) -> bool {
         matches!(self, VoiceKey::Unknown(_))
     }
+
+    fn __repr__(&self) -> String {
+        match self {
+            VoiceKey::User(user_id) => format!("VoiceKey.User({})", user_id),
+            VoiceKey::Unknown(ssrc) => format!("VoiceKey.Unknown({})", ssrc),
+        }
+    }
 }
 
 #[gen_stub_pymethods]
