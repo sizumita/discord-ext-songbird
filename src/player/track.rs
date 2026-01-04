@@ -3,7 +3,6 @@ use pyo3::{
     pyclass, pymethods, Bound, Py, PyAny, PyRefMut, PyResult, PyTraverseError, PyVisit, Python,
 };
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
-use songbird::input::Input;
 use songbird::tracks::{LoopState, PlayMode, Track};
 
 #[gen_stub_pyclass]

@@ -1,17 +1,11 @@
 use crate::player::input::codec::SupportedCodec;
-use crate::player::input::data::AnyVoiceDataArray;
 use crate::player::input::{PyCompose, PyInputBase};
-use async_trait::async_trait;
 use pin_project_lite::pin_project;
-use pyo3::{pyclass, pymethods, Bound, BoundObject, Py, PyAny, PyRef, PyResult, Python};
-use pyo3_arrow::PyArray;
-use pyo3_async_runtimes::tokio::into_future;
+use pyo3::{pyclass, pymethods, Bound, Py, PyAny, PyRef, PyResult, Python};
 use pyo3_async_runtimes::{into_future_with_locals, TaskLocals};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
-use songbird::input::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
-use songbird::input::{
-    AsyncAdapterStream, AsyncReadOnlySource, AudioStream, AudioStreamError, Compose, LiveInput,
-};
+use songbird::input::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+use songbird::input::{AsyncAdapterStream, AsyncReadOnlySource, AudioStream, LiveInput};
 use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
@@ -20,14 +14,8 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
 #[gen_stub_pyclass]
-#[pyclass(name = "StreamInput", extends = PyInputBase, module = "discord.ext.songbird.native.player")]
+#[pyclass(name = "StreamInput", extends = PyInputBase, module = "discord.ext.songbird.native.player.input")]
 pub struct PyStreamInput(Py<PyAny>, SupportedCodec);
-
-struct InputStreamIterator {
-    codec: SupportedCodec,
-    stream: Option<Py<PyAny>>,
-    current_loop: Option<Py<PyAny>>,
-}
 
 pin_project! {
     struct AsyncStream {
@@ -73,34 +61,6 @@ impl PyStreamInput {
             }),
             None,
         ))
-    }
-}
-
-#[async_trait]
-impl Compose for InputStreamIterator {
-    fn create(&mut self) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
-        unimplemented!()
-    }
-
-    async fn create_async(
-        &mut self,
-    ) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
-        let Some(stream) = self.stream.take() else {
-            return Err(AudioStreamError::Fail("Stream already consumed".into()));
-        };
-        let source = AsyncReadOnlySource::new(AsyncStream {
-            stream,
-            current_loop: self.current_loop.take().unwrap(),
-            pending: None,
-        });
-        Ok(AudioStream {
-            input: Box::new(AsyncAdapterStream::new(Box::new(source), 1024)),
-            hint: Some(self.codec.clone().into()),
-        })
-    }
-
-    fn should_create_async(&self) -> bool {
-        true
     }
 }
 

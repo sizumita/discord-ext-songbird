@@ -1,25 +1,16 @@
 pub(crate) use crate::player::input::codec::SupportedCodec;
 use crate::player::input::data::AnyVoiceDataArray;
 use crate::player::input::{PyCompose, PyInputBase};
-use arrow::array::{
-    Array, ArrayRef, AsArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-    UInt16Array, UInt32Array, UInt8Array,
-};
-use arrow::datatypes::{
-    Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, UInt16Type, UInt32Type, UInt8Type,
-};
+use arrow::array::{Array, ArrayRef};
 use async_trait::async_trait;
-use bytemuck::cast_slice;
-use pyo3::{pyclass, pymethods, Bound, PyAny, PyErr, PyRef, PyResult};
+use pyo3::{pyclass, pymethods, Bound, PyAny, PyResult};
 use pyo3_arrow::PyArray;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pymethods};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::input::core::io::MediaSource;
-use songbird::input::{AudioStream, AudioStreamError, Compose, RawAdapter};
-use std::io::{Cursor, ErrorKind};
-use symphonia::core::probe::Hint;
+use songbird::input::{AudioStream, AudioStreamError, Compose};
 
 #[gen_stub_pyclass]
-#[pyclass(name = "AudioInput", extends = PyInputBase, module = "discord.ext.songbird.native.player")]
+#[pyclass(name = "AudioInput", extends = PyInputBase, module = "discord.ext.songbird.native.player.input")]
 pub struct PyAudioInput {
     codec: SupportedCodec,
     array: ArrayRef,
@@ -52,12 +43,8 @@ impl PyAudioInput {
         ))
     }
 
-    fn codec(slf: PyRef<'_, Self>) {
-        slf.as_super().is_lazy();
-    }
-
     #[gen_stub(skip)]
-    fn _compose(&self, current_loop: Bound<PyAny>) -> PyResult<PyCompose> {
+    fn _compose(&self, _current_loop: Bound<PyAny>) -> PyResult<PyCompose> {
         let compose = ArrayCompose(self.array.clone().try_into()?, self.codec.clone());
         Ok(PyCompose::new_lazy(Box::new(compose)))
     }
@@ -67,7 +54,7 @@ impl PyAudioInput {
 impl Compose for ArrayCompose {
     fn create(&mut self) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
         Ok(AudioStream {
-            input: self.0.clone().try_into_media_source(self.1.clone())?,
+            input: self.0.clone().try_into_media_source()?,
             hint: Some(self.1.clone().into()),
         })
     }

@@ -1,6 +1,7 @@
 pub(crate) mod audio;
-mod codec;
+pub(crate) mod codec;
 mod data;
+pub mod pcm;
 pub mod stream;
 
 use pyo3::{pyclass, pymethods, Bound, PyAny, PyResult};
@@ -40,10 +41,6 @@ impl PyInputBase {
 impl PyInputBase {
     pub fn new() -> Self {
         Self {}
-    }
-
-    pub fn is_lazy(&self) -> bool {
-        false
     }
 }
 

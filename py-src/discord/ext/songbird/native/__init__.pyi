@@ -23,14 +23,13 @@ VERSION : str
 """
 
 import builtins
-import discord
 import typing
+
+import discord
 from discord.ext.songbird.native.player import Track, TrackHandle
 from discord.ext.songbird.native.receive import SinkBase
-from . import error
-from . import model
-from . import player
-from . import receive
+
+from . import error, model, player, receive
 
 VERSION: builtins.str = "0.4.0-alpha"
 

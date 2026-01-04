@@ -1,8 +1,6 @@
-import asyncio
 import io
 import logging
 import os
-import wave
 
 import discord
 import numpy as np
@@ -16,12 +14,6 @@ logging.getLogger().setLevel(logging.DEBUG)
 client = discord.Client(intents=discord.Intents.default())
 
 # Creating a sine wave
-sine: io.BytesIO
-
-with open("examples/mono.wav", "rb") as f:
-    sine = io.BytesIO(f.read())
-sine_wav = pyarrow.array(pyarrow.py_buffer(sine.getbuffer()), pyarrow.uint8())
-
 duration = 5
 sample_rate = 48000
 frequency = 440.0
@@ -43,12 +35,9 @@ async def on_ready():
     if isinstance(ch, discord.VoiceChannel):
         vc = await ch.connect(cls=songbird.SongbirdClient)
 
-        data = songbird.player.AudioInput(signal, songbird.player.SupportedCodec.PCM)
-        data2 = songbird.player.AudioInput(sine_wav, songbird.player.SupportedCodec.WAVE)
+        data = songbird.player.input.RawPCMInput(signal, sample_rate=sample_rate, channels=2)
         track = songbird.player.Track(data)
-        track2 = songbird.player.Track(data2)
         handle = await vc.play(track)
-        handle2 = await vc.play(track2)
 
 
 client.run(os.environ["DISCORD_BOT_TOKEN"])

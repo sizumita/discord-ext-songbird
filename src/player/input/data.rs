@@ -1,4 +1,3 @@
-use crate::player::input::codec::SupportedCodec;
 use arrow::array::{
     ArrayRef, AsArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, UInt16Array,
     UInt32Array, UInt8Array,
@@ -9,8 +8,8 @@ use arrow::datatypes::{
 use bytemuck::cast_slice;
 use pyo3::PyErr;
 use songbird::input::core::io::MediaSource;
-use songbird::input::{AudioStreamError, RawAdapter};
-use std::io::{Cursor, ErrorKind};
+use songbird::input::AudioStreamError;
+use std::io::Cursor;
 
 #[derive(Clone)]
 pub enum AnyVoiceDataArray {
@@ -40,21 +39,8 @@ impl AsRef<[u8]> for AnyVoiceDataArray {
 }
 
 impl AnyVoiceDataArray {
-    pub fn try_into_media_source(
-        self,
-        codec: SupportedCodec,
-    ) -> Result<Box<dyn MediaSource>, AudioStreamError> {
-        if codec == SupportedCodec::PCM {
-            if !matches!(self, AnyVoiceDataArray::Float32(_)) {
-                return Err(AudioStreamError::Fail(Box::new(std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    "PCM codec requires Float32 array",
-                ))));
-            }
-            Ok(Box::new(RawAdapter::new(Cursor::new(self), 48000, 2)))
-        } else {
-            Ok(Box::new(Cursor::new(self)))
-        }
+    pub fn try_into_media_source(self) -> Result<Box<dyn MediaSource>, AudioStreamError> {
+        Ok(Box::new(Cursor::new(self)))
     }
 }
 

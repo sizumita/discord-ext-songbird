@@ -34,7 +34,7 @@ async def on_ready():
         buffer = asyncio.StreamReader()
         asyncio.create_task(feed_radio(buffer))
 
-        i = player.StreamInput(buffer, player.SupportedCodec.AAC)
+        i = player.input.StreamInput(buffer, player.input.SupportedCodec.AAC)
         print(asyncio.get_running_loop())
         handle = await vc.play(player.Track(i))
         handle.play()

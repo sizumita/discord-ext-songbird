@@ -1,6 +1,5 @@
 use pyo3::{Bound, IntoPyObject, PyAny, PyErr, Python};
 use pyo3_stub_gen::{PyStubType, TypeInfo};
-use std::future::Future;
 use std::marker::PhantomData;
 
 pub struct PyFuture<'py, T>(Bound<'py, PyAny>, PhantomData<T>)

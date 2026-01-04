@@ -34,6 +34,7 @@ use tokio_stream::wrappers::BroadcastStream;
 ///     async for tick in stream:
 ///         ...
 /// ```
+#[allow(unused)]
 pub struct StreamSink {
     rx: broadcast::Receiver<Option<VoiceTick>>,
     weak_tx: broadcast::WeakSender<Option<VoiceTick>>,
