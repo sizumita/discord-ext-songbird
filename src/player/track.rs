@@ -7,6 +7,18 @@ use songbird::tracks::{LoopState, PlayMode, Track};
 
 #[gen_stub_pyclass]
 #[pyclass(name = "Track", module = "discord.ext.songbird.native.player")]
+/// Playable audio track.
+///
+/// Notes
+/// -----
+/// Tracks are created from an `InputBase` and played via the voice client.
+///
+/// Examples
+/// --------
+/// ```python
+/// track = player.Track(source)
+/// track = track.volume(0.8)
+/// ```
 pub struct PyTrack {
     pub input: Option<Py<PyInputBase>>,
     mode: PlayMode,
@@ -18,6 +30,16 @@ pub struct PyTrack {
 #[pymethods]
 impl PyTrack {
     #[new]
+    /// Create a new track from an input source.
+    ///
+    /// Parameters
+    /// ----------
+    /// input : InputBase
+    ///     The audio input source.
+    ///
+    /// Returns
+    /// -------
+    /// Track
     pub fn new<'py>(input: Bound<'py, PyInputBase>) -> Self {
         Self {
             input: Some(input.unbind()),
@@ -27,21 +49,50 @@ impl PyTrack {
         }
     }
 
+    /// Mark this track as playing.
+    ///
+    /// Returns
+    /// -------
+    /// Track
+    ///     This track.
     fn play<'py>(mut slf: PyRefMut<'py, Self>) -> PyRefMut<'py, Self> {
         slf.mode = PlayMode::Play;
         slf
     }
 
+    /// Mark this track as paused.
+    ///
+    /// Returns
+    /// -------
+    /// Track
+    ///     This track.
     fn pause<'py>(mut slf: PyRefMut<'py, Self>) -> PyRefMut<'py, Self> {
         slf.mode = PlayMode::Pause;
         slf
     }
 
+    /// Mark this track as stopped.
+    ///
+    /// Returns
+    /// -------
+    /// Track
+    ///     This track.
     fn stop<'py>(mut slf: PyRefMut<'py, Self>) -> PyRefMut<'py, Self> {
         slf.mode = PlayMode::Stop;
         slf
     }
 
+    /// Set the track volume multiplier.
+    ///
+    /// Parameters
+    /// ----------
+    /// volume : float
+    ///     Volume multiplier.
+    ///
+    /// Returns
+    /// -------
+    /// Track
+    ///     This track.
     fn volume<'py>(mut slf: PyRefMut<'py, Self>, volume: f32) -> PyRefMut<'py, Self> {
         slf.volume = volume;
         slf

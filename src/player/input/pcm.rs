@@ -13,6 +13,11 @@ use symphonia::core::probe::Hint;
 
 #[gen_stub_pyclass]
 #[pyclass(name = "RawPCMInput", extends = PyInputBase, module = "discord.ext.songbird.native.player.input")]
+/// Raw PCM input backed by a float32 array.
+///
+/// Notes
+/// -----
+/// Samples are expected to be interleaved float32 PCM.
 pub struct PyRawPcmInput {
     array: Float32Array,
     sample_rate: u32,
@@ -28,6 +33,20 @@ impl PyRawPcmInput {
     #[gen_stub(override_return_type(type_repr = "typing.Self", imports = ("typing")))]
     #[new]
     #[pyo3(signature = (array, *, sample_rate = 48000, channels = 2))]
+    /// Create a raw PCM input.
+    ///
+    /// Parameters
+    /// ----------
+    /// array : pyarrow.Float32Array
+    ///     Interleaved PCM samples.
+    /// sample_rate : int, optional
+    ///     Sample rate in Hz.
+    /// channels : int, optional
+    ///     Channel count.
+    ///
+    /// Returns
+    /// -------
+    /// RawPCMInput
     fn new(
         #[gen_stub(override_type(type_repr = "pyarrow.Float32Array", imports = ("pyarrow")))]
         array: PyArray,

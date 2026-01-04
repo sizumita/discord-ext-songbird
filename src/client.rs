@@ -460,6 +460,18 @@ impl SongbirdImpl {
         Ok(())
     }
 
+    /// |coro|
+    ///
+    /// Play a track.
+    ///
+    /// Parameters
+    /// ----------
+    /// track : Track
+    ///     The track to play.
+    ///
+    /// Returns
+    /// -------
+    /// TrackHandle
     fn play<'py>(
         &self,
         py: Python<'py>,

@@ -6,15 +6,96 @@ import typing
 
 from . import input
 
-class InputBase: ...
+class InputBase:
+    r"""
+    Base class for player inputs.
+
+    Notes
+    -----
+    Concrete inputs are provided under `discord.ext.songbird.player.input`.
+    """
+
+    ...
 
 @typing.final
 class Track:
-    def __new__(cls, input: InputBase) -> Track: ...
-    def play(self) -> Track: ...
-    def pause(self) -> Track: ...
-    def stop(self) -> Track: ...
-    def volume(self, volume: builtins.float) -> Track: ...
+    r"""
+    Playable audio track.
+
+    Notes
+    -----
+    Tracks are created from an `InputBase` and played via the voice client.
+
+    Examples
+    --------
+    ```python
+    track = player.Track(source)
+    track = track.volume(0.8)
+    ```
+    """
+    def __new__(cls, input: InputBase) -> Track:
+        r"""
+        Create a new track from an input source.
+
+        Parameters
+        ----------
+        input : InputBase
+            The audio input source.
+
+        Returns
+        -------
+        Track
+        """
+    def play(self) -> Track:
+        r"""
+        Mark this track as playing.
+
+        Returns
+        -------
+        Track
+            This track.
+        """
+    def pause(self) -> Track:
+        r"""
+        Mark this track as paused.
+
+        Returns
+        -------
+        Track
+            This track.
+        """
+    def stop(self) -> Track:
+        r"""
+        Mark this track as stopped.
+
+        Returns
+        -------
+        Track
+            This track.
+        """
+    def volume(self, volume: builtins.float) -> Track:
+        r"""
+        Set the track volume multiplier.
+
+        Parameters
+        ----------
+        volume : float
+            Volume multiplier.
+
+        Returns
+        -------
+        Track
+            This track.
+        """
 
 @typing.final
-class TrackHandle: ...
+class TrackHandle:
+    r"""
+    Handle for controlling a playing track.
+
+    Notes
+    -----
+    Returned by `SongbirdImpl.play`.
+    """
+
+    ...

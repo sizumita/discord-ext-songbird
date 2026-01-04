@@ -342,7 +342,14 @@ class VoiceKey:
         receive.VoiceKey.Unknown(42).is_unknown()
         ```
         """
-    def __repr__(self) -> builtins.str: ...
+    def __repr__(self) -> builtins.str:
+        r"""
+        Return a debug representation.
+
+        Returns
+        -------
+        str
+        """
     @typing.final
     class User(VoiceKey):
         __match_args__ = ("_0",)

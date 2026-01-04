@@ -7,6 +7,11 @@ use songbird::input::core::probe::Hint;
     module = "discord.ext.songbird.native.player.input",
     rename_all = "UPPERCASE"
 )]
+/// Codec hint for encoded audio inputs.
+///
+/// Notes
+/// -----
+/// Used by `AudioInput` and `StreamInput` to describe the payload format.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum SupportedCodec {
     Mp3,

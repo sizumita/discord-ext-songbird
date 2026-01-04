@@ -11,20 +11,93 @@ from discord.ext.songbird.native.player import InputBase
 
 @typing.final
 class AudioInput(InputBase):
-    def __new__(cls, array: pyarrow.Array, codec: SupportedCodec) -> typing.Self: ...
+    r"""
+    Encoded audio input backed by a pyarrow array.
+
+    Notes
+    -----
+    The payload is interpreted according to `SupportedCodec`.
+    """
+    def __new__(cls, array: pyarrow.Array, codec: SupportedCodec) -> typing.Self:
+        r"""
+        Create an encoded audio input.
+
+        Parameters
+        ----------
+        array : pyarrow.Array
+            Encoded audio payload.
+        codec : SupportedCodec
+            Codec hint for decoding.
+
+        Returns
+        -------
+        AudioInput
+        """
 
 @typing.final
 class RawPCMInput(InputBase):
+    r"""
+    Raw PCM input backed by a float32 array.
+
+    Notes
+    -----
+    Samples are expected to be interleaved float32 PCM.
+    """
     def __new__(
         cls, array: pyarrow.Float32Array, *, sample_rate: builtins.int = 48000, channels: builtins.int = 2
-    ) -> typing.Self: ...
+    ) -> typing.Self:
+        r"""
+        Create a raw PCM input.
+
+        Parameters
+        ----------
+        array : pyarrow.Float32Array
+            Interleaved PCM samples.
+        sample_rate : int, optional
+            Sample rate in Hz.
+        channels : int, optional
+            Channel count.
+
+        Returns
+        -------
+        RawPCMInput
+        """
 
 @typing.final
 class StreamInput(InputBase):
-    def __new__(cls, stream_reader: asyncio.StreamReader, codec: SupportedCodec) -> typing.Self: ...
+    r"""
+    Stream input backed by an asyncio StreamReader.
+
+    Notes
+    -----
+    This is intended for long-running or live audio sources.
+    """
+    def __new__(cls, stream_reader: asyncio.StreamReader, codec: SupportedCodec) -> typing.Self:
+        r"""
+        Create a stream input.
+
+        Parameters
+        ----------
+        stream_reader : asyncio.StreamReader
+            The source stream to read from.
+        codec : SupportedCodec
+            Codec hint for decoding.
+
+        Returns
+        -------
+        StreamInput
+        """
 
 @typing.final
 class SupportedCodec(enum.Enum):
+    r"""
+    Codec hint for encoded audio inputs.
+
+    Notes
+    -----
+    Used by `AudioInput` and `StreamInput` to describe the payload format.
+    """
+
     MP3 = ...
     WAVE = ...
     MKV = ...

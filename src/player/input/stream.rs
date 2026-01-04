@@ -17,6 +17,11 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 #[gen_stub_pyclass]
 #[pyclass(name = "StreamInput", extends = PyInputBase, module = "discord.ext.songbird.native.player.input")]
+/// Stream input backed by an asyncio StreamReader.
+///
+/// Notes
+/// -----
+/// This is intended for long-running or live audio sources.
 pub struct PyStreamInput(Option<Py<PyAny>>, SupportedCodec);
 
 pin_project! {
@@ -32,6 +37,18 @@ pin_project! {
 impl PyStreamInput {
     #[gen_stub(override_return_type(type_repr = "typing.Self", imports = ("typing")))]
     #[new]
+    /// Create a stream input.
+    ///
+    /// Parameters
+    /// ----------
+    /// stream_reader : asyncio.StreamReader
+    ///     The source stream to read from.
+    /// codec : SupportedCodec
+    ///     Codec hint for decoding.
+    ///
+    /// Returns
+    /// -------
+    /// StreamInput
     fn new(
         #[gen_stub(override_type(type_repr = "asyncio.StreamReader", imports = ("asyncio")))]
         stream_reader: Bound<PyAny>,

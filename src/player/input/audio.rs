@@ -11,6 +11,11 @@ use songbird::input::{AudioStream, AudioStreamError, Compose};
 
 #[gen_stub_pyclass]
 #[pyclass(name = "AudioInput", extends = PyInputBase, module = "discord.ext.songbird.native.player.input")]
+/// Encoded audio input backed by a pyarrow array.
+///
+/// Notes
+/// -----
+/// The payload is interpreted according to `SupportedCodec`.
 pub struct PyAudioInput {
     codec: SupportedCodec,
     array: ArrayRef,
@@ -23,6 +28,18 @@ struct ArrayCompose(AnyVoiceDataArray, SupportedCodec);
 impl PyAudioInput {
     #[gen_stub(override_return_type(type_repr = "typing.Self", imports = ("typing")))]
     #[new]
+    /// Create an encoded audio input.
+    ///
+    /// Parameters
+    /// ----------
+    /// array : pyarrow.Array
+    ///     Encoded audio payload.
+    /// codec : SupportedCodec
+    ///     Codec hint for decoding.
+    ///
+    /// Returns
+    /// -------
+    /// AudioInput
     fn new(
         #[gen_stub(override_type(type_repr = "pyarrow.Array", imports = ("pyarrow")))]
         array: PyArray,

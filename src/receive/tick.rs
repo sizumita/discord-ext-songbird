@@ -100,6 +100,11 @@ impl VoiceKey {
         matches!(self, VoiceKey::Unknown(_))
     }
 
+    /// Return a debug representation.
+    ///
+    /// Returns
+    /// -------
+    /// str
     fn __repr__(&self) -> String {
         match self {
             VoiceKey::User(user_id) => format!("VoiceKey.User({})", user_id),

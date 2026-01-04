@@ -5,12 +5,22 @@ use songbird::tracks::TrackHandle;
 
 #[gen_stub_pyclass]
 #[pyclass(name = "TrackHandle", module = "discord.ext.songbird.native.player")]
+/// Handle for controlling a playing track.
+///
+/// Notes
+/// -----
+/// Returned by `SongbirdImpl.play`.
 pub struct PyTrackHandle {
     inner: TrackHandle,
 }
 
 #[pymethods]
 impl PyTrackHandle {
+    /// Resume playback.
+    ///
+    /// Returns
+    /// -------
+    /// None
     fn play(&self) -> PyResult<()> {
         self.inner
             .play()
@@ -18,6 +28,11 @@ impl PyTrackHandle {
         Ok(())
     }
 
+    /// Pause playback.
+    ///
+    /// Returns
+    /// -------
+    /// None
     fn pause(&self) -> PyResult<()> {
         self.inner
             .pause()
@@ -25,6 +40,11 @@ impl PyTrackHandle {
         Ok(())
     }
 
+    /// Stop playback.
+    ///
+    /// Returns
+    /// -------
+    /// None
     fn stop(&self) -> PyResult<()> {
         self.inner
             .stop()

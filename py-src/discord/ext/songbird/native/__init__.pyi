@@ -244,4 +244,18 @@ class SongbirdImpl:
         vc.listen(sink)
         ```
         """
-    def play(self, track: Track) -> typing.Coroutine[typing.Any, typing.Any, TrackHandle]: ...
+    def play(self, track: Track) -> typing.Coroutine[typing.Any, typing.Any, TrackHandle]:
+        r"""
+        |coro|
+
+        Play a track.
+
+        Parameters
+        ----------
+        track : Track
+            The track to play.
+
+        Returns
+        -------
+        TrackHandle
+        """

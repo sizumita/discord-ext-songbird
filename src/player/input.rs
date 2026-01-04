@@ -14,9 +14,19 @@ use songbird::input::{Compose, Input, LiveInput};
     module = "discord.ext.songbird.native.player",
     subclass
 )]
+/// Base class for player inputs.
+///
+/// Notes
+/// -----
+/// Concrete inputs are provided under `discord.ext.songbird.player.input`.
 pub struct PyInputBase;
 
 #[pyclass(name = "Compose", module = "discord.ext.songbird.native.player")]
+/// Internal compose result for player inputs.
+///
+/// Notes
+/// -----
+/// Created by `_compose` implementations and consumed by the backend.
 pub struct PyCompose(ComposeValue);
 
 pub enum ComposeValue {
