@@ -35,33 +35,23 @@ submit! {
     }
 }
 
-pyo3::create_exception!(
+pyo3_stub_gen::create_exception!(
     discord.ext.songbird.native.error,
     PyJoinError,
+    PySongbirdError,
+    "Raised when a voice join fails."
+);
+pyo3_stub_gen::create_exception!(
+    discord.ext.songbird.native.error,
+    PyPlayerError,
+    PySongbirdError
+);
+pyo3_stub_gen::create_exception!(
+    discord.ext.songbird.native.error,
+    PyControlError,
     PySongbirdError
 );
 
-impl PyStubType for PyJoinError {
-    fn type_output() -> TypeInfo {
-        TypeInfo::locally_defined("PyJoinError", "discord.ext.songbird.native.error".into())
-    }
-}
-submit! {
-    PyClassInfo {
-        pyclass_name: "PyJoinError",
-        struct_id: std::any::TypeId::of::<PyJoinError>,
-        getters: &[],
-        setters: &[],
-        module: Some("discord.ext.songbird.native.error"),
-        doc: "Raised when a voice join fails.",
-        bases: &[|| <PySongbirdError as PyStubType>::type_output()],
-        has_eq: false,
-        has_ord: false,
-        has_hash: false,
-        has_str: false,
-        subclass: true,
-    }
-}
 
 pub trait IntoPyResult<T> {
     fn into_py(self) -> PyResult<T>;

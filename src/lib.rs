@@ -5,6 +5,8 @@ mod error;
 mod model;
 mod receive;
 mod update;
+mod player;
+mod format;
 
 use crate::client::SongbirdImpl;
 use pyo3::prelude::*;
@@ -57,6 +59,22 @@ VERSION : str
     mod model {
         #[pymodule_export]
         use crate::model::PyAsyncIterator;
+    }
+
+    #[pymodule]
+    mod player {
+        #[pymodule_export]
+        use crate::player::handle::PyTrackHandle;
+        #[pymodule_export]
+        use crate::player::input::audio::PyAudioInput;
+        #[pymodule_export]
+        use crate::player::input::audio::SupportedCodec;
+        #[pymodule_export]
+        use crate::player::input::stream::PyStreamInput;
+        #[pymodule_export]
+        use crate::player::input::PyInputBase;
+        #[pymodule_export]
+        use crate::player::track::PyTrack;
     }
 
     #[pymodule]

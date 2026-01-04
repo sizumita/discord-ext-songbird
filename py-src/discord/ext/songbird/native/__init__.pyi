@@ -23,26 +23,27 @@ VERSION : str
 """
 
 import builtins
-import typing
-
 import discord
+import typing
+from discord.ext.songbird.native.player import Track, TrackHandle
 from discord.ext.songbird.native.receive import SinkBase
+from . import error
+from . import model
+from . import player
+from . import receive
 
-from . import error, model, receive
-
-VERSION: builtins.str = "0.4.0-alpha"
-
+VERSION: builtins.str = '0.4.0-alpha'
 class SongbirdImpl:
     r"""
     Internal backend for Songbird voice connections.
-
+    
     This class is exposed to Python and used by `SongbirdClient` to manage
     voice state and connection lifecycle.
     """
     def __new__(cls, client: discord.Client, connectable: discord.abc.Connectable) -> SongbirdImpl:
         r"""
         Create a new backend tied to a Discord client and connectable.
-
+        
         Parameters
         ----------
         client : discord.Client
@@ -50,19 +51,12 @@ class SongbirdImpl:
         connectable : discord.abc.Connectable
             A connectable voice target (e.g., VoiceChannel or StageChannel).
         """
-    def connect(
-        self,
-        *,
-        timeout: builtins.float,
-        reconnect: builtins.bool,
-        self_deaf: builtins.bool = False,
-        self_mute: builtins.bool = False,
-    ) -> typing.Coroutine[typing.Any, typing.Any, None]:
+    def connect(self, *, timeout: builtins.float, reconnect: builtins.bool, self_deaf: builtins.bool = False, self_mute: builtins.bool = False) -> typing.Coroutine[typing.Any, typing.Any, None]:
         r"""
         |coro|
-
+        
         Connect to the voice channel associated with this backend.
-
+        
         Parameters
         ----------
         timeout : float
@@ -73,7 +67,7 @@ class SongbirdImpl:
             Whether to deafen this account after connecting.
         self_mute : bool
             Whether to mute this account after connecting.
-
+        
         Returns
         -------
         None
@@ -81,14 +75,14 @@ class SongbirdImpl:
     async def disconnect(self, *, force: builtins.bool) -> None:
         r"""
         |coro|
-
+        
         Disconnect from the current voice channel.
-
+        
         Parameters
         ----------
         force : bool
             Whether to force disconnect (currently ignored).
-
+        
         Returns
         -------
         None
@@ -96,18 +90,18 @@ class SongbirdImpl:
     async def update_server(self, endpoint: builtins.str, token: builtins.str) -> None:
         r"""
         |coro|
-
+        
         Update voice server information.
-
+        
         This is typically invoked by discord.py during a voice handshake.
-
+        
         Parameters
         ----------
         endpoint : str
             Voice server endpoint.
         token : str
             Voice session token.
-
+        
         Returns
         -------
         None
@@ -115,32 +109,30 @@ class SongbirdImpl:
     async def update_state(self, session_id: builtins.str, channel_id: int | None = None) -> None:
         r"""
         |coro|
-
+        
         Update voice state information.
-
+        
         This is typically invoked by discord.py after a VOICE_STATE_UPDATE.
-
+        
         Parameters
         ----------
         session_id : str
             Voice session ID.
         channel_id : int | None
             Channel ID, or None if disconnecting.
-
+        
         Returns
         -------
         None
         """
-    async def update_hook(
-        self, channel_id: typing.Optional[builtins.int], self_mute: builtins.bool, self_deaf: builtins.bool
-    ) -> None:
+    async def update_hook(self, channel_id: typing.Optional[builtins.int], self_mute: builtins.bool, self_deaf: builtins.bool) -> None:
         r"""
         |coro|
-
+        
         Hook invoked when discord.py updates voice state.
-
+        
         Subclasses should override this to integrate with their event loop.
-
+        
         Parameters
         ----------
         channel_id : int | None
@@ -149,7 +141,7 @@ class SongbirdImpl:
             Whether the account is self-muted.
         self_deaf : bool
             Whether the account is self-deafened.
-
+        
         Returns
         -------
         None
@@ -157,14 +149,14 @@ class SongbirdImpl:
     async def deafen(self, self_deaf: builtins.bool) -> None:
         r"""
         |coro|
-
+        
         Deafen or undeafen this account.
-
+        
         Parameters
         ----------
         self_deaf : bool
             Whether to deafen or undeafen this account.
-
+        
         Returns
         -------
         None
@@ -172,14 +164,14 @@ class SongbirdImpl:
     async def mute(self, self_mute: builtins.bool) -> None:
         r"""
         |coro|
-
+        
         Mute or unmute this account.
-
+        
         Parameters
         ----------
         self_mute : bool
             Whether to mute or unmute this account.
-
+        
         Returns
         -------
         None
@@ -187,7 +179,7 @@ class SongbirdImpl:
     def is_mute(self) -> builtins.bool:
         r"""
         Check if this account is muted.
-
+        
         Returns
         -------
         bool
@@ -196,7 +188,7 @@ class SongbirdImpl:
     def is_deaf(self) -> builtins.bool:
         r"""
         Check if this account is deafened.
-
+        
         Returns
         -------
         bool
@@ -205,15 +197,15 @@ class SongbirdImpl:
     def move_to(self, channel: discord.abc.Snowflake) -> typing.Coroutine[typing.Any, typing.Any, None]:
         r"""
         |coro|
-
+        
         Move this account to another voice channel.
-
+        
         Parameters
         ----------
         channel : discord.abc.Snowflake | None
             The channel to move to.
             If None, disconnects from voice.
-
+        
         Returns
         -------
         None
@@ -221,21 +213,21 @@ class SongbirdImpl:
     def listen(self, sink: SinkBase) -> None:
         r"""
         |coro|
-
+        
         Register a receive sink for voice events.
-
+        
         This attaches the sink's event handlers to the current call and starts
         its internal system event loop.
-
+        
         Parameters
         ----------
         sink : SinkBase
             The receive sink to register.
-
+        
         Returns
         -------
         None
-
+        
         Examples
         --------
         ```python
@@ -243,3 +235,5 @@ class SongbirdImpl:
         vc.listen(sink)
         ```
         """
+    def play(self, track: Track) -> typing.Coroutine[typing.Any, typing.Any, TrackHandle]: ...
+

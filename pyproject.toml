@@ -33,6 +33,7 @@ build-backend = "maturin"
 dev = [
     "hatchling>=1.28.0",
     "maturin>=1.10.2",
+    "numpy>=2.4.0",
     "ruff>=0.14.10",
     "ty>=0.0.8",
 ]

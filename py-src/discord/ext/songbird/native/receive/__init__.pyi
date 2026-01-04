@@ -44,40 +44,37 @@ distinguish silent from missing keys.
 """
 
 import builtins
-import typing
-
 import pyarrow
+import typing
 from discord.ext.songbird.native.model import PyAsyncIterator
 
 @typing.final
 class BufferSink(SinkBase):
     r"""
     Buffering sink for received voice data.
-
+    
     Collects `VoiceTick` snapshots and exposes them via async iteration.
-
+    
     Examples
     --------
     ```python
     from discord.ext import songbird
     from discord.ext.songbird import receive
-
+    
     vc = await channel.connect(cls=songbird.SongbirdClient)
     sink = receive.BufferSink(max_duration_secs=5)
     vc.listen(sink)
-
+    
     async for tick in sink:
         pcm = tick.get(receive.VoiceKey.User(user_id))
         if pcm is not None:
             handle_pcm(pcm)
     ```
     """
-    def __new__(
-        cls, *, max_duration_secs: typing.Optional[builtins.int] = None, drop_oldest: builtins.bool = True
-    ) -> typing.Self:
+    def __new__(cls, *, max_duration_secs: typing.Optional[builtins.int] = None, drop_oldest: builtins.bool = True) -> typing.Self:
         r"""
         Create a new BufferSink.
-
+        
         Parameters
         ----------
         max_duration_secs : int | None
@@ -85,12 +82,12 @@ class BufferSink(SinkBase):
         drop_oldest : bool, optional
             If True, drop the oldest ticks when the buffer is full. If False,
             drop new ticks instead.
-
+        
         Notes
         -----
         Internally converted to a tick count based on 20 ms per tick (50 ticks/sec).
         Parameters are keyword-only.
-
+        
         Returns
         -------
         BufferSink
@@ -98,11 +95,11 @@ class BufferSink(SinkBase):
     def stop(self) -> None:
         r"""
         Stop buffering new ticks.
-
+        
         Notes
         -----
         This does not unregister the sink.
-
+        
         Returns
         -------
         None
@@ -110,16 +107,16 @@ class BufferSink(SinkBase):
     def __getitem__(self, key: VoiceKey) -> PyAsyncIterator[typing.Optional[pyarrow.Int16Array]]:
         r"""
         Return an async iterator over PCM for a specific key.
-
+        
         Parameters
         ----------
         key : VoiceKey
             The user/ssrc key to filter.
-
+        
         Returns
         -------
         PyAsyncIterator[pyarrow.Int16Array | None]
-
+        
         Examples
         --------
         ```python
@@ -132,11 +129,11 @@ class BufferSink(SinkBase):
     def __aiter__(self) -> PyAsyncIterator[VoiceTick]:
         r"""
         Return an async iterator over buffered `VoiceTick` entries.
-
+        
         Returns
         -------
         PyAsyncIterator[VoiceTick]
-
+        
         Examples
         --------
         ```python
@@ -148,26 +145,25 @@ class BufferSink(SinkBase):
 class SinkBase:
     r"""
     Base class for receive sinks.
-
+    
     Notes
     -----
     This is an internal type exposed to Python for sink registration.
     Custom sinks are not currently supported from Python.
     """
-
     ...
 
 @typing.final
 class Stream:
     r"""
     Async stream handle returned by `StreamSink.stream()`.
-
+    
     This object is an async context manager that acquires a stream permit.
     """
     def close(self) -> typing.Coroutine[typing.Any, typing.Any, None]:
         r"""
         Close the stream and release its permit.
-
+        
         Returns
         -------
         None
@@ -175,7 +171,7 @@ class Stream:
     def __aenter__(self) -> typing.Coroutine[typing.Any, typing.Any, Stream]:
         r"""
         Enter the async context and acquire a stream permit.
-
+        
         Returns
         -------
         Stream
@@ -183,17 +179,15 @@ class Stream:
     def __aiter__(self) -> PyAsyncIterator[VoiceTick]:
         r"""
         Return an async iterator over `VoiceTick` entries.
-
+        
         Returns
         -------
         PyAsyncIterator[VoiceTick]
         """
-    def __aexit__(
-        self, _exc_type: typing.Any, _exc_val: typing.Any, _exc_tb: typing.Any
-    ) -> typing.Coroutine[typing.Any, typing.Any, None]:
+    def __aexit__(self, _exc_type: typing.Any, _exc_val: typing.Any, _exc_tb: typing.Any) -> typing.Coroutine[typing.Any, typing.Any, None]:
         r"""
         Exit the async context and release the stream permit.
-
+        
         Returns
         -------
         None
@@ -201,16 +195,16 @@ class Stream:
     def __getitem__(self, key: VoiceKey) -> PyAsyncIterator[typing.Optional[pyarrow.Int16Array]]:
         r"""
         Return an async iterator over PCM for a specific key.
-
+        
         Parameters
         ----------
         key : VoiceKey
             The user/ssrc key to filter.
-
+        
         Returns
         -------
         PyAsyncIterator[pyarrow.Int16Array | None]
-
+        
         Examples
         --------
         ```python
@@ -225,31 +219,29 @@ class Stream:
 class StreamSink(SinkBase):
     r"""
     Streaming sink for received voice data.
-
+    
     Unlike `BufferSink`, this sink exposes a stream interface backed by a
     broadcast channel and supports concurrent consumers via permits.
-
+    
     Examples
     --------
     ```python
     from discord.ext import songbird
     from discord.ext.songbird import receive
-
+    
     vc = await channel.connect(cls=songbird.SongbirdClient)
     sink = receive.StreamSink()
     vc.listen(sink)
-
+    
     async with sink.stream() as stream:
         async for tick in stream:
             ...
     ```
     """
-    def __new__(
-        cls, *, retain: builtins.bool = False, retain_secs: builtins.int = 15, max_concurrent: builtins.int = 50
-    ) -> typing.Self:
+    def __new__(cls, *, retain: builtins.bool = False, retain_secs: builtins.int = 15, max_concurrent: builtins.int = 50) -> typing.Self:
         r"""
         Create a new StreamSink.
-
+        
         Parameters
         ----------
         retain : bool, optional
@@ -259,7 +251,7 @@ class StreamSink(SinkBase):
             Internally converted to a tick count based on 20 ms per tick (50 ticks/sec).
         max_concurrent : int, optional
             Maximum number of concurrent streams.
-
+        
         Returns
         -------
         StreamSink
@@ -267,13 +259,13 @@ class StreamSink(SinkBase):
     def stream(self) -> Stream:
         r"""
         Create an async stream handle.
-
+        
         Use this with `async with` to acquire a stream permit.
-
+        
         Returns
         -------
         Stream
-
+        
         Examples
         --------
         ```python
@@ -286,9 +278,9 @@ class StreamSink(SinkBase):
 class VoiceKey:
     r"""
     Identifier for a voice source.
-
+    
     This is either a Discord user ID or an unknown SSRC.
-
+    
     Examples
     --------
     ```python
@@ -300,13 +292,13 @@ class VoiceKey:
     def id(self) -> int:
         r"""
         Return the underlying integer identifier.
-
+        
         For user keys this is the user ID, otherwise the SSRC value.
-
+        
         Returns
         -------
         int
-
+        
         Examples
         --------
         ```python
@@ -317,11 +309,11 @@ class VoiceKey:
     def is_user(self) -> builtins.bool:
         r"""
         Check whether this key represents a user ID.
-
+        
         Returns
         -------
         bool
-
+        
         Examples
         --------
         ```python
@@ -331,11 +323,11 @@ class VoiceKey:
     def is_unknown(self) -> builtins.bool:
         r"""
         Check whether this key represents an unknown SSRC.
-
+        
         Returns
         -------
         bool
-
+        
         Examples
         --------
         ```python
@@ -351,7 +343,7 @@ class VoiceKey:
         def __new__(cls, _0: builtins.int) -> VoiceKey.User: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int) -> typing.Any: ...
-
+    
     @typing.final
     class Unknown(VoiceKey):
         __match_args__ = ("_0",)
@@ -360,12 +352,13 @@ class VoiceKey:
         def __new__(cls, _0: builtins.int) -> VoiceKey.Unknown: ...
         def __len__(self) -> builtins.int: ...
         def __getitem__(self, key: builtins.int) -> typing.Any: ...
+    
 
 @typing.final
 class VoiceTick:
     r"""
     Snapshot of received voice data for a single tick.
-
+    
     Examples
     --------
     ```python
@@ -378,17 +371,17 @@ class VoiceTick:
     def get(self, key: VoiceKey) -> typing.Optional[pyarrow.Int16Array]:
         r"""
         Get PCM audio for a key if it is speaking in this tick.
-
+        
         Parameters
         ----------
         key : VoiceKey
             The user/ssrc key to query.
-
+        
         Returns
         -------
         pyarrow.Int16Array | None
             PCM when speaking, otherwise None.
-
+        
         Examples
         --------
         ```python
@@ -400,16 +393,16 @@ class VoiceTick:
     def is_silent(self, key: VoiceKey) -> builtins.bool:
         r"""
         Check whether a key is marked silent in this tick.
-
+        
         Parameters
         ----------
         key : VoiceKey
             The user/ssrc key to query.
-
+        
         Returns
         -------
         bool
-
+        
         Examples
         --------
         ```python
@@ -420,11 +413,11 @@ class VoiceTick:
     def all_keys(self) -> builtins.set[VoiceKey]:
         r"""
         Return all keys present in this tick (speaking + silent).
-
+        
         Returns
         -------
         set[VoiceKey]
-
+        
         Examples
         --------
         ```python
@@ -435,11 +428,11 @@ class VoiceTick:
     def speaking_keys(self) -> builtins.set[VoiceKey]:
         r"""
         Return keys that have PCM data in this tick.
-
+        
         Returns
         -------
         set[VoiceKey]
-
+        
         Examples
         --------
         ```python
@@ -450,11 +443,11 @@ class VoiceTick:
     def silent_keys(self) -> builtins.set[VoiceKey]:
         r"""
         Return keys marked silent in this tick.
-
+        
         Returns
         -------
         set[VoiceKey]
-
+        
         Examples
         --------
         ```python
@@ -462,3 +455,4 @@ class VoiceTick:
             ...
         ```
         """
+
