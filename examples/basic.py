@@ -16,24 +16,21 @@ logging.getLogger().setLevel(logging.DEBUG)
 client = discord.Client(intents=discord.Intents.default())
 
 # Creating a sine wave
-sine: io.BytesIO = io.BytesIO()
+sine: io.BytesIO
+
+with open("examples/mono.wav", "rb") as f:
+    sine = io.BytesIO(f.read())
+sine_wav = pyarrow.array(pyarrow.py_buffer(sine.getbuffer()), pyarrow.uint8())
 
 duration = 5
-sample_rate = 44100
+sample_rate = 48000
 frequency = 440.0
 amplitude = 0.9
 
 t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
 signal = amplitude * np.sin(2 * np.pi * frequency * t)
-pcm_i16 = np.clip(signal * 32767, -32768, 32767).astype(np.int16)
+signal = signal.astype(dtype=np.float32)
 
-with wave.open(sine, "wb") as f:
-    f.setnchannels(1)
-    f.setframerate(sample_rate)
-    f.setsampwidth(2)  # 16-bit
-    f.writeframes(pcm_i16.tobytes())
-
-source = pyarrow.array(pyarrow.py_buffer(sine.getbuffer()), type=pyarrow.uint8())
 
 @client.event
 async def on_ready():
@@ -44,12 +41,14 @@ async def on_ready():
 
     ch = client.get_channel(int(os.environ["CHANNEL_ID"]))
     if isinstance(ch, discord.VoiceChannel):
-        discord.PCMAudio
         vc = await ch.connect(cls=songbird.SongbirdClient)
 
-        data = songbird.player.AudioInput(source, songbird.player.SupportedCodec.WAVE)
+        data = songbird.player.AudioInput(signal, songbird.player.SupportedCodec.PCM)
+        data2 = songbird.player.AudioInput(sine_wav, songbird.player.SupportedCodec.WAVE)
         track = songbird.player.Track(data)
+        track2 = songbird.player.Track(data2)
         handle = await vc.play(track)
+        handle2 = await vc.play(track2)
 
 
 client.run(os.environ["DISCORD_BOT_TOKEN"])

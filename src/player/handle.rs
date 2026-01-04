@@ -12,25 +12,29 @@ pub struct PyTrackHandle {
 #[pymethods]
 impl PyTrackHandle {
     fn play(&self) -> PyResult<()> {
-        self.inner.play().map_err(|err| PyControlError::new_err(err.to_string()))?;
+        self.inner
+            .play()
+            .map_err(|err| PyControlError::new_err(err.to_string()))?;
         Ok(())
     }
 
     fn pause(&self) -> PyResult<()> {
-        self.inner.pause().map_err(|err| PyControlError::new_err(err.to_string()))?;
+        self.inner
+            .pause()
+            .map_err(|err| PyControlError::new_err(err.to_string()))?;
         Ok(())
     }
 
     fn stop(&self) -> PyResult<()> {
-        self.inner.stop().map_err(|err| PyControlError::new_err(err.to_string()))?;
+        self.inner
+            .stop()
+            .map_err(|err| PyControlError::new_err(err.to_string()))?;
         Ok(())
     }
 }
 
 impl PyTrackHandle {
     pub fn new(inner: TrackHandle) -> Self {
-        Self {
-            inner,
-        }
+        Self { inner }
     }
 }

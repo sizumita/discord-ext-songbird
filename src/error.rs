@@ -52,7 +52,6 @@ pyo3_stub_gen::create_exception!(
     PySongbirdError
 );
 
-
 pub trait IntoPyResult<T> {
     fn into_py(self) -> PyResult<T>;
 }

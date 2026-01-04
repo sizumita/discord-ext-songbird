@@ -1,7 +1,6 @@
 use crate::error::IntoPyResult;
 use crate::model::PyFuture;
 use crate::player::handle::PyTrackHandle;
-use crate::player::input::PyCompose;
 use crate::player::track::PyTrack;
 use crate::receive::sink::SinkBase;
 use crate::receive::HandlerWrapper;
@@ -13,9 +12,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::driver::DecodeMode;
 use songbird::id::{ChannelId, GuildId, UserId};
-use songbird::input::Input;
 use songbird::shards::Shard;
-use songbird::tracks::Track;
 use songbird::{Call, Config};
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -457,7 +454,11 @@ impl SongbirdImpl {
         Ok(())
     }
 
-    fn play<'py>(&self, py: Python<'py>, track: &PyTrack) -> PyResult<PyFuture<'py, PyTrackHandle>> {
+    fn play<'py>(
+        &self,
+        py: Python<'py>,
+        track: &PyTrack,
+    ) -> PyResult<PyFuture<'py, PyTrackHandle>> {
         let call = self.call.clone();
         let track = track.to_track(py)?;
         future_into_py(py, async move {
@@ -466,6 +467,7 @@ impl SongbirdImpl {
 
             let handle = call.play(track);
             Ok(PyTrackHandle::new(handle))
-        }).map(|x| x.into())
+        })
+        .map(|x| x.into())
     }
 }

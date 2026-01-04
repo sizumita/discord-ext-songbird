@@ -3,10 +3,9 @@
 mod client;
 mod error;
 mod model;
+mod player;
 mod receive;
 mod update;
-mod player;
-mod format;
 
 use crate::client::SongbirdImpl;
 use pyo3::prelude::*;

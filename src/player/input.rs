@@ -1,16 +1,23 @@
 pub(crate) mod audio;
 pub mod stream;
 
-use pyo3::{pyclass, pymethods, Bound, PyResult};
+use pyo3::{pyclass, pymethods, PyResult};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::input::Compose;
-use std::sync::Arc;
 
 #[gen_stub_pyclass]
-#[pyclass(name = "InputBase", module = "discord.ext.songbird.native.player", subclass)]
+#[pyclass(
+    name = "InputBase",
+    module = "discord.ext.songbird.native.player",
+    subclass
+)]
 pub struct PyInputBase;
 
-#[pyclass(name = "Compose", module = "discord.ext.songbird.native.player", subclass)]
+#[pyclass(
+    name = "Compose",
+    module = "discord.ext.songbird.native.player",
+    subclass
+)]
 pub struct PyCompose(Option<Box<dyn Compose + Send + Sync + 'static>>);
 
 #[gen_stub_pymethods]
