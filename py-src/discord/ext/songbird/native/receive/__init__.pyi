@@ -44,9 +44,8 @@ distinguish silent from missing keys.
 """
 
 import builtins
-import typing
-
 import pyarrow
+import typing
 from discord.ext.songbird.native.model import PyAsyncIterator
 
 @typing.final

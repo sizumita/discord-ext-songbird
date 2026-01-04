@@ -6,7 +6,7 @@ import discord
 from discord.types.voice import GuildVoiceState as GuildVoiceStatePayload
 from discord.types.voice import VoiceServerUpdate as VoiceServerUpdatePayload
 
-from .native import SongbirdImpl
+from .native import SongbirdImpl, player
 
 
 class SongbirdClient(discord.VoiceProtocol, SongbirdImpl):

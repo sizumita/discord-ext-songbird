@@ -7,7 +7,9 @@ use crate::receive::HandlerWrapper;
 use crate::update::VoiceUpdater;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::types::PyTuple;
-use pyo3::{pyclass, pymethods, Bound, IntoPyObjectExt, PyAny, PyRef, PyRefMut, PyResult, Python};
+use pyo3::{
+    pyclass, pymethods, Bound, IntoPyObjectExt, Py, PyAny, PyRef, PyRefMut, PyResult, Python,
+};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::driver::DecodeMode;
@@ -54,6 +56,7 @@ pub struct SongbirdImpl {
     guild_id: GuildId,
     application_id: UserId,
     call: Arc<Mutex<CallWrapper>>,
+    current_loop: Py<PyAny>,
 }
 
 #[gen_stub_pymethods]
@@ -76,6 +79,7 @@ impl SongbirdImpl {
         connectable: &Bound<PyAny>,
     ) -> PyResult<Self> {
         let id = connectable.getattr("id")?.extract::<NonZeroU64>()?;
+        let current_loop = client.getattr("loop")?.unbind();
 
         let channel_id = ChannelId(id);
         let (guild_id, key_type) = {
@@ -106,6 +110,7 @@ impl SongbirdImpl {
             guild_id: guild_id.into(),
             application_id: application_id.into(),
             call: Arc::new(Mutex::new(CallWrapper::new())),
+            current_loop,
         })
     }
 
@@ -457,14 +462,16 @@ impl SongbirdImpl {
     fn play<'py>(
         &self,
         py: Python<'py>,
-        track: &PyTrack,
+        track: Bound<'py, PyTrack>,
     ) -> PyResult<PyFuture<'py, PyTrackHandle>> {
         let call = self.call.clone();
-        let track = track.to_track(py)?;
+        let current_loop = self.current_loop.clone_ref(py);
+        let track = track.unbind().clone_ref(py);
         future_into_py(py, async move {
             let mut guard = call.lock().await;
             let call = guard.get_mut()?;
 
+            let track = Python::attach(|py| track.bind(py).borrow().to_track(py, current_loop))?;
             let handle = call.play(track);
             Ok(PyTrackHandle::new(handle))
         })

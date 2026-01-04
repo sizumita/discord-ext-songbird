@@ -1,6 +1,6 @@
 use crate::player::input::{PyCompose, PyInputBase};
 use pyo3::{
-    pyclass, pymethods, Bound, Py, PyRefMut, PyResult, PyTraverseError, PyVisit, Python,
+    pyclass, pymethods, Bound, Py, PyAny, PyRefMut, PyResult, PyTraverseError, PyVisit, Python,
 };
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::input::Input;
@@ -56,13 +56,13 @@ impl PyTrack {
 }
 
 impl PyTrack {
-    pub fn to_track(&self, py: Python) -> PyResult<Track> {
+    pub fn to_track(&self, py: Python, current_loop: Py<PyAny>) -> PyResult<Track> {
         let mut compose = self
             .input
-            .call_method0(py, "_compose")?
+            .call_method1(py, "_compose", (current_loop,))?
             .cast_bound::<PyCompose>(py)?
             .borrow_mut();
-        let mut track = Track::new(Input::Lazy(compose.get_compose().unwrap()))
+        let mut track = Track::new(compose.get_input().unwrap())
             .loops(self.loops)
             .volume(self.volume);
         track.playing = self.mode.clone();
