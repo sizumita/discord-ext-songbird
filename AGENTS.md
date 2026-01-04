@@ -3,16 +3,17 @@
 This repository hosts a hybrid Rust/Python voice backend for `discord.py`, built with PyO3 and `maturin`.
 
 ## Project Structure & Module Organization
-- `src/`: Rust backend (PyO3 module, voice connection logic, queue/track handling). Stub generation lives in `src/bin/stub_gen.rs`.
+- `src/`: Rust backend (PyO3 module, voice connection logic, track handling, receive sinks). Stub generation lives in `src/bin/stub_gen.rs`.
 - `py-src/discord/ext/songbird/`: Python API layer, type stubs (`.pyi`), and `py.typed` marker; native stubs live under `native/`.
-- `examples/`: runnable bot examples (`basic.py`, `track_handling.py`, `receive.py`).
+- `examples/`: runnable bot examples (`basic.py`, `send_stream.py`, `receive_stream.py`).
 - Build metadata: `Cargo.toml`, `pyproject.toml`, `build.rs`, `justfile`. Build outputs go to `target/` and should not be committed.
- - `py-src/discord/ext/songbird/native/`: **auto-generated** by `cargo stub`; do not edit manually.
+- `py-src/discord/ext/songbird/native/`: **auto-generated** by `cargo run --bin stub_gen` (via `just build`/`just dev`); do not edit manually.
 
 ## Build, Test, and Development Commands
 - `uv sync --all-extras --dev --no-install-project`: install dev dependencies.
 - `uvx maturin develop`: build and install the Rust extension into the active virtualenv.
 - `just build`: runs stub generation then builds wheels (`cargo run --bin stub_gen`, `uvx maturin build`).
+- `just dev`: runs stub generation then installs the extension locally (`cargo run --bin stub_gen`, `uvx maturin develop`).
 - `just fmt`: `cargo fmt` + `ruff format` for Python.
 - `just check`: `cargo clippy` + `ruff check` + `uvx ty check`.
 - `python examples/basic.py`: run a sample bot after setting `DISCORD_BOT_TOKEN`.
