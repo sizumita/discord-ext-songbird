@@ -1,7 +1,9 @@
 use crate::player::input::codec::SupportedCodec;
 use crate::player::input::{PyCompose, PyInputBase};
 use pin_project_lite::pin_project;
-use pyo3::{pyclass, pymethods, Bound, Py, PyAny, PyRef, PyResult, Python};
+use pyo3::{
+    pyclass, pymethods, Bound, Py, PyAny, PyRef, PyResult, PyTraverseError, PyVisit, Python,
+};
 use pyo3_async_runtimes::{into_future_with_locals, TaskLocals};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::input::core::io::{MediaSourceStream, MediaSourceStreamOptions};
@@ -15,7 +17,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 #[gen_stub_pyclass]
 #[pyclass(name = "StreamInput", extends = PyInputBase, module = "discord.ext.songbird.native.player.input")]
-pub struct PyStreamInput(Py<PyAny>, SupportedCodec);
+pub struct PyStreamInput(Option<Py<PyAny>>, SupportedCodec);
 
 pin_project! {
     struct AsyncStream {
@@ -35,7 +37,10 @@ impl PyStreamInput {
         stream_reader: Bound<PyAny>,
         codec: SupportedCodec,
     ) -> (Self, PyInputBase) {
-        (Self(stream_reader.unbind(), codec), PyInputBase::new())
+        (
+            Self(Some(stream_reader.unbind()), codec),
+            PyInputBase::new(),
+        )
     }
 
     #[gen_stub(skip)]
@@ -44,7 +49,13 @@ impl PyStreamInput {
         py: Python<'py>,
         current_loop: Bound<'py, PyAny>,
     ) -> PyResult<PyCompose> {
-        let stream = slf.0.clone_ref(py);
+        let stream = slf
+            .0
+            .as_ref()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("StreamInput has been cleared")
+            })?
+            .clone_ref(py);
         let codec = slf.1.clone();
         let source = AsyncReadOnlySource::new(AsyncStream {
             stream,
@@ -62,6 +73,20 @@ impl PyStreamInput {
             None,
         ))
     }
+
+    #[gen_stub(skip)]
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        if let Some(stream) = &self.0 {
+            visit.call(stream)?;
+        }
+        Ok(())
+    }
+
+    #[gen_stub(skip)]
+    fn __clear__(&mut self) {
+        // Clear reference, this decrements ref counter.
+        self.0 = None;
+    }
 }
 
 impl AsyncRead for AsyncStream {
@@ -69,7 +94,7 @@ impl AsyncRead for AsyncStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let len = buf.remaining();
         if len == 0 {

@@ -8,7 +8,8 @@ use crate::update::VoiceUpdater;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::types::PyTuple;
 use pyo3::{
-    pyclass, pymethods, Bound, IntoPyObjectExt, Py, PyAny, PyRef, PyRefMut, PyResult, Python,
+    pyclass, pymethods, Bound, IntoPyObjectExt, Py, PyAny, PyRef, PyRefMut, PyResult,
+    PyTraverseError, PyVisit, Python,
 };
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -56,7 +57,7 @@ pub struct SongbirdImpl {
     guild_id: GuildId,
     application_id: UserId,
     call: Arc<Mutex<CallWrapper>>,
-    current_loop: Py<PyAny>,
+    current_loop: Option<Py<PyAny>>,
 }
 
 #[gen_stub_pymethods]
@@ -110,7 +111,7 @@ impl SongbirdImpl {
             guild_id: guild_id.into(),
             application_id: application_id.into(),
             call: Arc::new(Mutex::new(CallWrapper::new())),
-            current_loop,
+            current_loop: Some(current_loop),
         })
     }
 
@@ -465,7 +466,13 @@ impl SongbirdImpl {
         track: Bound<'py, PyTrack>,
     ) -> PyResult<PyFuture<'py, PyTrackHandle>> {
         let call = self.call.clone();
-        let current_loop = self.current_loop.clone_ref(py);
+        let current_loop = self
+            .current_loop
+            .as_ref()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("SongbirdImpl has been cleared")
+            })?
+            .clone_ref(py);
         let track = track.unbind().clone_ref(py);
         future_into_py(py, async move {
             let mut guard = call.lock().await;
@@ -476,5 +483,19 @@ impl SongbirdImpl {
             Ok(PyTrackHandle::new(handle))
         })
         .map(|x| x.into())
+    }
+
+    #[gen_stub(skip)]
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        if let Some(current_loop) = &self.current_loop {
+            visit.call(current_loop)?;
+        }
+        Ok(())
+    }
+
+    #[gen_stub(skip)]
+    fn __clear__(&mut self) {
+        // Clear reference, this decrements ref counter.
+        self.current_loop = None;
     }
 }

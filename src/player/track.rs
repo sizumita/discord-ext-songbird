@@ -8,7 +8,7 @@ use songbird::tracks::{LoopState, PlayMode, Track};
 #[gen_stub_pyclass]
 #[pyclass(name = "Track", module = "discord.ext.songbird.native.player")]
 pub struct PyTrack {
-    pub input: Py<PyInputBase>,
+    pub input: Option<Py<PyInputBase>>,
     mode: PlayMode,
     volume: f32,
     loops: LoopState,
@@ -20,7 +20,7 @@ impl PyTrack {
     #[new]
     pub fn new<'py>(input: Bound<'py, PyInputBase>) -> Self {
         Self {
-            input: input.unbind(),
+            input: Some(input.unbind()),
             mode: PlayMode::Play,
             volume: 1.0,
             loops: LoopState::Finite(0),
@@ -49,15 +49,25 @@ impl PyTrack {
 
     #[gen_stub(skip)]
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        visit.call(&self.input)?;
+        if let Some(input) = &self.input {
+            visit.call(input)?;
+        }
         Ok(())
+    }
+
+    #[gen_stub(skip)]
+    fn __clear__(&mut self) {
+        // Clear reference, this decrements ref counter.
+        self.input = None;
     }
 }
 
 impl PyTrack {
     pub fn to_track(&self, py: Python, current_loop: Py<PyAny>) -> PyResult<Track> {
-        let mut compose = self
-            .input
+        let input = self.input.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Track input has been cleared")
+        })?;
+        let mut compose = input
             .call_method1(py, "_compose", (current_loop,))?
             .cast_bound::<PyCompose>(py)?
             .borrow_mut();
