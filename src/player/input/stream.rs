@@ -2,9 +2,9 @@ use crate::player::input::codec::SupportedCodec;
 use crate::player::input::{PyCompose, PyInputBase};
 use pin_project_lite::pin_project;
 use pyo3::{
-    pyclass, pymethods, Bound, Py, PyAny, PyRef, PyResult, PyTraverseError, PyVisit, Python,
+    Bound, Py, PyAny, PyRef, PyResult, PyTraverseError, PyVisit, Python, pyclass, pymethods,
 };
-use pyo3_async_runtimes::{into_future_with_locals, TaskLocals};
+use pyo3_async_runtimes::{TaskLocals, into_future_with_locals};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::input::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use songbird::input::{AsyncAdapterStream, AsyncReadOnlySource, AudioStream, LiveInput};

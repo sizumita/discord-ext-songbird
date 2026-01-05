@@ -1,6 +1,6 @@
 use crate::model::future::PyFuture;
 use futures::StreamExt;
-use pyo3::{pyclass, pymethods, IntoPyObjectExt, Py, PyAny, PyRef, PyResult, Python};
+use pyo3::{IntoPyObjectExt, Py, PyAny, PyRef, PyResult, Python, pyclass, pymethods};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::gen_stub_pymethods;
 use pyo3_stub_gen::inventory::submit;

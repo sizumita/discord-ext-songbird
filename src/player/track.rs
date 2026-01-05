@@ -1,6 +1,6 @@
 use crate::player::input::{PyCompose, PyInputBase};
 use pyo3::{
-    pyclass, pymethods, Bound, Py, PyAny, PyRefMut, PyResult, PyTraverseError, PyVisit, Python,
+    Bound, Py, PyAny, PyRefMut, PyResult, PyTraverseError, PyVisit, Python, pyclass, pymethods,
 };
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::tracks::{LoopState, PlayMode, Track};

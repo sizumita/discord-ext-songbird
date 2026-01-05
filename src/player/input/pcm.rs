@@ -3,7 +3,7 @@ use arrow::array::{AsArray, Float32Array};
 use arrow::datatypes::Float32Type;
 use async_trait::async_trait;
 use bytemuck::cast_slice;
-use pyo3::{pyclass, pymethods, Bound, PyAny, PyResult};
+use pyo3::{Bound, PyAny, PyResult, pyclass, pymethods};
 use pyo3_arrow::PyArray;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::input::core::io::MediaSource;

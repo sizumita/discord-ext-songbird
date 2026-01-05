@@ -5,12 +5,12 @@ use arrow::array::Int16Array;
 use async_stream::stream;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use pyo3::{pyclass, pymethods, IntoPyObjectExt, PyRef, PyResult, Python};
+use pyo3::{IntoPyObjectExt, PyRef, PyResult, Python, pyclass, pymethods};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::{CoreEvent, Event, EventContext, EventHandler};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 
 pub struct BufferSinkHandler {

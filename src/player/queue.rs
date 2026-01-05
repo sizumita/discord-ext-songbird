@@ -1,6 +1,6 @@
 use crate::error::IntoPyResult;
 use crate::player::handle::PyTrackHandle;
-use pyo3::{pyclass, pymethods, PyResult};
+use pyo3::{PyResult, pyclass, pymethods};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::tracks::TrackQueue;
 

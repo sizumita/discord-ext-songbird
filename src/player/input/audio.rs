@@ -3,7 +3,7 @@ use crate::player::input::data::AnyVoiceDataArray;
 use crate::player::input::{PyCompose, PyInputBase};
 use arrow::array::{Array, ArrayRef};
 use async_trait::async_trait;
-use pyo3::{pyclass, pymethods, Bound, PyAny, PyResult};
+use pyo3::{Bound, PyAny, PyResult, pyclass, pymethods};
 use pyo3_arrow::PyArray;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::input::core::io::MediaSource;

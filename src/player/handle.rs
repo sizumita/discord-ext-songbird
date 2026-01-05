@@ -1,6 +1,6 @@
 use crate::error::PyControlError;
 use crate::model::PyFuture;
-use pyo3::{pyclass, pymethods, PyResult, Python};
+use pyo3::{PyResult, Python, pyclass, pymethods};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::tracks::TrackHandle;

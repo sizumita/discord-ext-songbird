@@ -4,7 +4,7 @@ mod data;
 pub mod pcm;
 pub mod stream;
 
-use pyo3::{pyclass, pymethods, Bound, PyAny, PyResult};
+use pyo3::{Bound, PyAny, PyResult, pyclass, pymethods};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::input::{Compose, Input, LiveInput};
 

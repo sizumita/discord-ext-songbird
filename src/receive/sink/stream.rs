@@ -5,12 +5,12 @@ use arrow::array::Int16Array;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::StreamExt;
-use pyo3::{pyclass, pymethods, Bound, IntoPyObjectExt, PyAny, PyRef, PyRefMut, PyResult, Python};
+use pyo3::{Bound, IntoPyObjectExt, PyAny, PyRef, PyRefMut, PyResult, Python, pyclass, pymethods};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::{CoreEvent, Event, EventContext, EventHandler};
 use std::sync::Arc;
-use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 
 #[gen_stub_pyclass]

@@ -3,14 +3,14 @@ use crate::model::PyFuture;
 use crate::player::handle::PyTrackHandle;
 use crate::player::queue::PyQueue;
 use crate::player::track::PyTrack;
-use crate::receive::sink::SinkBase;
 use crate::receive::HandlerWrapper;
+use crate::receive::sink::SinkBase;
 use crate::update::VoiceUpdater;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::types::PyTuple;
 use pyo3::{
-    pyclass, pymethods, Bound, IntoPyObjectExt, Py, PyAny, PyRef, PyRefMut, PyResult,
-    PyTraverseError, PyVisit, Python,
+    Bound, IntoPyObjectExt, Py, PyAny, PyRef, PyRefMut, PyResult, PyTraverseError, PyVisit, Python,
+    pyclass, pymethods,
 };
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};

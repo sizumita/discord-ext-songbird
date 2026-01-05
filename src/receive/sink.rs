@@ -1,7 +1,7 @@
 mod buffer;
 mod stream;
 
-use pyo3::{pyclass, PyResult};
+use pyo3::{PyResult, pyclass};
 use pyo3_stub_gen::derive::gen_stub_pyclass;
 use songbird::{Event, EventHandler};
 use std::collections::HashSet;

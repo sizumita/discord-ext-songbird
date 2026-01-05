@@ -2,7 +2,7 @@ use crate::model::ArrowArray;
 use arrow::array::Int16Array;
 use dashmap::DashMap;
 use pyo3::types::PyInt;
-use pyo3::{pyclass, pymethods, Bound, PyResult, Python};
+use pyo3::{Bound, PyResult, Python, pyclass, pymethods};
 use pyo3_arrow::PyArray;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 use songbird::events::context_data::VoiceTick as SongbirdVoiceTick;

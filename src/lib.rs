@@ -74,6 +74,8 @@ VERSION : str
         #[pymodule]
         mod input {
             #[pymodule_export]
+            use crate::player::input::PyInputBase;
+            #[pymodule_export]
             use crate::player::input::audio::PyAudioInput;
             #[pymodule_export]
             use crate::player::input::codec::SupportedCodec;
@@ -81,8 +83,6 @@ VERSION : str
             use crate::player::input::pcm::PyRawPcmInput;
             #[pymodule_export]
             use crate::player::input::stream::PyStreamInput;
-            #[pymodule_export]
-            use crate::player::input::PyInputBase;
         }
     }
 

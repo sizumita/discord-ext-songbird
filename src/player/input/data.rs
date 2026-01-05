@@ -1,14 +1,14 @@
 use arrow::array::{
-    ArrayRef, AsArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, UInt16Array,
-    UInt32Array, UInt8Array,
+    ArrayRef, AsArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, UInt8Array,
+    UInt16Array, UInt32Array,
 };
 use arrow::datatypes::{
-    Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, UInt16Type, UInt32Type, UInt8Type,
+    Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type,
 };
 use bytemuck::cast_slice;
 use pyo3::PyErr;
-use songbird::input::core::io::MediaSource;
 use songbird::input::AudioStreamError;
+use songbird::input::core::io::MediaSource;
 use std::io::Cursor;
 
 #[derive(Clone)]
