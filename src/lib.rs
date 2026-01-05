@@ -100,7 +100,11 @@ VERSION : str
     #[pymodule]
     mod error {
         #[pymodule_export]
+        use crate::error::PyControlError;
+        #[pymodule_export]
         use crate::error::PyJoinError;
+        #[pymodule_export]
+        use crate::error::PyPlayerError;
         #[pymodule_export]
         use crate::error::PySongbirdError;
     }
