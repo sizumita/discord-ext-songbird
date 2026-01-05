@@ -1,38 +1,70 @@
-use pyo3::exceptions::PyValueError;
-use pyo3::{create_exception, PyErr};
+use pyo3::PyResult;
+use pyo3_stub_gen::inventory::submit;
+use pyo3_stub_gen::type_info::PyClassInfo;
+use pyo3_stub_gen::{PyStubType, TypeInfo};
 use songbird::error::JoinError;
 use songbird::tracks::ControlError;
-use thiserror::Error;
 
-#[derive(Debug, Error)]
-pub enum SongbirdError {
-    #[error("Connection not started. Please call .start/3 before call this function")]
-    ConnectionNotStarted,
-    #[error("Passing Message failed")]
-    JoinError(#[from] JoinError),
-    #[error("Controller Error")]
-    ControlError(#[from] ControlError),
-    #[error("Id is invalid")]
-    InvalidId,
+pyo3::create_exception!(
+    discord.ext.songbird.native.error,
+    PySongbirdError,
+    pyo3::exceptions::PyException
+);
+
+impl PyStubType for PySongbirdError {
+    fn type_output() -> TypeInfo {
+        TypeInfo::locally_defined(
+            "PySongbirdError",
+            "discord.ext.songbird.native.error".into(),
+        )
+    }
 }
-
-create_exception!(module, PySongbirdError, pyo3::exceptions::PyException);
-
-create_exception!(module, PyConnectionNotInitialized, PySongbirdError);
-create_exception!(module, PyJoinError, PySongbirdError);
-create_exception!(module, PyControlError, PySongbirdError);
-
-impl From<SongbirdError> for PyErr {
-    fn from(error: SongbirdError) -> Self {
-        match error {
-            SongbirdError::ConnectionNotStarted => {
-                PyConnectionNotInitialized::new_err(error.to_string())
-            }
-            SongbirdError::JoinError(e) => PyJoinError::new_err(e.to_string()),
-            SongbirdError::InvalidId => PyValueError::new_err("Id is not in valid range"),
-            SongbirdError::ControlError(e) => PyControlError::new_err(e.to_string()),
-        }
+submit! {
+    PyClassInfo {
+        pyclass_name: "PySongbirdError",
+        struct_id: std::any::TypeId::of::<PySongbirdError>,
+        getters: &[],
+        setters: &[],
+        module: Some("discord.ext.songbird.native.error"),
+        doc: "Base exception for Songbird backend errors.",
+        bases: &[],
+        has_eq: false,
+        has_ord: false,
+        has_hash: false,
+        has_str: false,
+        subclass: true,
     }
 }
 
-pub type SongbirdResult<T> = Result<T, SongbirdError>;
+pyo3_stub_gen::create_exception!(
+    discord.ext.songbird.native.error,
+    PyJoinError,
+    PySongbirdError,
+    "Raised when a voice join fails."
+);
+pyo3_stub_gen::create_exception!(
+    discord.ext.songbird.native.error,
+    PyPlayerError,
+    PySongbirdError
+);
+pyo3_stub_gen::create_exception!(
+    discord.ext.songbird.native.error,
+    PyControlError,
+    PySongbirdError
+);
+
+pub trait IntoPyResult<T> {
+    fn into_pyerr(self) -> PyResult<T>;
+}
+
+impl<T> IntoPyResult<T> for Result<T, JoinError> {
+    fn into_pyerr(self) -> PyResult<T> {
+        self.map_err(|err| PyJoinError::new_err(err.to_string()))
+    }
+}
+
+impl<T> IntoPyResult<T> for Result<T, ControlError> {
+    fn into_pyerr(self) -> PyResult<T> {
+        self.map_err(|err| PyControlError::new_err(err.to_string()))
+    }
+}

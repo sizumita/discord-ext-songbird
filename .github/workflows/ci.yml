@@ -8,39 +8,18 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  lint_python:
-    name: Lint Python ${{ matrix.python-version }}
+  check:
+    name: Check Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version:
           - "3.13"
+          - "3.14"
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-        with:
-          enable-cache: true
-          version: "latest"
-          python-version: ${{ matrix.python-version }}
-
-      - name: Syncing uv project
-        run: uv sync --all-extras --dev --no-install-project
-
-      - name: Run ruff
-        run: uvx ruff check --output-format=github .
-
-      - name: Run ruff formatter
-        run: uvx ruff format --diff
-  lint_rust:
-    name: Lint rust
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libopus-dev
@@ -57,8 +36,30 @@ jobs:
       - name: Add problem matchers
         run: echo "::add-matcher::.github/rust.json"
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          version: "latest"
+          python-version: ${{ matrix.python-version }}
+
       - name: Run rustfmt
         run: cargo fmt --all -- --check
 
       - name: Run clippy
         run: cargo clippy --all-features --all-targets
+
+      - name: Syncing uv project
+        run: uv sync --all-extras --dev --no-install-project --frozen
+
+      - name: Build wheels for checking
+        run: uv tool run maturin develop
+
+      - name: Run ruff
+        run: uv tool run ruff check --output-format=github
+
+      - name: Run ruff formatter
+        run: uv tool run ruff format --diff
+
+      - name: Run ty
+        run: uv tool run ty check --output-format=github --python-version ${{ matrix.python-version }}

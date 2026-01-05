@@ -1,183 +1,150 @@
 # discord-ext-songbird
 
-![GitHub License](https://img.shields.io/github/license/sizumita/discord-ext-songbird)
-![GitHub Release](https://img.shields.io/github/v/release/sizumita/discord-ext-songbird)
-![PyPI - Version](https://img.shields.io/pypi/v/discord-ext-songbird)
-![PyPI - Python Version](https://img.shields.io/pypi/pyversions/discord-ext-songbird)
+[![GitHub License](https://img.shields.io/github/license/sizumita/discord-ext-songbird)](LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/sizumita/discord-ext-songbird)](https://github.com/sizumita/discord-ext-songbird/releases)
+[![PyPI - Version](https://img.shields.io/pypi/v/discord-ext-songbird)](https://pypi.org/project/discord-ext-songbird/)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/discord-ext-songbird)](https://pypi.org/project/discord-ext-songbird/)
 
-A high-performance voice backend for [discord.py](https://github.com/rapptz/discord.py) powered by [Songbird](https://github.com/serenity-rs/songbird), written in Rust for superior audio processing and lower latency.
+High-performance voice backend for discord.py, powered by Songbird and written in Rust.
 
-## Features
+discord-ext-songbird provides a native `VoiceProtocol` implementation for discord.py, exposing
+Songbird's Rust audio pipeline through PyO3.
 
-- **High Performance**: Built with Rust for optimal performance and minimal resource usage
-- **Discord.py Integration**: Drop-in replacement for discord.py's native voice client
-- **Audio Queue Management**: Built-in track queuing and playback control
-- **Voice Receiving**: Real-time voice data reception and processing
-- **Flexible Audio Sources**: Support for various audio input formats
-- **Volume Control**: Per-track volume adjustment
-- **Python 3.10+ Support**: Compatible with modern Python versions
+## Highlights
+
+- Drop-in `VoiceProtocol` via `SongbirdClient`
+- Low-latency playback backed by Songbird
+- Voice receive APIs (`BufferSink`, `StreamSink`)
+- Native input types for raw PCM, encoded audio, and streaming
+- PyO3/maturin extension with Python 3.13+ support
+- Beta release series (API may evolve)
 
 ## Installation
-
-Install from PyPI:
 
 ```bash
 pip install discord-ext-songbird
 ```
 
-## Quick Start
+```bash
+uv add discord-ext-songbird
+```
+
+## Quickstart
 
 ```python
-import io
+import pyarrow as pa
 import discord
 from discord.ext import songbird
+from discord.ext.songbird import player
 
-# Initialize Discord client
 client = discord.Client(intents=discord.Intents.default())
 
 @client.event
 async def on_ready():
-    print(f"Logged in as {client.user}")
-    
-    # Connect to a voice channel
-    channel = client.get_channel(YOUR_VOICE_CHANNEL_ID)
-    voice_client = await channel.connect(cls=songbird.SongbirdClient)
-    
-    # Load audio data
-    with open("audio.wav", "rb") as f:
-        audio_data = io.BytesIO(f.read())
-    
-    # Create and play a track
-    source = songbird.RawBufferSource(audio_data)
-    track = songbird.Track(source).set_volume(0.5)
-    
-    await voice_client.queue.enqueue(track)
+    channel = client.get_channel(int(CHANNEL_ID))
+    if isinstance(channel, discord.VoiceChannel):
+        vc = await channel.connect(cls=songbird.SongbirdClient)
 
-client.run("YOUR_BOT_TOKEN")
+        samples = pa.array([0.0, 0.1, 0.0, -0.1], type=pa.float32())
+        source = player.input.RawPCMInput(samples, sample_rate=48000, channels=2)
+        track = player.Track(source).volume(0.8)
+        await vc.play(track)
+
+client.run(DISCORD_BOT_TOKEN)
 ```
 
-## API Reference
+## Features
 
-### SongbirdClient
+### Playback
 
-The main voice client class that implements discord.py's `VoiceProtocol`.
+Use `SongbirdClient` as your voice client. Playback is driven by `Track` and `TrackHandle`.
 
 ```python
-# Connect to a voice channel
-voice_client = await voice_channel.connect(cls=songbird.SongbirdClient)
+from discord.ext import songbird
+from discord.ext.songbird import player
 
-# Access the audio queue
-await voice_client.queue.enqueue(track)
-
-# Access the player controls
-await voice_client.player.stop()
-await voice_client.player.pause()
-await voice_client.player.resume()
+vc = await channel.connect(cls=songbird.SongbirdClient)
+track = player.Track(source)
+handle = await vc.play(track)
+handle.pause()
 ```
 
-### Track Management
+### Inputs
 
-Create and configure audio tracks:
+Native input types live under `discord.ext.songbird.player.input`.
+
+- `RawPCMInput`: `pyarrow.Float32Array` PCM input
+- `AudioInput`: encoded audio in a `pyarrow.Array` with a `SupportedCodec`
+- `StreamInput`: `asyncio.StreamReader` with a `SupportedCodec`
+
+Supported codecs: `MP3`, `WAVE`, `MKV`, `FLAC`, `AAC`.
 
 ```python
-# Create a track from raw audio data
-source = songbird.RawBufferSource(audio_buffer)
-track = songbird.Track(source)
+import asyncio
+from discord.ext.songbird import player
 
-# Set volume (0.0 to 1.0)
-track = track.set_volume(0.8)
-
-# Enqueue for playback
-await voice_client.queue.enqueue(track)
+buffer = asyncio.StreamReader()
+source = player.input.StreamInput(buffer, player.input.SupportedCodec.AAC)
+track = player.Track(source)
 ```
 
-### Audio Sources
+### Voice receive
 
-Supported audio source types:
-
-- `RawBufferSource`: For raw audio data from `io.BytesIO` objects
-- More source types coming soon
-
-### Voice Receiving
-
-Receive and process voice data from other users by creating a custom receiver:
+Receive decoded PCM via `BufferSink` or `StreamSink`.
 
 ```python
-class MyVoiceReceiver(songbird.VoiceReceiver):
-    def voice_tick(self, tick):
-        """Handle incoming voice data."""
-        for ssrc, voice_data in tick.speaking:
-            if voice_data.decoded_voice:
-                # Process decoded PCM audio data
-                audio_data = voice_data.decoded_voice
-                print(f"Received {len(audio_data)} bytes of audio from SSRC {ssrc}")
-    
-    def speaking_update(self, ssrc: int, user_id: int, speaking: bool):
-        """Handle speaking state changes."""
-        user_str = f"User {user_id}" if user_id else "Unknown user"
-        status = "started" if speaking else "stopped"
-        print(f"{user_str} (SSRC: {ssrc}) {status} speaking")
+from discord.ext.songbird import receive
 
-# Register the receiver
-receiver = MyVoiceReceiver()
-await voice_client.register_receiver(receiver)
+sink = receive.BufferSink(max_duration_secs=5)
+vc.listen(sink)
+
+async for tick in sink:
+    pcm = tick.get(receive.VoiceKey.User(user_id))
+    if pcm is not None:
+        handle_pcm(pcm)
 ```
 
-### Configuration
-
-Customize voice connection settings:
-
-```python
-from discord.ext.songbird import ConfigBuilder, PyCryptoMode, PyDecodeMode
-
-config = (ConfigBuilder()
-    .crypto_mode(PyCryptoMode.Normal)
-    .decode_mode(PyDecodeMode.Decode)
-    .build())
-
-voice_client = await channel.connect(cls=songbird.SongbirdClient, config=config)
-```
+`VoiceTick.get()` returns `pyarrow.Int16Array` (PCM).
 
 ## Examples
 
-See the [examples](examples/) directory for more comprehensive usage examples:
+See `examples/` for runnable bots:
 
-- [basic.py](examples/basic.py) - Basic voice playback
-- [track_handling.py](examples/track_handling.py) - Advanced track management  
-- [custom_config.py](examples/custom_config.py) - Custom voice configuration
-- [receive.py](examples/receive.py) - Voice receiving functionality
+- `examples/basic.py` (PCM playback)
+- `examples/send_stream.py` (stream input)
+- `examples/receive_stream.py` (voice receive)
+
+Set `DISCORD_BOT_TOKEN` and `CHANNEL_ID` before running the examples.
 
 ## Requirements
 
-- Python 3.10 or higher
-- discord.py[voice]
-- A Discord bot token
+- Python 3.13+
+- `discord.py[voice]`
+- `pyarrow`
 
 ## Development
 
-To set up the development environment:
+```bash
+uv sync --all-extras --dev --no-install-project
+uvx maturin develop
+```
 
 ```bash
-# Clone the repository
-git clone https://github.com/sizumita/discord-ext-songbird.git
-cd discord-ext-songbird
-
-uv sync --all-extras --dev --no-install-project
-uvx maturin develop 
-# or
 just build
+just fmt
+just check
 ```
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
+Issues and pull requests are welcome. Please keep changes focused and avoid committing build artifacts.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT. See `LICENSE`.
 
-## Acknowledgments
+## Acknowledgements
 
-- [Songbird](https://github.com/serenity-rs/songbird) - The Rust voice library powering this project
-- [discord.py](https://github.com/rapptz/discord.py) - The Python Discord API wrapper
-- [PyO3](https://github.com/PyO3/pyo3) - Rust bindings for Python
+- Songbird (Rust voice library)
+- discord.py (Python Discord API wrapper)
+- PyO3 (Rust bindings for Python)
