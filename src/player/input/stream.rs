@@ -16,7 +16,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
 #[gen_stub_pyclass]
-#[pyclass(name = "StreamInput", extends = PyInputBase, module = "discord.ext.songbird.native.player.input")]
+#[pyclass(name = "StreamInput", extends = PyInputBase, module = "discord.ext.songbird.native.player")]
 /// Stream input backed by an asyncio StreamReader.
 ///
 /// Notes

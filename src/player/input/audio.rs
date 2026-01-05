@@ -10,7 +10,7 @@ use songbird::input::core::io::MediaSource;
 use songbird::input::{AudioStream, AudioStreamError, Compose};
 
 #[gen_stub_pyclass]
-#[pyclass(name = "AudioInput", extends = PyInputBase, module = "discord.ext.songbird.native.player.input")]
+#[pyclass(name = "AudioInput", extends = PyInputBase, module = "discord.ext.songbird.native.player")]
 /// Encoded audio input backed by a pyarrow array.
 ///
 /// Notes

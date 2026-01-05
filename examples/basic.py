@@ -33,8 +33,8 @@ async def on_ready():
     if isinstance(ch, discord.VoiceChannel):
         vc = await ch.connect(cls=songbird.SongbirdClient)
 
-        data = songbird.player.input.RawPCMInput(signal, sample_rate=sample_rate, channels=2)
-        track = songbird.player.Track(data)
+        data = songbird.RawPCMInput(signal, sample_rate=sample_rate, channels=2)
+        track = songbird.Track(data)
         handle = await vc.enqueue(track)
 
 

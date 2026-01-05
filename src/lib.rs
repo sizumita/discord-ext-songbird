@@ -62,8 +62,6 @@ VERSION : str
 
     #[pymodule]
     mod player {
-        use pyo3::prelude::*;
-
         #[pymodule_export]
         use crate::player::handle::PyTrackHandle;
         #[pymodule_export]
@@ -71,19 +69,16 @@ VERSION : str
         #[pymodule_export]
         use crate::player::track::PyTrack;
 
-        #[pymodule]
-        mod input {
-            #[pymodule_export]
-            use crate::player::input::PyInputBase;
-            #[pymodule_export]
-            use crate::player::input::audio::PyAudioInput;
-            #[pymodule_export]
-            use crate::player::input::codec::SupportedCodec;
-            #[pymodule_export]
-            use crate::player::input::pcm::PyRawPcmInput;
-            #[pymodule_export]
-            use crate::player::input::stream::PyStreamInput;
-        }
+        #[pymodule_export]
+        use crate::player::input::PyInputBase;
+        #[pymodule_export]
+        use crate::player::input::audio::PyAudioInput;
+        #[pymodule_export]
+        use crate::player::input::codec::SupportedCodec;
+        #[pymodule_export]
+        use crate::player::input::pcm::PyRawPcmInput;
+        #[pymodule_export]
+        use crate::player::input::stream::PyStreamInput;
     }
 
     #[pymodule]

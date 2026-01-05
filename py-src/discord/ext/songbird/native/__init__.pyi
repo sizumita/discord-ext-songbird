@@ -31,7 +31,7 @@ from discord.ext.songbird.native.receive import SinkBase
 
 from . import error, model, player, receive
 
-VERSION: builtins.str = "0.4.0-beta"
+VERSION: builtins.str = "0.4.1"
 
 class SongbirdImpl:
     r"""

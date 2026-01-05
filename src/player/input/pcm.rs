@@ -12,7 +12,7 @@ use std::io::Cursor;
 use symphonia::core::probe::Hint;
 
 #[gen_stub_pyclass]
-#[pyclass(name = "RawPCMInput", extends = PyInputBase, module = "discord.ext.songbird.native.player.input")]
+#[pyclass(name = "RawPCMInput", extends = PyInputBase, module = "discord.ext.songbird.native.player")]
 /// Raw PCM input backed by a float32 array.
 ///
 /// Notes

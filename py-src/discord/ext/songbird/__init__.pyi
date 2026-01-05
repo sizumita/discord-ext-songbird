@@ -2,10 +2,24 @@
 
 from . import native
 from .client import SongbirdClient as SongbirdClient
+from .native import error as error
+from .native import model as model
 from .native import player as player
 from .native import receive as receive
-from .native.player import InputBase, Queue, Track, TrackHandle
-from .native.player.input import AudioInput, RawPCMInput, StreamInput, SupportedCodec
+
+InputBase = player.InputBase
+AudioInput = player.AudioInput
+RawPCMInput = player.RawPCMInput
+StreamInput = player.StreamInput
+SupportedCodec = player.SupportedCodec
+Track = player.Track
+TrackHandle = player.TrackHandle
+Queue = player.Queue
+
+PySongbirdError = error.PySongbirdError
+PyPlayerError = error.PyPlayerError
+PyJoinError = error.PyJoinError
+PyControlError = error.PyControlError
 
 __all__ = (
     "native",

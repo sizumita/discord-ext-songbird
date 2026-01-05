@@ -4,7 +4,7 @@ use songbird::input::core::probe::Hint;
 
 #[gen_stub_pyclass_enum]
 #[pyclass(
-    module = "discord.ext.songbird.native.player.input",
+    module = "discord.ext.songbird.native.player",
     rename_all = "UPPERCASE"
 )]
 /// Codec hint for encoded audio inputs.
