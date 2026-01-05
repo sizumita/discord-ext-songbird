@@ -22,6 +22,11 @@ jobs:
             target: s390x
           - runner: ubuntu-22.04
             target: ppc64le
+        python-version:
+          - 3.13
+          - 3.13t
+          - 3.14
+          - 3.14t
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
@@ -29,9 +34,7 @@ jobs:
         with:
           enable-cache: true
           version: "latest"
-
-      - name: Install Python versions
-        run: uv python install 3.13 3.13t 3.14 3.14t
+          python-version: ${{ matrix.python-version }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -45,7 +48,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist -i ${{ matrix.python-version }}
           sccache: 'true'
           manylinux: manylinux_2_28
           container: "ghcr.io/rust-cross/manylinux_2_28-cross:${{ matrix.platform.target }}"
@@ -68,6 +71,11 @@ jobs:
             target: x86_64
           - runner: ubuntu-22.04
             target: aarch64
+        python-version:
+          - 3.13
+          - 3.13t
+          - 3.14
+          - 3.14t
     steps:
       - uses: actions/checkout@v4
 
@@ -81,9 +89,7 @@ jobs:
         with:
           enable-cache: true
           version: "latest"
-
-      - name: Install Python versions
-        run: uv python install 3.13 3.13t 3.14 3.14t
+          python-version: ${{ matrix.python-version }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -97,7 +103,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist -i ${{ matrix.python-version }}
           sccache: 'true'
           manylinux: musllinux_1_2
       - name: Upload wheels
@@ -115,6 +121,11 @@ jobs:
             target: x64
           - runner: windows-latest
             target: x86
+        python-version:
+          - 3.13
+          - 3.13t
+          - 3.14
+          - 3.14t
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
@@ -122,9 +133,7 @@ jobs:
         with:
           enable-cache: true
           version: "latest"
-
-      - name: Install Python versions
-        run: uv python install 3.13 3.13t 3.14 3.14t
+          python-version: ${{ matrix.python-version }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -138,7 +147,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release -i 3.13 -i 3.14 -i 3.13t -i 3.14t --out dist --features pyo3/generate-import-lib
+          args: --release --out dist -i ${{ matrix.python-version }} --features pyo3/generate-import-lib
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -151,10 +160,13 @@ jobs:
     strategy:
       matrix:
         platform:
-          - runner: macos-13
-            target: x86_64
           - runner: macos-14
             target: aarch64
+        python-version:
+          - 3.13
+          - 3.13t
+          - 3.14
+          - 3.14t
     steps:
       - uses: actions/checkout@v4
 
@@ -182,9 +194,7 @@ jobs:
         with:
           enable-cache: true
           version: "latest"
-
-      - name: Install Python versions
-        run: uv python install 3.13 3.13t 3.14 3.14t
+          python-version: ${{ matrix.python-version }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -198,7 +208,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release -i 3.13 -i 3.14 -i 3.13t -i 3.14t --out dist --features pyo3/generate-import-lib
+          args: --release --out dist -i ${{ matrix.python-version }} --features pyo3/generate-import-lib
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4

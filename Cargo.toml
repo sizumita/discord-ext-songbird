@@ -11,6 +11,10 @@ authors = [
 ]
 publish = false
 
+[profile.release]
+lto = true
+codegen-units = 1
+
 [lib]
 name = "discord_ext_songbird_native"
 crate-type = ["cdylib", "rlib"]
