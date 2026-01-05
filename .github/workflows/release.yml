@@ -45,7 +45,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release -i 3.13 -i 3.14 -i 3.13t -i 3.14t --out dist --find-interpreter
+          args: --release -i 3.13 -i 3.14 -i 3.13t -i 3.14t --out dist
           sccache: 'true'
           manylinux: manylinux_2_28
           container: "ghcr.io/rust-cross/manylinux_2_28-cross:${{ matrix.platform.target }}"
@@ -97,7 +97,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release -i 3.13 -i 3.14 -i 3.13t -i 3.14t --out dist --find-interpreter
+          args: --release -i 3.13 -i 3.14 -i 3.13t -i 3.14t --out dist
           sccache: 'true'
           manylinux: musllinux_1_2
       - name: Upload wheels
@@ -138,7 +138,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release -i 3.13 -i 3.14 -i 3.13t -i 3.14t --out dist --find-interpreter
+          args: --release -i 3.13 -i 3.14 -i 3.13t -i 3.14t --out dist
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -178,7 +178,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release -i 3.13 -i 3.14 -i 3.13t -i 3.14t --out dist --find-interpreter
+          args: --release -i 3.13 -i 3.14 -i 3.13t -i 3.14t --out dist
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
