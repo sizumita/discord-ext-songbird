@@ -235,14 +235,13 @@ wheels = [
 
 [[package]]
 name = "discord-ext-songbird"
-version = "0.4.0a0"
+version = "0.4.0b0"
 source = { editable = "." }
 dependencies = [
     { name = "arro3-compute" },
     { name = "arro3-core" },
     { name = "arro3-io" },
     { name = "audioop-lts" },
-    { name = "discord-py", extra = ["voice"] },
     { name = "pyarrow" },
     { name = "ty" },
     { name = "typing-extensions" },
@@ -250,6 +249,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "discord-py", extra = ["voice"] },
     { name = "hatchling" },
     { name = "maturin" },
     { name = "numpy" },
@@ -263,7 +263,6 @@ requires-dist = [
     { name = "arro3-core", specifier = ">=0.6.5" },
     { name = "arro3-io", specifier = ">=0.6.5" },
     { name = "audioop-lts", marker = "python_full_version >= '3.13'" },
-    { name = "discord-py", extras = ["voice"], git = "https://github.com/rapptz/discord.py" },
     { name = "pyarrow", specifier = ">=22.0.0" },
     { name = "ty", specifier = ">=0.0.8" },
     { name = "typing-extensions", specifier = ">=4.15.0" },
@@ -271,6 +270,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "discord-py", extras = ["voice"], git = "https://github.com/rapptz/discord.py" },
     { name = "hatchling", specifier = ">=1.28.0" },
     { name = "maturin", specifier = ">=1.10.2" },
     { name = "numpy", specifier = ">=2.4.0" },

@@ -2,7 +2,6 @@
 name = "discord-ext-songbird"
 requires-python = ">=3.13"
 dependencies = [
-    "discord.py[voice]",
     "audioop-lts; python_version >= '3.13'",
     "typing-extensions>=4.15.0",
     "ty>=0.0.8",
@@ -31,6 +30,7 @@ build-backend = "maturin"
 
 [dependency-groups]
 dev = [
+    "discord.py[voice]",
     "hatchling>=1.28.0",
     "maturin>=1.10.2",
     "numpy>=2.4.0",
