@@ -7,4 +7,17 @@ from .native import receive as receive
 from .native.player import InputBase, Queue, Track, TrackHandle
 from .native.player.input import AudioInput, RawPCMInput, StreamInput, SupportedCodec
 
-__all__: tuple[str]
+__all__ = (
+    "native",
+    "receive",
+    "player",
+    "SongbirdClient",
+    "InputBase",
+    "Queue",
+    "Track",
+    "TrackHandle",
+    "SupportedCodec",
+    "AudioInput",
+    "RawPCMInput",
+    "StreamInput",
+)
