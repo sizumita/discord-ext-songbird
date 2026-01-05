@@ -1,10 +1,8 @@
-import io
 import logging
 import os
 
 import discord
 import numpy as np
-import pyarrow
 from discord.ext import songbird
 from discord.ext.songbird import receive
 
@@ -37,7 +35,7 @@ async def on_ready():
 
         data = songbird.player.input.RawPCMInput(signal, sample_rate=sample_rate, channels=2)
         track = songbird.player.Track(data)
-        handle = await vc.play(track)
+        handle = await vc.enqueue(track)
 
 
 client.run(os.environ["DISCORD_BOT_TOKEN"])

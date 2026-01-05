@@ -1,6 +1,7 @@
 fmt:
     cargo fmt
     uvx ruff format
+    uvx ruff check --fix
 check:
     cargo clippy
     uvx ruff check

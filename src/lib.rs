@@ -67,6 +67,8 @@ VERSION : str
         #[pymodule_export]
         use crate::player::handle::PyTrackHandle;
         #[pymodule_export]
+        use crate::player::queue::PyQueue;
+        #[pymodule_export]
         use crate::player::track::PyTrack;
 
         #[pymodule]

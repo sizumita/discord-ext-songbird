@@ -3,6 +3,7 @@ use pyo3_stub_gen::inventory::submit;
 use pyo3_stub_gen::type_info::PyClassInfo;
 use pyo3_stub_gen::{PyStubType, TypeInfo};
 use songbird::error::JoinError;
+use songbird::tracks::ControlError;
 
 pyo3::create_exception!(
     discord.ext.songbird.native.error,
@@ -53,11 +54,17 @@ pyo3_stub_gen::create_exception!(
 );
 
 pub trait IntoPyResult<T> {
-    fn into_py(self) -> PyResult<T>;
+    fn into_pyerr(self) -> PyResult<T>;
 }
 
 impl<T> IntoPyResult<T> for Result<T, JoinError> {
-    fn into_py(self) -> PyResult<T> {
+    fn into_pyerr(self) -> PyResult<T> {
         self.map_err(|err| PyJoinError::new_err(err.to_string()))
+    }
+}
+
+impl<T> IntoPyResult<T> for Result<T, ControlError> {
+    fn into_pyerr(self) -> PyResult<T> {
+        self.map_err(|err| PyControlError::new_err(err.to_string()))
     }
 }

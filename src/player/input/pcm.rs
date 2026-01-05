@@ -48,7 +48,7 @@ impl PyRawPcmInput {
     /// -------
     /// RawPCMInput
     fn new(
-        #[gen_stub(override_type(type_repr = "pyarrow.Float32Array", imports = ("pyarrow")))]
+        #[gen_stub(override_type(type_repr = "pyarrow.FloatArray", imports = ("pyarrow")))]
         array: PyArray,
         sample_rate: u32,
         channels: u32,

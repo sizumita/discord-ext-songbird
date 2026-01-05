@@ -44,7 +44,7 @@ class RawPCMInput(InputBase):
     Samples are expected to be interleaved float32 PCM.
     """
     def __new__(
-        cls, array: pyarrow.Float32Array, *, sample_rate: builtins.int = 48000, channels: builtins.int = 2
+        cls, array: pyarrow.FloatArray, *, sample_rate: builtins.int = 48000, channels: builtins.int = 2
     ) -> typing.Self:
         r"""
         Create a raw PCM input.

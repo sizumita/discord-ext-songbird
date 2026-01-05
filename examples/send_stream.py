@@ -36,7 +36,7 @@ async def on_ready():
 
         i = player.input.StreamInput(buffer, player.input.SupportedCodec.AAC)
         print(asyncio.get_running_loop())
-        handle = await vc.play(player.Track(i))
+        handle = await vc.enqueue(player.Track(i))
         handle.play()
 
 

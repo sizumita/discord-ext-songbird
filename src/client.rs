@@ -1,6 +1,7 @@
 use crate::error::IntoPyResult;
 use crate::model::PyFuture;
 use crate::player::handle::PyTrackHandle;
+use crate::player::queue::PyQueue;
 use crate::player::track::PyTrack;
 use crate::receive::sink::SinkBase;
 use crate::receive::HandlerWrapper;
@@ -176,11 +177,11 @@ impl SongbirdImpl {
             let joined = {
                 let mut guard = self_call.lock().await;
                 let call = guard.get_mut()?;
-                call.deafen(self_deaf).await.into_py()?;
-                call.mute(self_mute).await.into_py()?;
-                call.join(channel_id).await.into_py()?
+                call.deafen(self_deaf).await.into_pyerr()?;
+                call.mute(self_mute).await.into_pyerr()?;
+                call.join(channel_id).await.into_pyerr()?
             };
-            joined.await.into_py()?;
+            joined.await.into_pyerr()?;
             log::debug!(
                 "Connected to voice channel {} for guild {}",
                 channel_id,
@@ -212,7 +213,7 @@ impl SongbirdImpl {
         );
         let mut guard = self.call.lock().await;
         let call = guard.get_mut()?;
-        call.leave().await.into_py()
+        call.leave().await.into_pyerr()
     }
 
     /// |coro|
@@ -328,7 +329,7 @@ impl SongbirdImpl {
         );
         let mut guard = self.call.lock().await;
         let call = guard.get_mut()?;
-        call.deafen(self_deaf).await.into_py()
+        call.deafen(self_deaf).await.into_pyerr()
     }
 
     /// |coro|
@@ -351,7 +352,7 @@ impl SongbirdImpl {
         );
         let mut guard = self.call.lock().await;
         let call = guard.get_mut()?;
-        call.mute(self_mute).await.into_py()
+        call.mute(self_mute).await.into_pyerr()
     }
 
     /// Check if this account is muted.
@@ -408,7 +409,7 @@ impl SongbirdImpl {
             future_into_py(py, async move {
                 let mut guard = call.lock().await;
                 let call = guard.get_mut()?;
-                call.join(id).await.into_py()?;
+                call.join(id).await.into_pyerr()?;
                 Ok(())
             })
             .map(|x| x.into())
@@ -420,7 +421,7 @@ impl SongbirdImpl {
             future_into_py(py, async move {
                 let mut guard = call.lock().await;
                 let call = guard.get_mut()?;
-                call.leave().await.into_py()?;
+                call.leave().await.into_pyerr()?;
                 Ok(())
             })
             .map(|x| x.into())
@@ -492,6 +493,65 @@ impl SongbirdImpl {
 
             let track = Python::attach(|py| track.bind(py).borrow().to_track(py, current_loop))?;
             let handle = call.play(track);
+            Ok(PyTrackHandle::new(handle))
+        })
+        .map(|x| x.into())
+    }
+
+    /// Stop playback immediately.
+    ///
+    /// Returns
+    /// -------
+    /// None
+    fn stop(&self) -> PyResult<()> {
+        let mut guard = self.call.blocking_lock();
+        let call = guard.get_mut()?;
+        call.stop();
+        Ok(())
+    }
+
+    /// Return the playback queue controller.
+    ///
+    /// Returns
+    /// -------
+    /// Queue
+    fn queue(&self) -> PyResult<PyQueue> {
+        let guard = self.call.blocking_lock();
+        let call = guard.get()?;
+        Ok(PyQueue::new(call.queue().clone()))
+    }
+
+    /// |coro|
+    ///
+    /// Enqueue a track for playback.
+    ///
+    /// Parameters
+    /// ----------
+    /// track : Track
+    ///     The track to enqueue.
+    ///
+    /// Returns
+    /// -------
+    /// TrackHandle
+    fn enqueue<'py>(
+        &self,
+        py: Python<'py>,
+        track: Py<PyTrack>,
+    ) -> PyResult<PyFuture<'py, PyTrackHandle>> {
+        let call = self.call.clone();
+        let current_loop = self
+            .current_loop
+            .as_ref()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("SongbirdImpl has been cleared")
+            })?
+            .clone_ref(py);
+        future_into_py(py, async move {
+            let mut guard = call.lock().await;
+            let call = guard.get_mut()?;
+
+            let track = Python::attach(|py| track.bind(py).borrow().to_track(py, current_loop))?;
+            let handle = call.enqueue(track).await;
             Ok(PyTrackHandle::new(handle))
         })
         .map(|x| x.into())

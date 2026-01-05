@@ -26,7 +26,7 @@ import builtins
 import typing
 
 import discord
-from discord.ext.songbird.native.player import Track, TrackHandle
+from discord.ext.songbird.native.player import Queue, Track, TrackHandle
 from discord.ext.songbird.native.receive import SinkBase
 
 from . import error, model, player, receive
@@ -254,6 +254,37 @@ class SongbirdImpl:
         ----------
         track : Track
             The track to play.
+
+        Returns
+        -------
+        TrackHandle
+        """
+    def stop(self) -> None:
+        r"""
+        Stop playback immediately.
+
+        Returns
+        -------
+        None
+        """
+    def queue(self) -> Queue:
+        r"""
+        Return the playback queue controller.
+
+        Returns
+        -------
+        Queue
+        """
+    def enqueue(self, track: Track) -> typing.Coroutine[typing.Any, typing.Any, TrackHandle]:
+        r"""
+        |coro|
+
+        Enqueue a track for playback.
+
+        Parameters
+        ----------
+        track : Track
+            The track to enqueue.
 
         Returns
         -------

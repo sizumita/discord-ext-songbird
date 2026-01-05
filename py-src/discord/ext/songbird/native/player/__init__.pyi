@@ -2,6 +2,7 @@
 # ruff: noqa: E501, F401
 
 import builtins
+import datetime
 import typing
 
 from . import input
@@ -16,6 +17,106 @@ class InputBase:
     """
 
     ...
+
+@typing.final
+class Queue:
+    r"""
+    Track queue controller.
+
+    Notes
+    -----
+    Exposes queue operations for the active voice call.
+    """
+    def current(self) -> typing.Optional[TrackHandle]:
+        r"""
+        Return the currently playing track handle, if any.
+
+        Returns
+        -------
+        TrackHandle | None
+        """
+    def dequeue(self, index: builtins.int) -> typing.Optional[TrackHandle]:
+        r"""
+        Remove and return a queued track handle by index.
+
+        Parameters
+        ----------
+        index : int
+            Zero-based index in the queue.
+
+        Returns
+        -------
+        TrackHandle | None
+        """
+    def is_empty(self) -> builtins.bool:
+        r"""
+        Check whether the queue is empty.
+
+        Returns
+        -------
+        bool
+        """
+    def pause(self) -> None:
+        r"""
+        Pause all tracks in the queue.
+
+        Returns
+        -------
+        None
+        """
+    def resume(self) -> None:
+        r"""
+        Resume all tracks in the queue.
+
+        Returns
+        -------
+        None
+        """
+    def stop(self) -> None:
+        r"""
+        Stop playback and clear the queue.
+
+        Returns
+        -------
+        None
+        """
+    def skip(self) -> None:
+        r"""
+        Skip the current track.
+
+        Returns
+        -------
+        None
+        """
+    def tracks(self) -> builtins.list[TrackHandle]:
+        r"""
+        Return handles for all queued tracks.
+
+        Returns
+        -------
+        list[TrackHandle]
+        """
+    def __len__(self) -> builtins.int:
+        r"""
+        Return the number of queued tracks.
+
+        Returns
+        -------
+        int
+        """
+    def __getitem__(self, item: builtins.int) -> typing.Optional[TrackHandle]:
+        r"""
+        Return a queued track handle by index.
+
+        Parameters
+        ----------
+        item : int
+            Zero-based index in the queue.
+
+        Returns
+        -------
+        TrackHandle | None
+        """
 
 @typing.final
 class Track:
@@ -97,5 +198,31 @@ class TrackHandle:
     -----
     Returned by `SongbirdImpl.play`.
     """
+    def seek(self, position: datetime.timedelta) -> typing.Coroutine[typing.Any, typing.Any, datetime.timedelta]: ...
+    def play(self) -> None:
+        r"""
+        Resume playback.
 
-    ...
+        Returns
+        -------
+        None
+        """
+    def pause(self) -> None:
+        r"""
+        Pause playback.
+
+        Returns
+        -------
+        None
+        """
+    def stop(self) -> None:
+        r"""
+        Stop playback.
+
+        Returns
+        -------
+        None
+        """
+    def enable_loop(self) -> None: ...
+    def disable_loop(self) -> None: ...
+    def loop_for(self, times: builtins.int) -> None: ...
