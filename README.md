@@ -121,7 +121,7 @@ Set `DISCORD_BOT_TOKEN` and `CHANNEL_ID` before running the examples.
 ## Requirements
 
 - Python 3.14+
-- `discord.py[voice]`
+- `discord.py`
 - `pyarrow`
 
 Published CPython wheels are split by ABI. The release workflow builds regular

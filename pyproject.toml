@@ -30,7 +30,7 @@ build-backend = "maturin"
 
 [dependency-groups]
 dev = [
-    "discord.py[voice]",
+    "discord.py",
     "hatchling>=1.28.0",
     "maturin>=1.10.2",
     "numpy>=2.4.0",
