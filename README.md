@@ -16,7 +16,7 @@ Songbird's Rust audio pipeline through PyO3.
 - Low-latency playback backed by Songbird
 - Voice receive APIs (`BufferSink`, `StreamSink`)
 - Native input types for raw PCM, encoded audio, and streaming
-- PyO3/maturin extension with CPython 3.13+ and free-threaded CPython support
+- PyO3/maturin extension with CPython 3.14 and free-threaded CPython 3.14 support
 - Beta release series (API may evolve)
 
 ## Installation
@@ -120,14 +120,14 @@ Set `DISCORD_BOT_TOKEN` and `CHANNEL_ID` before running the examples.
 
 ## Requirements
 
-- Python 3.13+
+- Python 3.14+
 - `discord.py[voice]`
 - `pyarrow`
 
-Published CPython wheels are split by ABI. The release workflow builds `cp313`,
-`cp313t`, `cp314`, and `cp314t` wheels for the supported platforms, so a normal
-Python 3.14 environment continues to install the regular `cp314` wheel while
-Python 3.14t installs `cp314t`.
+Published CPython wheels are split by ABI. The release workflow builds regular
+`cp314` wheels and free-threaded `cp314t` wheels for the supported platforms, so
+a normal Python 3.14 environment installs the regular wheel while Python 3.14t
+installs the free-threaded wheel.
 
 ## Development
 
