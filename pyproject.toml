@@ -2,7 +2,7 @@
 name = "discord-ext-songbird"
 requires-python = ">=3.14"
 dependencies = [
-    "audioop-lts",
+    "audioop-lts>=0.2.2",
     "typing-extensions>=4.15.0",
     "ty>=0.0.8",
     "pyarrow>=22.0.0",
