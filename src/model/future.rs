@@ -20,11 +20,18 @@ where
     T: PyStubType,
 {
     fn type_output() -> TypeInfo {
-        let TypeInfo { name, mut import } = T::type_output();
+        let TypeInfo {
+            name,
+            mut import,
+            type_refs,
+            ..
+        } = T::type_output();
         import.insert("typing".into());
         TypeInfo {
             name: format!("typing.Coroutine[typing.Any, typing.Any, {name}]"),
+            source_module: None,
             import,
+            type_refs,
         }
     }
 }

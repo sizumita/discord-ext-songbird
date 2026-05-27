@@ -11,7 +11,6 @@ InputBase = player.InputBase
 AudioInput = player.AudioInput
 RawPCMInput = player.RawPCMInput
 StreamInput = player.StreamInput
-SupportedCodec = player.SupportedCodec
 Track = player.Track
 TrackHandle = player.TrackHandle
 Queue = player.Queue
@@ -30,7 +29,6 @@ __all__ = (
     "Queue",
     "Track",
     "TrackHandle",
-    "SupportedCodec",
     "AudioInput",
     "RawPCMInput",
     "StreamInput",

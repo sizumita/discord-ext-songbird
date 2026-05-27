@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use songbird::{Event, EventContext, EventHandler};
 use std::sync::Arc;
 
-pub struct HandlerWrapper(pub Arc<dyn EventHandler + Sync>);
+pub struct HandlerWrapper(pub Arc<dyn EventHandler + Send + Sync>);
 
 #[async_trait]
 impl EventHandler for HandlerWrapper {

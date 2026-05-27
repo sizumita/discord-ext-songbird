@@ -9,10 +9,14 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::input::core::io::MediaSource;
 use songbird::input::{AudioStream, AudioStreamError, Compose, RawAdapter};
 use std::io::Cursor;
-use symphonia::core::probe::Hint;
 
 #[gen_stub_pyclass]
-#[pyclass(name = "RawPCMInput", extends = PyInputBase, module = "discord.ext.songbird.native.player")]
+#[pyclass(
+    name = "RawPCMInput",
+    extends = PyInputBase,
+    module = "discord.ext.songbird.native.player",
+    skip_from_py_object
+)]
 /// Raw PCM input backed by a float32 array.
 ///
 /// Notes
@@ -84,11 +88,6 @@ impl Compose for PcmCompose {
                 self.1,
                 self.2,
             )),
-            hint: Some({
-                let mut hint = Hint::new();
-                hint.with_extension("rawf32");
-                hint
-            }),
         })
     }
 

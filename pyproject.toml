@@ -23,7 +23,7 @@ readme = "README.md"
 dynamic = ["version", "description", "authors", "license"]
 
 [build-system]
-requires = ["hatchling", "maturin"]
+requires = ["hatchling>=1.28.0", "maturin>=1.10.2,<2.0"]
 build-backend = "maturin"
 
 [tool.uv.sources]
@@ -60,3 +60,6 @@ line-ending = "auto"
 
 [tool.ty.src]
 include = ["py-src", "examples"]
+
+[tool.ty.environment]
+extra-paths = ["py-src"]

@@ -5,7 +5,12 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::tracks::TrackQueue;
 
 #[gen_stub_pyclass]
-#[pyclass(name = "Queue", module = "discord.ext.songbird.native.player")]
+#[pyclass(
+    name = "Queue",
+    module = "discord.ext.songbird.native.player",
+    frozen,
+    skip_from_py_object
+)]
 /// Track queue controller.
 ///
 /// Notes
@@ -30,10 +35,7 @@ impl PyQueue {
     /// -------
     /// TrackHandle | None
     fn current(&self) -> PyResult<Option<PyTrackHandle>> {
-        Ok(self
-            .handle
-            .current()
-            .map(|handle| PyTrackHandle::new(handle)))
+        Ok(self.handle.current().map(PyTrackHandle::new))
     }
 
     /// Remove and return a queued track handle by index.

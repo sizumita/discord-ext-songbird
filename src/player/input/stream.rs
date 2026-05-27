@@ -1,4 +1,3 @@
-use crate::player::input::codec::SupportedCodec;
 use crate::player::input::{PyCompose, PyInputBase};
 use pin_project_lite::pin_project;
 use pyo3::{
@@ -16,13 +15,18 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
 #[gen_stub_pyclass]
-#[pyclass(name = "StreamInput", extends = PyInputBase, module = "discord.ext.songbird.native.player")]
+#[pyclass(
+    name = "StreamInput",
+    extends = PyInputBase,
+    module = "discord.ext.songbird.native.player",
+    skip_from_py_object
+)]
 /// Stream input backed by an asyncio StreamReader.
 ///
 /// Notes
 /// -----
 /// This is intended for long-running or live audio sources.
-pub struct PyStreamInput(Option<Py<PyAny>>, SupportedCodec);
+pub struct PyStreamInput(Option<Py<PyAny>>);
 
 pin_project! {
     struct AsyncStream {
@@ -43,8 +47,6 @@ impl PyStreamInput {
     /// ----------
     /// stream_reader : asyncio.StreamReader
     ///     The source stream to read from.
-    /// codec : SupportedCodec
-    ///     Codec hint for decoding.
     ///
     /// Returns
     /// -------
@@ -52,12 +54,8 @@ impl PyStreamInput {
     fn new(
         #[gen_stub(override_type(type_repr = "asyncio.StreamReader", imports = ("asyncio")))]
         stream_reader: Bound<PyAny>,
-        codec: SupportedCodec,
     ) -> (Self, PyInputBase) {
-        (
-            Self(Some(stream_reader.unbind()), codec),
-            PyInputBase::new(),
-        )
+        (Self(Some(stream_reader.unbind())), PyInputBase::new())
     }
 
     #[gen_stub(skip)]
@@ -73,7 +71,6 @@ impl PyStreamInput {
                 pyo3::exceptions::PyRuntimeError::new_err("StreamInput has been cleared")
             })?
             .clone_ref(py);
-        let codec = slf.1.clone();
         let source = AsyncReadOnlySource::new(AsyncStream {
             stream,
             current_loop: current_loop.unbind(),
@@ -85,7 +82,6 @@ impl PyStreamInput {
                     Box::new(AsyncAdapterStream::new(Box::new(source), 64 * 1024)),
                     MediaSourceStreamOptions::default(),
                 ),
-                hint: Some(codec.into()),
             }),
             None,
         ))

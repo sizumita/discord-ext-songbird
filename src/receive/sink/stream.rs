@@ -14,7 +14,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 
 #[gen_stub_pyclass]
-#[pyclass(extends = SinkBase, module = "discord.ext.songbird.native.receive")]
+#[pyclass(
+    extends = SinkBase,
+    module = "discord.ext.songbird.native.receive",
+    skip_from_py_object
+)]
 /// Streaming sink for received voice data.
 ///
 /// Unlike `BufferSink`, this sink exposes a stream interface backed by a
@@ -42,7 +46,11 @@ pub struct StreamSink {
 }
 
 #[gen_stub_pyclass]
-#[pyclass(name = "Stream", module = "discord.ext.songbird.native.receive")]
+#[pyclass(
+    name = "Stream",
+    module = "discord.ext.songbird.native.receive",
+    skip_from_py_object
+)]
 /// Async stream handle returned by `StreamSink.stream()`.
 ///
 /// This object is an async context manager that acquires a stream permit.

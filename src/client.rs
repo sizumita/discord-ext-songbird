@@ -9,12 +9,12 @@ use crate::update::VoiceUpdater;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::types::PyTuple;
 use pyo3::{
-    Bound, IntoPyObjectExt, Py, PyAny, PyRef, PyRefMut, PyResult, PyTraverseError, PyVisit, Python,
-    pyclass, pymethods,
+    Bound, IntoPyObjectExt, Py, PyAny, PyRef, PyResult, PyTraverseError, PyVisit, Python, pyclass,
+    pymethods,
 };
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
-use songbird::driver::DecodeMode;
+use songbird::driver::{DecodeConfig, DecodeMode};
 use songbird::id::{ChannelId, GuildId, UserId};
 use songbird::shards::Shard;
 use songbird::{Call, Config};
@@ -48,7 +48,7 @@ impl CallWrapper {
 }
 
 #[gen_stub_pyclass]
-#[pyclass(subclass)]
+#[pyclass(subclass, skip_from_py_object)]
 /// Internal backend for Songbird voice connections.
 ///
 /// This class is exposed to Python and used by `SongbirdClient` to manage
@@ -145,7 +145,7 @@ impl SongbirdImpl {
     ) -> PyResult<PyFuture<'py, ()>> {
         let config = Config::default()
             .gateway_timeout(Some(Duration::from_secs_f32(timeout)))
-            .decode_mode(DecodeMode::Decode);
+            .decode_mode(DecodeMode::Decode(DecodeConfig::default()));
         let self_call = slf.call.clone();
         let guild_id = slf.guild_id;
         let channel_id = slf.channel_id;
@@ -450,7 +450,7 @@ impl SongbirdImpl {
     /// sink = receive.BufferSink()
     /// vc.listen(sink)
     /// ```
-    fn listen<'py>(&self, _py: Python<'py>, sink: PyRefMut<'py, SinkBase>) -> PyResult<()> {
+    fn listen<'py>(&self, _py: Python<'py>, sink: PyRef<'py, SinkBase>) -> PyResult<()> {
         let mut guard = self.call.blocking_lock();
         let call = guard.get_mut()?;
 

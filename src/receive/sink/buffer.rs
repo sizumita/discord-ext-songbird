@@ -22,7 +22,11 @@ pub struct BufferSinkHandler {
 }
 
 #[gen_stub_pyclass]
-#[pyclass(extends=SinkBase, module = "discord.ext.songbird.native.receive")]
+#[pyclass(
+    extends=SinkBase,
+    module = "discord.ext.songbird.native.receive",
+    skip_from_py_object
+)]
 /// Buffering sink for received voice data.
 ///
 /// Collects `VoiceTick` snapshots and exposes them via async iteration.

@@ -16,7 +16,7 @@ Songbird's Rust audio pipeline through PyO3.
 - Low-latency playback backed by Songbird
 - Voice receive APIs (`BufferSink`, `StreamSink`)
 - Native input types for raw PCM, encoded audio, and streaming
-- PyO3/maturin extension with Python 3.13+ support
+- PyO3/maturin extension with CPython 3.13+ and free-threaded CPython support
 - Beta release series (API may evolve)
 
 ## Installation
@@ -74,17 +74,19 @@ handle.pause()
 Native input types live under `discord.ext.songbird.player.input`.
 
 - `RawPCMInput`: `pyarrow.Float32Array` PCM input
-- `AudioInput`: encoded audio in a `pyarrow.Array` with a `SupportedCodec`
-- `StreamInput`: `asyncio.StreamReader` with a `SupportedCodec`
+- `AudioInput`: encoded audio in a `pyarrow.Array`
+- `StreamInput`: `asyncio.StreamReader`
 
-Supported codecs: `MP3`, `WAVE`, `MKV`, `FLAC`, `AAC`.
+`AudioInput` and `StreamInput` no longer take a codec argument. Songbird 0.6
+detects encoded stream formats internally, so `SupportedCodec` has been removed
+from the Python API.
 
 ```python
 import asyncio
 from discord.ext.songbird import player
 
 buffer = asyncio.StreamReader()
-source = player.input.StreamInput(buffer, player.input.SupportedCodec.AAC)
+source = player.input.StreamInput(buffer)
 track = player.Track(source)
 ```
 
@@ -122,11 +124,25 @@ Set `DISCORD_BOT_TOKEN` and `CHANNEL_ID` before running the examples.
 - `discord.py[voice]`
 - `pyarrow`
 
+Published CPython wheels are split by ABI. The release workflow builds `cp313`,
+`cp313t`, `cp314`, and `cp314t` wheels for the supported platforms, so a normal
+Python 3.14 environment continues to install the regular `cp314` wheel while
+Python 3.14t installs `cp314t`.
+
 ## Development
 
 ```bash
-uv sync --all-extras --dev --no-install-project
-uvx maturin develop
+uv sync --all-extras --dev --no-install-project --python 3.14t
+uv run maturin develop
+```
+
+The default local environment uses free-threaded CPython 3.14 (`3.14t`).
+Release wheels are built separately for the normal and free-threaded ABIs
+(`cp314` and `cp314t`). To check the normal 3.14 build locally, point PyO3 at
+a GIL-enabled interpreter:
+
+```bash
+PYO3_PYTHON=/path/to/python3.14 cargo check
 ```
 
 ```bash
