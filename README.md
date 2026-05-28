@@ -55,6 +55,9 @@ client.run(DISCORD_BOT_TOKEN)
 
 ## Features
 
+Detailed API guides are available for [voice output](docs/send.md) and
+[voice receive](docs/receive.md).
+
 ### Playback
 
 Use `SongbirdClient` as your voice client. Playback is driven by `Track` and `TrackHandle`.
@@ -137,6 +140,9 @@ See `examples/` for runnable bots:
 - `examples/basic.py` (PCM playback)
 - `examples/send_stream.py` (stream input)
 - `examples/receive_stream.py` (voice receive)
+
+For deeper usage notes, see [Send (Voice Output)](docs/send.md) and
+[Receive (Voice Input)](docs/receive.md).
 
 Set `DISCORD_BOT_TOKEN` and `CHANNEL_ID` before running the examples.
 
