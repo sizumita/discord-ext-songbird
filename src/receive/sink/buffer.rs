@@ -195,18 +195,16 @@ impl BufferSink {
         let ticks = self.ticks.clone();
         let s = stream! {
             loop {
-                let tick = {
+                let Some(tick) = ({
                     let mut guard = ticks.lock().await;
-                    if let Some(tick) = guard.pop_front() {
-                        Python::attach(|py| {
-                            let k = tick.get(py, &key);
-                            k.and_then(|x| x.into_py_any(py))
-                        })
-                    } else {
-                        drop(guard);
-                        break;
-                    }
+                    guard.pop_front()
+                }) else {
+                    break;
                 };
+                let tick = Python::attach(|py| {
+                    let k = tick.get(py, &key);
+                    k.and_then(|x| x.into_py_any(py))
+                });
                 yield tick;
             }
         };
@@ -231,17 +229,15 @@ impl BufferSink {
         let ticks = slf.ticks.clone();
         let s = stream! {
             loop {
-                let tick = {
+                let Some(tick) = ({
                     let mut guard = ticks.lock().await;
-                    if let Some(tick) = guard.pop_front() {
-                        Python::attach(|py| {
-                            tick.to_record_batch(py).and_then(|x| x.into_py_any(py))
-                        })
-                    } else {
-                        drop(guard);
-                        break;
-                    }
+                    guard.pop_front()
+                }) else {
+                    break;
                 };
+                let tick = Python::attach(|py| {
+                    tick.to_record_batch(py).and_then(|x| x.into_py_any(py))
+                });
                 yield tick;
             }
         };

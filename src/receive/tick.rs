@@ -10,7 +10,7 @@ use pyo3::{Bound, PyResult, Python, pyclass, pymethods};
 use pyo3_arrow::{PyArray, PyRecordBatch};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 use songbird::events::context_data::VoiceTick as SongbirdVoiceTick;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 const KEY_KIND_USER: u8 = 0;
@@ -239,28 +239,29 @@ impl VoiceTickBatch {
         let silent = silent.into_iter();
         let speaking_capacity = speaking.size_hint().0;
         let silent_capacity = silent.size_hint().0;
-        let mut rows = Vec::with_capacity(speaking_capacity + silent_capacity);
-        let mut speaking_keys = HashSet::with_capacity(speaking_capacity);
+        let mut rows_by_key = HashMap::with_capacity(speaking_capacity + silent_capacity);
 
         for (ssrc, decoded) in speaking {
             let key = key_for_ssrc(ssrc, identities);
             if let Some(decoded) = decoded {
-                speaking_keys.insert(key.clone());
-                rows.push(VoiceTickRow {
-                    key,
-                    pcm: Some(decoded),
-                });
+                let entry = rows_by_key.entry(key).or_insert(None);
+                if entry.is_none() {
+                    *entry = Some(decoded);
+                }
             } else {
-                rows.push(VoiceTickRow { key, pcm: None });
+                rows_by_key.entry(key).or_insert(None);
             }
         }
 
         for ssrc in silent {
             let key = key_for_ssrc(ssrc, identities);
-            if !speaking_keys.contains(&key) {
-                rows.push(VoiceTickRow { key, pcm: None });
-            }
+            rows_by_key.entry(key).or_insert(None);
         }
+
+        let rows = rows_by_key
+            .into_iter()
+            .map(|(key, pcm)| VoiceTickRow { key, pcm })
+            .collect();
 
         Arc::new(Self::from_rows(rows))
     }
@@ -541,5 +542,45 @@ mod tests {
 
         assert_eq!(batch.speaking_keys(), HashSet::from([VoiceKey::User(7)]));
         assert_eq!(batch.silent_keys(), HashSet::from([VoiceKey::Unknown(99)]));
+    }
+
+    #[test]
+    fn ssrc_rows_merge_duplicate_user_keys_and_prefer_pcm() {
+        let identities = crate::receive::identity::VoiceIdentityMap::default();
+        identities.insert(42, 7);
+        identities.insert(43, 7);
+        identities.insert(44, 7);
+        let first_pcm = [1, 2, 3, 4];
+        let second_pcm = [9, 8];
+        let batch = VoiceTickBatch::from_ssrc_rows(
+            [
+                (42, None),
+                (43, Some(first_pcm.as_slice())),
+                (44, Some(second_pcm.as_slice())),
+            ],
+            [42],
+            &identities,
+        );
+
+        assert_eq!(batch.record_batch().num_rows(), 1);
+        assert_eq!(batch.speaking_keys(), HashSet::from([VoiceKey::User(7)]));
+        assert_eq!(batch.silent_keys(), HashSet::new());
+        let pcm = batch
+            .get_array_ref(&VoiceKey::User(7))
+            .expect("merged user PCM should be present");
+        assert_eq!(int16_values(&pcm), first_pcm);
+    }
+
+    #[test]
+    fn ssrc_rows_merge_duplicate_silent_user_keys() {
+        let identities = crate::receive::identity::VoiceIdentityMap::default();
+        identities.insert(42, 7);
+        identities.insert(43, 7);
+        let batch = VoiceTickBatch::from_ssrc_rows([(42, None)], [42, 43], &identities);
+
+        assert_eq!(batch.record_batch().num_rows(), 1);
+        assert_eq!(batch.all_keys(), HashSet::from([VoiceKey::User(7)]));
+        assert_eq!(batch.speaking_keys(), HashSet::new());
+        assert_eq!(batch.silent_keys(), HashSet::from([VoiceKey::User(7)]));
     }
 }
