@@ -2,11 +2,16 @@ name: Release CI
 on:
   workflow_dispatch:
   push:
+    branches:
+      - master
     tags:
       - "v*"
 
 permissions:
   contents: read
+
+env:
+  CARGO_NET_RETRY: "10"
 
 jobs:
   linux:
@@ -62,7 +67,7 @@ jobs:
           container: "ghcr.io/rust-cross/manylinux_2_28-cross:${{ matrix.platform.target }}"
           before-script-linux: |
             sudo apt-get update
-            sudo apt-get install -y libopus-dev
+            sudo apt-get install -y libopus-dev pkg-config
 
       - name: Smoke test native wheel
         if: matrix.platform.target == 'x86_64'
