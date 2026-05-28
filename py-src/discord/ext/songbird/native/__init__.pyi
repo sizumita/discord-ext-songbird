@@ -38,7 +38,7 @@ __all__ = [
     "receive",
 ]
 
-VERSION: builtins.str = "0.4.3"
+VERSION: builtins.str = "0.5.0"
 
 class SongbirdImpl:
     r"""
