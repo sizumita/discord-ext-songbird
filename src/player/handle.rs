@@ -1,5 +1,6 @@
 use crate::error::PyControlError;
 use crate::model::PyFuture;
+use nonmax::NonMaxU32;
 use pyo3::{PyResult, Python, pyclass, pymethods};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -7,7 +8,12 @@ use songbird::tracks::TrackHandle;
 use std::time::Duration;
 
 #[gen_stub_pyclass]
-#[pyclass(name = "TrackHandle", module = "discord.ext.songbird.native.player")]
+#[pyclass(
+    name = "TrackHandle",
+    module = "discord.ext.songbird.native.player",
+    frozen,
+    skip_from_py_object
+)]
 /// Handle for controlling a playing track.
 ///
 /// Notes
@@ -82,6 +88,12 @@ impl PyTrackHandle {
     }
 
     fn loop_for(&self, times: usize) -> PyResult<()> {
+        let times = u32::try_from(times)
+            .ok()
+            .and_then(NonMaxU32::new)
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("times must be less than u32::MAX")
+            })?;
         self.inner
             .loop_for(times)
             .map_err(|err| PyControlError::new_err(err.to_string()))?;

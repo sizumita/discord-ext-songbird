@@ -1,4 +1,5 @@
 use crate::player::input::{PyCompose, PyInputBase};
+use nonmax::NonMaxU32;
 use pyo3::{
     Bound, Py, PyAny, PyRefMut, PyResult, PyTraverseError, PyVisit, Python, pyclass, pymethods,
 };
@@ -6,7 +7,11 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::tracks::{LoopState, PlayMode, Track};
 
 #[gen_stub_pyclass]
-#[pyclass(name = "Track", module = "discord.ext.songbird.native.player")]
+#[pyclass(
+    name = "Track",
+    module = "discord.ext.songbird.native.player",
+    skip_from_py_object
+)]
 /// Playable audio track.
 ///
 /// Notes
@@ -45,7 +50,7 @@ impl PyTrack {
             input: Some(input.unbind()),
             mode: PlayMode::Play,
             volume: 1.0,
-            loops: LoopState::Finite(0),
+            loops: LoopState::Finite(NonMaxU32::ZERO),
         }
     }
 

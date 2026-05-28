@@ -14,8 +14,8 @@ jobs:
     strategy:
       matrix:
         python-version:
-          - "3.13"
           - "3.14"
+          - "3.14t"
     steps:
       - uses: actions/checkout@v4
 
@@ -36,30 +36,47 @@ jobs:
       - name: Add problem matchers
         run: echo "::add-matcher::.github/rust.json"
 
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-          version: "latest"
+          version: "0.11.7"
           python-version: ${{ matrix.python-version }}
+
+      - name: Syncing uv project
+        run: uv sync --all-extras --dev --no-install-project --frozen --python "$pythonLocation/bin/python"
+
+      - name: Check Python ABI
+        run: |
+          if [[ "${{ matrix.python-version }}" == *t ]]; then
+            uv run --no-sync python -c "import sys; assert not sys._is_gil_enabled()"
+          else
+            uv run --no-sync python -c "import sys; assert sys._is_gil_enabled()"
+          fi
 
       - name: Run rustfmt
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-features --all-targets
-
-      - name: Syncing uv project
-        run: uv sync --all-extras --dev --no-install-project --frozen
+        run: PYO3_PYTHON="$PWD/.venv/bin/python" cargo clippy --all-features --all-targets
 
       - name: Build wheels for checking
-        run: uv tool run maturin develop
+        run: PYO3_PYTHON="$PWD/.venv/bin/python" uv run --no-sync maturin develop
 
       - name: Run ruff
-        run: uv tool run ruff check --output-format=github
+        run: uv run --no-sync ruff check --output-format=github
 
       - name: Run ruff formatter
-        run: uv tool run ruff format --diff
+        run: uv run --no-sync ruff format --diff
 
       - name: Run ty
-        run: uv tool run ty check --output-format=github --python-version ${{ matrix.python-version }}
+        run: |
+          ty_python_version="${{ matrix.python-version }}"
+          ty_python_version="${ty_python_version%t}"
+          uv run --no-sync ty check --output-format=github --python-version "$ty_python_version"

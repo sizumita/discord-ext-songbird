@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 use pyo3_stub_gen::define_stub_info_gatherer;
 
 /// A Python module implemented in Rust.
-#[pymodule]
+#[pymodule(gil_used = false)]
 mod native {
     use pyo3::prelude::*;
 
@@ -73,8 +73,6 @@ VERSION : str
         use crate::player::input::PyInputBase;
         #[pymodule_export]
         use crate::player::input::audio::PyAudioInput;
-        #[pymodule_export]
-        use crate::player::input::codec::SupportedCodec;
         #[pymodule_export]
         use crate::player::input::pcm::PyRawPcmInput;
         #[pymodule_export]

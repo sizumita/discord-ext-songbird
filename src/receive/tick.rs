@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 #[gen_stub_pyclass_complex_enum]
-#[pyclass(module = "discord.ext.songbird.native.receive")]
+#[pyclass(module = "discord.ext.songbird.native.receive", frozen, from_py_object)]
 /// Identifier for a voice source.
 ///
 /// This is either a Discord user ID or an unknown SSRC.
@@ -29,7 +29,11 @@ pub enum VoiceKey {
 }
 
 #[gen_stub_pyclass]
-#[pyclass(module = "discord.ext.songbird.native.receive")]
+#[pyclass(
+    module = "discord.ext.songbird.native.receive",
+    frozen,
+    skip_from_py_object
+)]
 /// Snapshot of received voice data for a single tick.
 ///
 /// Examples

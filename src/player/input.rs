@@ -1,5 +1,4 @@
 pub(crate) mod audio;
-pub(crate) mod codec;
 mod data;
 pub mod pcm;
 pub mod stream;
@@ -12,7 +11,8 @@ use songbird::input::{Compose, Input, LiveInput};
 #[pyclass(
     name = "InputBase",
     module = "discord.ext.songbird.native.player",
-    subclass
+    subclass,
+    skip_from_py_object
 )]
 /// Base class for player inputs.
 ///
@@ -21,7 +21,11 @@ use songbird::input::{Compose, Input, LiveInput};
 /// Concrete inputs are provided under `discord.ext.songbird.player.input`.
 pub struct PyInputBase;
 
-#[pyclass(name = "Compose", module = "discord.ext.songbird.native.player")]
+#[pyclass(
+    name = "Compose",
+    module = "discord.ext.songbird.native.player",
+    skip_from_py_object
+)]
 /// Internal compose result for player inputs.
 ///
 /// Notes

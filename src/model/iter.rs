@@ -14,7 +14,7 @@ use tokio_stream::Stream;
 
 type AsyncStream = Arc<Mutex<Pin<Box<dyn Stream<Item = PyResult<Py<PyAny>>> + Send + 'static>>>>;
 
-#[pyclass(module = "discord.ext.songbird.native.model")]
+#[pyclass(module = "discord.ext.songbird.native.model", skip_from_py_object)]
 /// Async iterator wrapper used by the native module.
 ///
 /// Notes

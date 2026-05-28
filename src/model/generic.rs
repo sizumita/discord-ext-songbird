@@ -40,15 +40,22 @@ where
         let TypeInfo {
             name: t_name,
             import: mut t_import,
+            type_refs: mut t_type_refs,
+            ..
         } = T::type_output();
         let TypeInfo {
             name: g_name,
             import: g_import,
+            type_refs: g_type_refs,
+            ..
         } = G::type_output();
         t_import.extend(g_import);
+        t_type_refs.extend(g_type_refs);
         TypeInfo {
             name: format!("{t_name}[{g_name}]"),
+            source_module: None,
             import: t_import,
+            type_refs: t_type_refs,
         }
     }
 }

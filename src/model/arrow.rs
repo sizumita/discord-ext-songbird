@@ -27,7 +27,9 @@ where
         imports.insert("pyarrow".into());
         TypeInfo {
             name: format!("pyarrow.{}", T::ARROW_TYPE_NAME),
+            source_module: None,
             import: imports,
+            type_refs: Default::default(),
         }
     }
 }

@@ -16,7 +16,7 @@ Songbird's Rust audio pipeline through PyO3.
 - Low-latency playback backed by Songbird
 - Voice receive APIs (`BufferSink`, `StreamSink`)
 - Native input types for raw PCM, encoded audio, and streaming
-- PyO3/maturin extension with Python 3.13+ support
+- PyO3/maturin extension with CPython 3.14 and free-threaded CPython 3.14 support
 - Beta release series (API may evolve)
 
 ## Installation
@@ -46,7 +46,7 @@ async def on_ready():
         vc = await channel.connect(cls=songbird.SongbirdClient)
 
         samples = pa.array([0.0, 0.1, 0.0, -0.1], type=pa.float32())
-        source = player.input.RawPCMInput(samples, sample_rate=48000, channels=2)
+        source = player.RawPCMInput(samples, sample_rate=48000, channels=2)
         track = player.Track(source).volume(0.8)
         await vc.play(track)
 
@@ -71,20 +71,22 @@ handle.pause()
 
 ### Inputs
 
-Native input types live under `discord.ext.songbird.player.input`.
+Native input types are exported from `discord.ext.songbird.player`.
 
 - `RawPCMInput`: `pyarrow.Float32Array` PCM input
-- `AudioInput`: encoded audio in a `pyarrow.Array` with a `SupportedCodec`
-- `StreamInput`: `asyncio.StreamReader` with a `SupportedCodec`
+- `AudioInput`: encoded audio in a `pyarrow.Array`
+- `StreamInput`: `asyncio.StreamReader`
 
-Supported codecs: `MP3`, `WAVE`, `MKV`, `FLAC`, `AAC`.
+`AudioInput` and `StreamInput` no longer take a codec argument. Songbird 0.6
+detects encoded stream formats internally, so `SupportedCodec` has been removed
+from the Python API.
 
 ```python
 import asyncio
 from discord.ext.songbird import player
 
 buffer = asyncio.StreamReader()
-source = player.input.StreamInput(buffer, player.input.SupportedCodec.AAC)
+source = player.StreamInput(buffer)
 track = player.Track(source)
 ```
 
@@ -118,15 +120,29 @@ Set `DISCORD_BOT_TOKEN` and `CHANNEL_ID` before running the examples.
 
 ## Requirements
 
-- Python 3.13+
-- `discord.py[voice]`
+- Python 3.14+
+- `discord.py`
 - `pyarrow`
+
+Published CPython wheels are split by ABI. The release workflow builds regular
+`cp314` wheels and free-threaded `cp314t` wheels for the supported platforms, so
+a normal Python 3.14 environment installs the regular wheel while Python 3.14t
+installs the free-threaded wheel.
 
 ## Development
 
 ```bash
-uv sync --all-extras --dev --no-install-project
-uvx maturin develop
+uv sync --all-extras --dev --no-install-project --python 3.14t
+uv run maturin develop
+```
+
+The default local environment uses free-threaded CPython 3.14 (`3.14t`).
+Release wheels are built separately for the normal and free-threaded ABIs
+(`cp314` and `cp314t`). To check the normal 3.14 build locally, point PyO3 at
+a GIL-enabled interpreter:
+
+```bash
+PYO3_PYTHON=/path/to/python3.14 cargo check
 ```
 
 ```bash

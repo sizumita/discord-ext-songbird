@@ -23,15 +23,20 @@ jobs:
           - runner: ubuntu-22.04
             target: ppc64le
         python-version:
-          - 3.13
           - 3.14
+          - 3.14t
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-          version: "latest"
+          version: "0.11.7"
           python-version: ${{ matrix.python-version }}
 
       - uses: dtolnay/rust-toolchain@stable
@@ -40,7 +45,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Syncing uv project
-        run: uv sync --all-extras --dev --no-install-project
+        shell: bash
+        run: uv sync --all-extras --dev --no-install-project --python "$pythonLocation/bin/python"
+
+      - name: Check Python ABI
+        run: |
+          if [[ "${{ matrix.python-version }}" == *t ]]; then
+            uv run --no-sync python -c "import sys; assert not sys._is_gil_enabled()"
+          else
+            uv run --no-sync python -c "import sys; assert sys._is_gil_enabled()"
+          fi
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -53,6 +67,13 @@ jobs:
           before-script-linux: |
             sudo apt-get update
             sudo apt-get install -y libopus-dev
+
+      - name: Smoke test native wheel
+        if: matrix.platform.target == 'x86_64'
+        run: |
+          uv run --no-sync python -m pip install --force-reinstall dist/*.whl
+          if [[ "${{ matrix.python-version }}" == *t ]]; then export PYTHON_GIL=0; fi
+          uv run --no-sync python -c "import asyncio, pyarrow as pa; asyncio.set_event_loop(asyncio.new_event_loop()); from discord.ext import songbird; from discord.ext.songbird import player; assert not hasattr(songbird, 'SupportedCodec'); player.AudioInput(pa.array([1, 2, 3], type=pa.uint8())); player.RawPCMInput(pa.array([0.0, 0.0], type=pa.float32()), sample_rate=48000, channels=2); player.StreamInput(asyncio.StreamReader())"
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -70,8 +91,8 @@ jobs:
           - runner: ubuntu-22.04
             target: aarch64
         python-version:
-          - 3.13
           - 3.14
+          - 3.14t
     steps:
       - uses: actions/checkout@v4
 
@@ -80,11 +101,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libopus-dev
 
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-          version: "latest"
+          version: "0.11.7"
           python-version: ${{ matrix.python-version }}
 
       - uses: dtolnay/rust-toolchain@stable
@@ -93,7 +120,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Syncing uv project
-        run: uv sync --all-extras --dev --no-install-project
+        shell: bash
+        run: uv sync --all-extras --dev --no-install-project --python "$pythonLocation/bin/python"
+
+      - name: Check Python ABI
+        run: |
+          if [[ "${{ matrix.python-version }}" == *t ]]; then
+            uv run --no-sync python -c "import sys; assert not sys._is_gil_enabled()"
+          else
+            uv run --no-sync python -c "import sys; assert sys._is_gil_enabled()"
+          fi
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -118,15 +154,20 @@ jobs:
           - runner: windows-latest
             target: x86
         python-version:
-          - 3.13
           - 3.14
+          - 3.14t
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-          version: "latest"
+          version: "0.11.7"
           python-version: ${{ matrix.python-version }}
 
       - uses: dtolnay/rust-toolchain@stable
@@ -135,7 +176,17 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Syncing uv project
-        run: uv sync --all-extras --dev --no-install-project
+        shell: bash
+        run: uv sync --all-extras --dev --no-install-project --python "$pythonLocation/python.exe"
+
+      - name: Check Python ABI
+        shell: bash
+        run: |
+          if [[ "${{ matrix.python-version }}" == *t ]]; then
+            uv run --no-sync python -c "import sys; assert not sys._is_gil_enabled()"
+          else
+            uv run --no-sync python -c "import sys; assert sys._is_gil_enabled()"
+          fi
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -143,6 +194,13 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: --release --out dist -i ${{ matrix.python-version }} --features pyo3/generate-import-lib
           sccache: 'true'
+      - name: Smoke test native wheel
+        if: matrix.platform.target == 'x64'
+        shell: bash
+        run: |
+          uv run --no-sync python -m pip install --force-reinstall dist/*.whl
+          if [[ "${{ matrix.python-version }}" == *t ]]; then export PYTHON_GIL=0; fi
+          uv run --no-sync python -c "import asyncio, pyarrow as pa; asyncio.set_event_loop(asyncio.new_event_loop()); from discord.ext import songbird; from discord.ext.songbird import player; assert not hasattr(songbird, 'SupportedCodec'); player.AudioInput(pa.array([1, 2, 3], type=pa.uint8())); player.RawPCMInput(pa.array([0.0, 0.0], type=pa.float32()), sample_rate=48000, channels=2); player.StreamInput(asyncio.StreamReader())"
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -157,10 +215,16 @@ jobs:
           - runner: macos-14
             target: aarch64
         python-version:
-          - 3.13
           - 3.14
+          - 3.14t
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
 
       - name: Set up Homebrew
         id: set-up-homebrew
@@ -182,10 +246,10 @@ jobs:
         run: brew install opus pkg-config
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-          version: "latest"
+          version: "0.11.7"
           python-version: ${{ matrix.python-version }}
 
       - uses: dtolnay/rust-toolchain@stable
@@ -194,7 +258,15 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Syncing uv project
-        run: uv sync --all-extras --dev --no-install-project
+        run: uv sync --all-extras --dev --no-install-project --python "$pythonLocation/bin/python"
+
+      - name: Check Python ABI
+        run: |
+          if [[ "${{ matrix.python-version }}" == *t ]]; then
+            uv run --no-sync python -c "import sys; assert not sys._is_gil_enabled()"
+          else
+            uv run --no-sync python -c "import sys; assert sys._is_gil_enabled()"
+          fi
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -202,6 +274,11 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: --release --out dist -i ${{ matrix.python-version }} --features pyo3/generate-import-lib
           sccache: 'true'
+      - name: Smoke test native wheel
+        run: |
+          uv run --no-sync python -m pip install --force-reinstall dist/*.whl
+          if [[ "${{ matrix.python-version }}" == *t ]]; then export PYTHON_GIL=0; fi
+          uv run --no-sync python -c "import asyncio, pyarrow as pa; asyncio.set_event_loop(asyncio.new_event_loop()); from discord.ext import songbird; from discord.ext.songbird import player; assert not hasattr(songbird, 'SupportedCodec'); player.AudioInput(pa.array([1, 2, 3], type=pa.uint8())); player.RawPCMInput(pa.array([0.0, 0.0], type=pa.float32()), sample_rate=48000, channels=2); player.StreamInput(asyncio.StreamReader())"
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -212,6 +289,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          version: "0.11.7"
+          python-version: "3.14"
       - uses: actions/setup-python@v6
         with:
           python-version: '3.14'
@@ -220,9 +303,11 @@ jobs:
         with:
           command: sdist
           args: --out dist
+      - name: Syncing uv project
+        run: uv sync --all-extras --dev --no-install-project --python "$pythonLocation/bin/python"
       - name: Test sdist
         run: |
-          python -m pip install dist/*.tar.gz
+          uv run --no-sync python -m pip install dist/*.tar.gz
       - name: Upload sdist
         uses: actions/upload-artifact@v4
         with:

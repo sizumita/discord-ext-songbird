@@ -1,4 +1,3 @@
-pub(crate) use crate::player::input::codec::SupportedCodec;
 use crate::player::input::data::AnyVoiceDataArray;
 use crate::player::input::{PyCompose, PyInputBase};
 use arrow::array::{Array, ArrayRef};
@@ -10,18 +9,22 @@ use songbird::input::core::io::MediaSource;
 use songbird::input::{AudioStream, AudioStreamError, Compose};
 
 #[gen_stub_pyclass]
-#[pyclass(name = "AudioInput", extends = PyInputBase, module = "discord.ext.songbird.native.player")]
+#[pyclass(
+    name = "AudioInput",
+    extends = PyInputBase,
+    module = "discord.ext.songbird.native.player",
+    skip_from_py_object
+)]
 /// Encoded audio input backed by a pyarrow array.
 ///
 /// Notes
 /// -----
-/// The payload is interpreted according to `SupportedCodec`.
+/// The payload format is detected by Songbird/Symphonia.
 pub struct PyAudioInput {
-    codec: SupportedCodec,
     array: ArrayRef,
 }
 
-struct ArrayCompose(AnyVoiceDataArray, SupportedCodec);
+struct ArrayCompose(AnyVoiceDataArray);
 
 #[gen_stub_pymethods]
 #[pymethods]
@@ -34,8 +37,6 @@ impl PyAudioInput {
     /// ----------
     /// array : pyarrow.Array
     ///     Encoded audio payload.
-    /// codec : SupportedCodec
-    ///     Codec hint for decoding.
     ///
     /// Returns
     /// -------
@@ -43,7 +44,6 @@ impl PyAudioInput {
     fn new(
         #[gen_stub(override_type(type_repr = "pyarrow.Array", imports = ("pyarrow")))]
         array: PyArray,
-        codec: SupportedCodec,
     ) -> PyResult<(Self, PyInputBase)> {
         let array = array.array();
         if !array.data_type().is_primitive() {
@@ -53,7 +53,6 @@ impl PyAudioInput {
         }
         Ok((
             Self {
-                codec,
                 array: array.clone(),
             },
             PyInputBase::new(),
@@ -62,7 +61,7 @@ impl PyAudioInput {
 
     #[gen_stub(skip)]
     fn _compose(&self, _current_loop: Bound<PyAny>) -> PyResult<PyCompose> {
-        let compose = ArrayCompose(self.array.clone().try_into()?, self.codec.clone());
+        let compose = ArrayCompose(self.array.clone().try_into()?);
         Ok(PyCompose::new_lazy(Box::new(compose)))
     }
 }
@@ -72,7 +71,6 @@ impl Compose for ArrayCompose {
     fn create(&mut self) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
         Ok(AudioStream {
             input: self.0.clone().try_into_media_source()?,
-            hint: Some(self.1.clone().into()),
         })
     }
 
