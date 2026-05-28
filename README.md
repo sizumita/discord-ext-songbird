@@ -46,7 +46,7 @@ async def on_ready():
         vc = await channel.connect(cls=songbird.SongbirdClient)
 
         samples = pa.array([0.0, 0.1, 0.0, -0.1], type=pa.float32())
-        source = player.input.RawPCMInput(samples, sample_rate=48000, channels=2)
+        source = player.RawPCMInput(samples, sample_rate=48000, channels=2)
         track = player.Track(source).volume(0.8)
         await vc.play(track)
 
@@ -71,7 +71,7 @@ handle.pause()
 
 ### Inputs
 
-Native input types live under `discord.ext.songbird.player.input`.
+Native input types are exported from `discord.ext.songbird.player`.
 
 - `RawPCMInput`: `pyarrow.Float32Array` PCM input
 - `AudioInput`: encoded audio in a `pyarrow.Array`
@@ -86,7 +86,7 @@ import asyncio
 from discord.ext.songbird import player
 
 buffer = asyncio.StreamReader()
-source = player.input.StreamInput(buffer)
+source = player.StreamInput(buffer)
 track = player.Track(source)
 ```
 
