@@ -21,8 +21,10 @@ jobs:
         platform:
           - runner: ubuntu-22.04
             target: x86_64
+            container: quay.io/pypa/manylinux_2_28_x86_64:latest
           - runner: ubuntu-22.04
             target: aarch64
+            container: ghcr.io/rust-cross/manylinux_2_28-cross:aarch64
         python-version:
           - 3.14
           - 3.14t
@@ -64,10 +66,14 @@ jobs:
           args: --release --out dist -i ${{ matrix.python-version }}
           sccache: 'true'
           manylinux: manylinux_2_28
-          container: "ghcr.io/rust-cross/manylinux_2_28-cross:${{ matrix.platform.target }}"
+          container: ${{ matrix.platform.container }}
           before-script-linux: |
-            sudo apt-get update
-            sudo apt-get install -y libopus-dev pkg-config
+            if command -v dnf >/dev/null 2>&1; then
+              dnf install -y opus-devel pkgconf-pkg-config
+            else
+              apt-get update
+              apt-get install -y libopus-dev pkg-config
+            fi
 
       - name: Smoke test native wheel
         if: matrix.platform.target == 'x86_64'
