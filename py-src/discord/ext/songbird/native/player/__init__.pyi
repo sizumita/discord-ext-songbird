@@ -11,11 +11,14 @@ import pyarrow
 __all__ = [
     "AudioInput",
     "InputBase",
+    "OpusPacketInput",
+    "OpusPacketStreamInput",
     "Queue",
     "RawPCMInput",
     "StreamInput",
     "Track",
     "TrackHandle",
+    "supported_codecs",
 ]
 
 @typing.final
@@ -51,6 +54,77 @@ class InputBase:
     """
 
     ...
+
+@typing.final
+class OpusPacketInput(InputBase):
+    r"""
+    Pre-encoded Opus packet input backed by an Arrow binary array.
+
+    Notes
+    -----
+    Each array value must be one non-empty 20 ms Opus frame at 48 kHz.
+    When this input is the only active track and volume is 1.0, Songbird can
+    send these frames through without decoding and re-encoding them.
+    """
+    def __new__(cls, frames: pyarrow.BinaryArray | pyarrow.LargeBinaryArray) -> typing.Self:
+        r"""
+        Create an Opus packet input.
+
+        Parameters
+        ----------
+        frames : pyarrow.BinaryArray | pyarrow.LargeBinaryArray
+            One 20 ms Opus frame per row.
+
+        Returns
+        -------
+        OpusPacketInput
+        """
+
+@typing.final
+class OpusPacketStreamInput(InputBase):
+    r"""
+    Live pre-encoded Opus packet input.
+
+    Notes
+    -----
+    Use ``await send(packet)`` to push one 20 ms Opus frame. The bounded queue
+    provides backpressure and ``close()`` signals EOF to the player.
+    """
+    def __new__(cls, *, max_packets: builtins.int = 128) -> typing.Self:
+        r"""
+        Create a live Opus packet input.
+
+        Parameters
+        ----------
+        max_packets : int, optional
+            Maximum queued packets before ``send`` applies backpressure.
+            Must be greater than zero.
+
+        Returns
+        -------
+        OpusPacketStreamInput
+        """
+    def send(self, packet: bytes) -> typing.Coroutine[typing.Any, typing.Any, None]:
+        r"""
+        Send one 20 ms Opus frame.
+
+        Parameters
+        ----------
+        packet : bytes
+            One non-empty Opus frame containing exactly 960 samples at 48 kHz.
+
+        Returns
+        -------
+        None
+        """
+    def close(self) -> typing.Coroutine[typing.Any, typing.Any, None]:
+        r"""
+        Close the stream and signal EOF to the player.
+
+        Returns
+        -------
+        None
+        """
 
 @typing.final
 class Queue:
@@ -312,3 +386,12 @@ class TrackHandle:
     def enable_loop(self) -> None: ...
     def disable_loop(self) -> None: ...
     def loop_for(self, times: builtins.int) -> None: ...
+
+def supported_codecs() -> builtins.list[builtins.str]:
+    r"""
+    Return codec and format identifiers enabled in this native build.
+
+    Returns
+    -------
+    list[str]
+    """

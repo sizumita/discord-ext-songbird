@@ -74,6 +74,12 @@ VERSION : str
         #[pymodule_export]
         use crate::player::input::audio::PyAudioInput;
         #[pymodule_export]
+        use crate::player::input::opus::PyOpusPacketInput;
+        #[pymodule_export]
+        use crate::player::input::opus::PyOpusPacketStreamInput;
+        #[pymodule_export]
+        use crate::player::input::opus::supported_codecs;
+        #[pymodule_export]
         use crate::player::input::pcm::PyRawPcmInput;
         #[pymodule_export]
         use crate::player::input::stream::PyStreamInput;

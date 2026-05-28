@@ -73,7 +73,7 @@ jobs:
         run: |
           uv run --no-sync python -m pip install --force-reinstall dist/*.whl
           if [[ "${{ matrix.python-version }}" == *t ]]; then export PYTHON_GIL=0; fi
-          uv run --no-sync python -c "import asyncio, pyarrow as pa; asyncio.set_event_loop(asyncio.new_event_loop()); from discord.ext import songbird; from discord.ext.songbird import player; assert not hasattr(songbird, 'SupportedCodec'); player.AudioInput(pa.array([1, 2, 3], type=pa.uint8())); player.RawPCMInput(pa.array([0.0, 0.0], type=pa.float32()), sample_rate=48000, channels=2); player.StreamInput(asyncio.StreamReader())"
+          uv run --no-sync python -c "import asyncio, pyarrow as pa; asyncio.set_event_loop(asyncio.new_event_loop()); from discord.ext import songbird; from discord.ext.songbird import player; assert not hasattr(songbird, 'SupportedCodec'); player.AudioInput(pa.array([1, 2, 3], type=pa.uint8())); player.RawPCMInput(pa.array([0.0, 0.0], type=pa.float32()), sample_rate=48000, channels=2); player.StreamInput(asyncio.StreamReader()); player.OpusPacketInput(pa.array([b'\xf8\xff\xfe'], type=pa.binary())); player.OpusPacketStreamInput(max_packets=1); assert 'opus' in player.supported_codecs()"
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -200,7 +200,7 @@ jobs:
         run: |
           uv run --no-sync python -m pip install --force-reinstall dist/*.whl
           if [[ "${{ matrix.python-version }}" == *t ]]; then export PYTHON_GIL=0; fi
-          uv run --no-sync python -c "import asyncio, pyarrow as pa; asyncio.set_event_loop(asyncio.new_event_loop()); from discord.ext import songbird; from discord.ext.songbird import player; assert not hasattr(songbird, 'SupportedCodec'); player.AudioInput(pa.array([1, 2, 3], type=pa.uint8())); player.RawPCMInput(pa.array([0.0, 0.0], type=pa.float32()), sample_rate=48000, channels=2); player.StreamInput(asyncio.StreamReader())"
+          uv run --no-sync python -c "import asyncio, pyarrow as pa; asyncio.set_event_loop(asyncio.new_event_loop()); from discord.ext import songbird; from discord.ext.songbird import player; assert not hasattr(songbird, 'SupportedCodec'); player.AudioInput(pa.array([1, 2, 3], type=pa.uint8())); player.RawPCMInput(pa.array([0.0, 0.0], type=pa.float32()), sample_rate=48000, channels=2); player.StreamInput(asyncio.StreamReader()); player.OpusPacketInput(pa.array([b'\xf8\xff\xfe'], type=pa.binary())); player.OpusPacketStreamInput(max_packets=1); assert 'opus' in player.supported_codecs()"
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -278,7 +278,7 @@ jobs:
         run: |
           uv run --no-sync python -m pip install --force-reinstall dist/*.whl
           if [[ "${{ matrix.python-version }}" == *t ]]; then export PYTHON_GIL=0; fi
-          uv run --no-sync python -c "import asyncio, pyarrow as pa; asyncio.set_event_loop(asyncio.new_event_loop()); from discord.ext import songbird; from discord.ext.songbird import player; assert not hasattr(songbird, 'SupportedCodec'); player.AudioInput(pa.array([1, 2, 3], type=pa.uint8())); player.RawPCMInput(pa.array([0.0, 0.0], type=pa.float32()), sample_rate=48000, channels=2); player.StreamInput(asyncio.StreamReader())"
+          uv run --no-sync python -c "import asyncio, pyarrow as pa; asyncio.set_event_loop(asyncio.new_event_loop()); from discord.ext import songbird; from discord.ext.songbird import player; assert not hasattr(songbird, 'SupportedCodec'); player.AudioInput(pa.array([1, 2, 3], type=pa.uint8())); player.RawPCMInput(pa.array([0.0, 0.0], type=pa.float32()), sample_rate=48000, channels=2); player.StreamInput(asyncio.StreamReader()); player.OpusPacketInput(pa.array([b'\xf8\xff\xfe'], type=pa.binary())); player.OpusPacketStreamInput(max_packets=1); assert 'opus' in player.supported_codecs()"
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -308,6 +308,9 @@ jobs:
       - name: Test sdist
         run: |
           uv run --no-sync python -m pip install dist/*.tar.gz
+      - name: Test sdist minimal codec build
+        run: |
+          uv run --no-sync python -m pip install --force-reinstall dist/*.tar.gz --config-settings="maturin.build-args=--no-default-features --features codec-minimal"
       - name: Upload sdist
         uses: actions/upload-artifact@v4
         with:

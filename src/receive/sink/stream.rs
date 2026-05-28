@@ -1,10 +1,11 @@
-use crate::model::{ArrowArray, Generic, PyAsyncIterator, PyFuture};
+use crate::model::{ArrowArray, ArrowRecordBatch, Generic, PyAsyncIterator, PyFuture};
+use crate::receive::identity::VoiceIdentityBinding;
 use crate::receive::sink::SinkBase;
-use crate::receive::tick::{VoiceKey, VoiceTick};
+use crate::receive::tick::{VoiceKey, VoiceTickBatch};
 use arrow::array::Int16Array;
 use async_trait::async_trait;
-use dashmap::DashMap;
 use futures::StreamExt;
+use pyo3::exceptions::PyValueError;
 use pyo3::{Bound, IntoPyObjectExt, PyAny, PyRef, PyRefMut, PyResult, Python, pyclass, pymethods};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -22,7 +23,8 @@ use tokio_stream::wrappers::BroadcastStream;
 /// Streaming sink for received voice data.
 ///
 /// Unlike `BufferSink`, this sink exposes a stream interface backed by a
-/// broadcast channel and supports concurrent consumers via permits.
+/// broadcast channel and supports concurrent consumers via permits. Stream
+/// iteration yields Arrow record batches.
 ///
 /// Examples
 /// --------
@@ -35,13 +37,12 @@ use tokio_stream::wrappers::BroadcastStream;
 /// vc.listen(sink)
 ///
 /// async with sink.stream() as stream:
-///     async for tick in stream:
+///     async for batch in stream:
 ///         ...
 /// ```
-#[allow(unused)]
 pub struct StreamSink {
-    rx: broadcast::Receiver<Option<VoiceTick>>,
-    weak_tx: broadcast::WeakSender<Option<VoiceTick>>,
+    _rx: broadcast::Receiver<Arc<VoiceTickBatch>>,
+    weak_tx: broadcast::WeakSender<Arc<VoiceTickBatch>>,
     sem: Arc<Semaphore>,
 }
 
@@ -57,36 +58,26 @@ pub struct StreamSink {
 pub struct PyStream {
     acquire: Option<OwnedSemaphorePermit>,
     sem: Arc<Semaphore>,
-    weak_tx: broadcast::WeakSender<Option<VoiceTick>>,
+    weak_tx: broadcast::WeakSender<Arc<VoiceTickBatch>>,
 }
 
 pub struct StreamSinkHandler {
-    tx: broadcast::Sender<Option<VoiceTick>>,
+    tx: broadcast::Sender<Arc<VoiceTickBatch>>,
     max_concurrent: usize,
     retain: bool,
     sem: Arc<Semaphore>,
-    ssrc_map: DashMap<u32, u64>,
+    identity: Arc<VoiceIdentityBinding>,
 }
 
 #[async_trait]
 impl EventHandler for StreamSinkHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         match ctx {
-            EventContext::SpeakingStateUpdate(speaking) => {
-                if let Some(user_id) = speaking.user_id {
-                    self.ssrc_map.insert(speaking.ssrc, user_id.0);
-                }
-            }
-            EventContext::VoiceTick(tick) => {
-                if self.sem.available_permits() < self.max_concurrent || self.retain {
-                    let tick = VoiceTick::from_parts(tick, &self.ssrc_map);
-                    drop(self.tx.send(Some(tick)))
-                } else {
-                    drop(self.tx.send(None))
-                }
-            }
-            EventContext::ClientDisconnect(disconnect) => {
-                self.ssrc_map.retain(|_, v| !disconnect.user_id.0.eq(v));
+            EventContext::VoiceTick(tick)
+                if self.sem.available_permits() < self.max_concurrent || self.retain =>
+            {
+                let tick = VoiceTickBatch::from_parts(tick, &*self.identity);
+                drop(self.tx.send(tick))
             }
             _ => {}
         }
@@ -109,18 +100,38 @@ impl StreamSink {
     /// retain_secs : int, optional
     ///     Retention window in seconds for the broadcast buffer.
     ///     Internally converted to a tick count based on 20 ms per tick (50 ticks/sec).
+    ///     Must be greater than zero.
     /// max_concurrent : int, optional
     ///     Maximum number of concurrent streams.
+    ///     Must be greater than zero.
     ///
     /// Returns
     /// -------
     /// StreamSink
-    fn new(retain: bool, retain_secs: usize, max_concurrent: usize) -> (StreamSink, SinkBase) {
-        let (tx, rx) = broadcast::channel(retain_secs * 50);
+    fn new(
+        retain: bool,
+        retain_secs: usize,
+        max_concurrent: usize,
+    ) -> PyResult<(StreamSink, SinkBase)> {
+        if retain_secs == 0 {
+            return Err(PyValueError::new_err(
+                "retain_secs must be greater than zero",
+            ));
+        }
+        if max_concurrent == 0 {
+            return Err(PyValueError::new_err(
+                "max_concurrent must be greater than zero",
+            ));
+        }
+        let retain_ticks = retain_secs
+            .checked_mul(50)
+            .ok_or_else(|| PyValueError::new_err("retain_secs is too large"))?;
+        let (tx, rx) = broadcast::channel(retain_ticks);
         let sem = Arc::new(Semaphore::new(max_concurrent));
-        (
+        let identity = Arc::new(VoiceIdentityBinding::default());
+        Ok((
             StreamSink {
-                rx,
+                _rx: rx,
                 sem: sem.clone(),
                 weak_tx: tx.downgrade(),
             },
@@ -130,17 +141,14 @@ impl StreamSink {
                     max_concurrent,
                     retain,
                     sem,
-                    ssrc_map: Default::default(),
+                    identity: identity.clone(),
                 }),
-                receive_events: vec![
-                    Event::Core(CoreEvent::VoiceTick),
-                    Event::Core(CoreEvent::SpeakingStateUpdate),
-                    Event::Core(CoreEvent::ClientDisconnect),
-                ]
-                .into_iter()
-                .collect(),
+                identity,
+                receive_events: vec![Event::Core(CoreEvent::VoiceTick)]
+                    .into_iter()
+                    .collect(),
             },
-        )
+        ))
     }
 
     /// Create an async stream handle.
@@ -155,7 +163,7 @@ impl StreamSink {
     /// --------
     /// ```python
     /// async with sink.stream() as stream:
-    ///     async for tick in stream:
+    ///     async for batch in stream:
     ///         ...
     /// ```
     fn stream(&self) -> PyResult<PyStream> {
@@ -203,17 +211,21 @@ impl PyStream {
         fut.map(|x| x.into())
     }
 
-    /// Return an async iterator over `VoiceTick` entries.
+    /// Return an async iterator over Arrow record batches.
     ///
     /// Returns
     /// -------
-    /// PyAsyncIterator[VoiceTick]
-    fn __aiter__<'py>(slf: PyRef<'py, Self>) -> PyResult<Generic<'py, PyAsyncIterator, VoiceTick>> {
+    /// PyAsyncIterator[pyarrow.RecordBatch]
+    fn __aiter__<'py>(
+        slf: PyRef<'py, Self>,
+    ) -> PyResult<Generic<'py, PyAsyncIterator, ArrowRecordBatch<'py>>> {
         let tx = slf.try_tx()?;
         let rx = tx.subscribe();
-        let stream = BroadcastStream::new(rx).filter_map(|r| async move { r.ok().flatten() });
+        let stream = BroadcastStream::new(rx)
+            .filter_map(|r| async move { r.ok() })
+            .map(|r| Python::attach(|py| r.to_record_batch(py).and_then(|x| x.into_py_any(py))));
 
-        Ok(Generic::new(PyAsyncIterator::new(stream)))
+        Ok(Generic::new(PyAsyncIterator::new_in_raw(stream)))
     }
 
     /// Exit the async context and release the stream permit.
@@ -257,7 +269,7 @@ impl PyStream {
         let tx = self.try_tx()?;
         let rx = tx.subscribe();
         let stream = BroadcastStream::new(rx)
-            .filter_map(|r| async move { r.ok().flatten() })
+            .filter_map(|r| async move { r.ok() })
             .map(move |r| {
                 Python::attach(|py| {
                     let k = r.get(py, &key);
@@ -270,7 +282,7 @@ impl PyStream {
 }
 
 impl PyStream {
-    fn try_tx(&self) -> PyResult<broadcast::Sender<Option<VoiceTick>>> {
+    fn try_tx(&self) -> PyResult<broadcast::Sender<Arc<VoiceTickBatch>>> {
         if self.acquire.is_none() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "StreamSink has been closed",

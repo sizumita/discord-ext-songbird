@@ -1,10 +1,11 @@
-use crate::model::{ArrowArray, Generic, PyAsyncIterator};
+use crate::model::{ArrowArray, ArrowRecordBatch, Generic, PyAsyncIterator};
+use crate::receive::identity::VoiceIdentityBinding;
 use crate::receive::sink::SinkBase;
-use crate::receive::tick::{VoiceKey, VoiceTick};
+use crate::receive::tick::{VoiceKey, VoiceTickBatch};
 use arrow::array::Int16Array;
 use async_stream::stream;
 use async_trait::async_trait;
-use dashmap::DashMap;
+use pyo3::exceptions::PyValueError;
 use pyo3::{IntoPyObjectExt, PyRef, PyResult, Python, pyclass, pymethods};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::{CoreEvent, Event, EventContext, EventHandler};
@@ -15,8 +16,8 @@ use tokio::sync::Mutex;
 
 pub struct BufferSinkHandler {
     is_stopped: Arc<AtomicBool>,
-    ssrc_map: DashMap<u32, u64>,
-    ticks: Arc<Mutex<VecDeque<VoiceTick>>>,
+    identity: Arc<VoiceIdentityBinding>,
+    ticks: Arc<Mutex<VecDeque<Arc<VoiceTickBatch>>>>,
     max_ticks: Option<usize>,
     drop_oldest: bool,
 }
@@ -29,7 +30,7 @@ pub struct BufferSinkHandler {
 )]
 /// Buffering sink for received voice data.
 ///
-/// Collects `VoiceTick` snapshots and exposes them via async iteration.
+/// Collects columnar Arrow record batches and exposes them via async iteration.
 ///
 /// Examples
 /// --------
@@ -41,26 +42,25 @@ pub struct BufferSinkHandler {
 /// sink = receive.BufferSink(max_duration_secs=5)
 /// vc.listen(sink)
 ///
-/// async for tick in sink:
-///     pcm = tick.get(receive.VoiceKey.User(user_id))
-///     if pcm is not None:
-///         handle_pcm(pcm)
+/// async for batch in sink:
+///     handle_batch(batch)
 /// ```
 pub struct BufferSink {
     is_stopped: Arc<AtomicBool>,
-    ticks: Arc<Mutex<VecDeque<VoiceTick>>>,
+    ticks: Arc<Mutex<VecDeque<Arc<VoiceTickBatch>>>>,
 }
 
 impl BufferSinkHandler {
     pub fn new(
-        ticks: Arc<Mutex<VecDeque<VoiceTick>>>,
+        ticks: Arc<Mutex<VecDeque<Arc<VoiceTickBatch>>>>,
         is_stopped: Arc<AtomicBool>,
+        identity: Arc<VoiceIdentityBinding>,
         max_ticks: Option<usize>,
         drop_oldest: bool,
     ) -> Self {
         Self {
             is_stopped,
-            ssrc_map: DashMap::new(),
+            identity,
             ticks,
             max_ticks,
             drop_oldest,
@@ -74,30 +74,19 @@ impl EventHandler for BufferSinkHandler {
         if self.is_stopped.load(Ordering::Relaxed) {
             return None;
         }
-        match ctx {
-            EventContext::SpeakingStateUpdate(speaking) => {
-                if let Some(user_id) = speaking.user_id {
-                    self.ssrc_map.insert(speaking.ssrc, user_id.0);
-                }
-            }
-            EventContext::VoiceTick(tick) => {
-                let mut guard = self.ticks.lock().await;
-                if let Some(max_ticks) = self.max_ticks {
-                    if self.drop_oldest {
-                        while guard.len() >= max_ticks {
-                            guard.pop_front();
-                        }
-                    } else if guard.len() >= max_ticks {
-                        return None;
+        if let EventContext::VoiceTick(tick) = ctx {
+            let mut guard = self.ticks.lock().await;
+            if let Some(max_ticks) = self.max_ticks {
+                if self.drop_oldest {
+                    while guard.len() >= max_ticks {
+                        guard.pop_front();
                     }
+                } else if guard.len() >= max_ticks {
+                    return None;
                 }
-                let tick = VoiceTick::from_parts(tick, &self.ssrc_map);
-                guard.push_back(tick);
             }
-            EventContext::ClientDisconnect(disconnect) => {
-                self.ssrc_map.retain(|_, v| !disconnect.user_id.0.eq(v));
-            }
-            _ => {}
+            let tick = VoiceTickBatch::from_parts(tick, &*self.identity);
+            guard.push_back(tick);
         }
         None
     }
@@ -123,31 +112,46 @@ impl BufferSink {
     /// -----
     /// Internally converted to a tick count based on 20 ms per tick (50 ticks/sec).
     /// Parameters are keyword-only.
+    /// `max_duration_secs=0` is invalid.
     ///
     /// Returns
     /// -------
     /// BufferSink
     fn new(max_duration_secs: Option<usize>, drop_oldest: bool) -> PyResult<(Self, SinkBase)> {
         let is_stopped = Arc::new(AtomicBool::new(false));
-        let max_ticks = max_duration_secs.map(|secs| secs * 50);
+        let max_ticks = match max_duration_secs {
+            Some(0) => {
+                return Err(PyValueError::new_err(
+                    "max_duration_secs must be greater than zero",
+                ));
+            }
+            Some(secs) => Some(
+                secs.checked_mul(50)
+                    .ok_or_else(|| PyValueError::new_err("max_duration_secs is too large"))?,
+            ),
+            None => None,
+        };
+        let identity = Arc::new(VoiceIdentityBinding::default());
         let ticks = Arc::new(Mutex::new(if let Some(max) = max_ticks {
             VecDeque::with_capacity(max)
         } else {
             VecDeque::new()
         }));
-        let handler =
-            BufferSinkHandler::new(ticks.clone(), is_stopped.clone(), max_ticks, drop_oldest);
+        let handler = BufferSinkHandler::new(
+            ticks.clone(),
+            is_stopped.clone(),
+            identity.clone(),
+            max_ticks,
+            drop_oldest,
+        );
         Ok((
             Self { is_stopped, ticks },
             SinkBase::new(
                 Arc::new(handler),
-                vec![
-                    Event::Core(CoreEvent::VoiceTick),
-                    Event::Core(CoreEvent::SpeakingStateUpdate),
-                    Event::Core(CoreEvent::ClientDisconnect),
-                ]
-                .into_iter()
-                .collect(),
+                identity,
+                vec![Event::Core(CoreEvent::VoiceTick)]
+                    .into_iter()
+                    .collect(),
             )?,
         ))
     }
@@ -191,52 +195,52 @@ impl BufferSink {
         let ticks = self.ticks.clone();
         let s = stream! {
             loop {
-                let tick = {
+                let Some(tick) = ({
                     let mut guard = ticks.lock().await;
-                    if let Some(tick) = guard.pop_front() {
-                        Python::attach(|py| {
-                            let k = tick.get(py, &key);
-                            k.and_then(|x| x.into_py_any(py))
-                        })
-                    } else {
-                        drop(guard);
-                        break;
-                    }
+                    guard.pop_front()
+                }) else {
+                    break;
                 };
+                let tick = Python::attach(|py| {
+                    let k = tick.get(py, &key);
+                    k.and_then(|x| x.into_py_any(py))
+                });
                 yield tick;
             }
         };
         Ok(Generic::new(PyAsyncIterator::new_in_raw(s)))
     }
 
-    /// Return an async iterator over buffered `VoiceTick` entries.
+    /// Return an async iterator over buffered Arrow record batches.
     ///
     /// Returns
     /// -------
-    /// PyAsyncIterator[VoiceTick]
+    /// PyAsyncIterator[pyarrow.RecordBatch]
     ///
     /// Examples
     /// --------
     /// ```python
-    /// async for tick in sink:
+    /// async for batch in sink:
     ///     ...
     /// ```
-    fn __aiter__<'py>(slf: PyRef<'py, Self>) -> Generic<'py, PyAsyncIterator, VoiceTick> {
+    fn __aiter__<'py>(
+        slf: PyRef<'py, Self>,
+    ) -> Generic<'py, PyAsyncIterator, ArrowRecordBatch<'py>> {
         let ticks = slf.ticks.clone();
         let s = stream! {
             loop {
-                let tick = {
+                let Some(tick) = ({
                     let mut guard = ticks.lock().await;
-                    if let Some(tick) = guard.pop_front() {
-                        tick
-                    } else {
-                        drop(guard);
-                        break;
-                    }
+                    guard.pop_front()
+                }) else {
+                    break;
                 };
+                let tick = Python::attach(|py| {
+                    tick.to_record_batch(py).and_then(|x| x.into_py_any(py))
+                });
                 yield tick;
             }
         };
-        Generic::new(PyAsyncIterator::new(s))
+        Generic::new(PyAsyncIterator::new_in_raw(s))
     }
 }

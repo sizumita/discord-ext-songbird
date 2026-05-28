@@ -1,8 +1,10 @@
 mod handler;
+mod identity;
 pub mod sink;
 pub(crate) mod tick;
 
 pub use handler::HandlerWrapper;
+pub(crate) use identity::{VoiceIdentityMap, VoiceIdentityTracker};
 
 pyo3_stub_gen::module_doc!(
     "discord.ext.songbird.native.receive",
@@ -15,13 +17,13 @@ connections. The primary entry point is `BufferSink`.
 Classes
 -------
 BufferSink
-    Buffering sink that yields `VoiceTick` snapshots.
+    Buffering sink that yields Arrow `RecordBatch` snapshots.
 StreamSink
-    Streaming sink that yields `VoiceTick` snapshots.
+    Streaming sink that yields Arrow `RecordBatch` snapshots.
 Stream
     Async stream handle returned by `StreamSink.stream()`.
 VoiceTick
-    Per-tick snapshot of speaking and silent sources.
+    Compatibility wrapper for per-tick helpers.
 VoiceKey
     Identifier for a voice source (user ID or SSRC).
 SinkBase
@@ -37,15 +39,14 @@ vc = await channel.connect(cls=songbird.SongbirdClient)
 sink = receive.BufferSink(max_duration_secs=5)
 vc.listen(sink)
 
-async for tick in sink:
-    pcm = tick.get(receive.VoiceKey.User(user_id))
-    if pcm is not None:
-        handle_pcm(pcm)
+async for batch in sink:
+    handle_batch(batch)
 ```
 
 Notes
 -----
-PCM is returned as `pyarrow.Int16Array`. Use `VoiceTick.is_silent()` to
-distinguish silent from missing keys.
+Receive iterators return `pyarrow.RecordBatch` values with `key_kind`,
+`key_id`, `speaking`, and `pcm` columns. Per-key convenience iterators still
+return `pyarrow.Int16Array | None`.
 "#,
 );

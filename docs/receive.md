@@ -1,14 +1,15 @@
 # Receive (Voice Input)
 
-This document describes the **current** voice receive API in `discord-ext-songbird`.
-The public Python surface is re-exported from `discord.ext.songbird.receive`, which is backed by the
-native module `discord.ext.songbird.native.receive`.
+This document describes the voice receive API in `discord-ext-songbird`.
+The public Python surface is re-exported from `discord.ext.songbird.receive`,
+which is backed by the native module `discord.ext.songbird.native.receive`.
 
 ## Overview
 
-- Voice receive is done by registering a **sink** with `SongbirdClient.listen()`.
+- Voice receive is done by registering a sink with `SongbirdClient.listen()`.
 - Two sinks are available from Python: `BufferSink` and `StreamSink`.
-- Incoming audio is buffered as **VoiceTick** snapshots and consumed with `async for`.
+- Incoming audio is exposed as Arrow `RecordBatch` snapshots and consumed with `async for`.
+- Per-key convenience iterators are still available when only one source is needed.
 
 ## Quick Start
 
@@ -28,21 +29,27 @@ vc.listen(sink)  # non-async
 await asyncio.sleep(5)
 sink.stop()
 
-async for tick in sink:
-    key = receive.VoiceKey.User(user_id)
-    pcm = tick.get(key)
+async for batch in sink:
+    # batch is a pyarrow.RecordBatch
+    # columns: key_kind, key_id, speaking, pcm
+    handle_batch(batch)
+```
+
+For single-source consumers:
+
+```python
+key = receive.VoiceKey.User(user_id)
+async for pcm in sink[key]:
     if pcm is not None:
-        # pcm is a pyarrow.Int16Array (16-bit PCM)
+        # pcm is a pyarrow.Int16Array slice backed by the tick's shared PCM buffer
         handle_pcm(pcm)
-    elif tick.is_silent(key):
-        # key was present but silent for this tick
-        pass
 ```
 
 ## StreamSink (Streaming)
 
-`StreamSink` provides a stream-based API using a broadcast channel. Unlike `BufferSink`,
-it is designed for concurrent consumers and supports retaining ticks when no streams are active.
+`StreamSink` provides a stream-based API using a broadcast channel. It supports
+concurrent consumers via permits and can optionally retain recent ticks when no
+streams are active.
 
 ```python
 from discord.ext import songbird
@@ -53,41 +60,58 @@ sink = receive.StreamSink(retain=True, retain_secs=15, max_concurrent=50)
 vc.listen(sink)
 
 async with sink.stream() as stream:
-    async for tick in stream:
-        pcm = tick.get(receive.VoiceKey.User(user_id))
-        if pcm is not None:
-            handle_pcm(pcm)
+    async for batch in stream:
+        handle_batch(batch)
 ```
+
+## Arrow Batch Schema
+
+Each receive tick is represented as one Arrow `RecordBatch`:
+
+| column | type | meaning |
+| --- | --- | --- |
+| `key_kind` | `uint8` | `0` for user IDs, `1` for unknown SSRCs |
+| `key_id` | `uint64` | Discord user ID or SSRC value |
+| `speaking` | `bool` | `True` when this row has PCM for the tick |
+| `pcm` | `list<int16>` | Interleaved 16-bit PCM samples; silent rows use an empty list |
+
+This keeps all PCM for a tick in a single Arrow values buffer. The per-key
+helpers return zero-copy slices from that shared buffer where possible.
 
 ## How It Works (Technical)
 
-At runtime, Songbird emits voice events (e.g., `VoiceTick`, `SpeakingStateUpdate`) from the voice
-driver. The receive layer attaches a sink-specific event handler and converts raw tick data into
-Python-facing structures.
+At runtime, Songbird emits voice events from the voice driver. The receive layer
+maintains a connection-level SSRC to user ID map and converts raw tick data into
+a compact columnar Arrow batch.
 
 Key points:
 
-- **Tick cadence**: one tick represents ~20 ms of audio (≈ 50 ticks/sec).
-- **Source mapping**: `SpeakingStateUpdate` is used to map SSRC → user ID.
-- **Tick conversion**:
-  - speaking entries with `decoded_voice` are converted to `pyarrow.Int16Array` PCM
-  - entries without `decoded_voice` (or in the silent list) are marked silent
-- **Delivery**:
-  - `BufferSink` stores `VoiceTick` in a queue and is consumed destructively
-  - `StreamSink` pushes `VoiceTick` through a broadcast channel for concurrent consumers
+- One tick represents about 20 ms of audio, or roughly 50 ticks/sec.
+- `SpeakingStateUpdate` maps SSRC values to Discord user IDs at the voice
+  connection level, so later sinks can reuse mappings observed before `listen()`.
+- Entries with `decoded_voice` append their PCM into the shared `pcm` values buffer.
+- Entries without `decoded_voice`, and SSRCs in the silent set, become silent rows.
+- `BufferSink` stores batches in a queue and is consumed destructively.
+- `StreamSink` broadcasts `Arc`-shared batches for concurrent consumers.
 
-### Data Flow (Simplified)
+### Data Flow
 
-```
+```text
 Discord Voice -> Songbird driver
                      |
                      v
-      SpeakingStateUpdate / VoiceTick events
+      SpeakingStateUpdate / ClientDisconnect
+                     |
+                     v
+        Connection VoiceIdentityMap
+                     |
+                     v
+             VoiceTick events
                      |
                      v
             Receive Sink Handler
-            - SSRC → User ID map
-            - Build VoiceTick
+            - Build VoiceTickBatch
+            - Canonical Arrow RecordBatch
                      |
          +-----------+-----------+
          |                       |
@@ -96,72 +120,32 @@ Discord Voice -> Songbird driver
    (VecDeque queue)     (broadcast channel)
          |                       |
          v                       v
-   async for tick          async with stream
-   async for pcm           async for tick/pcm
+   async for batch        async with stream
+   async for pcm          async for batch/pcm
 ```
-
-## Data Model
-
-### VoiceKey
-
-Identifies the source of audio.
-
-- `VoiceKey.User(user_id)` for known user IDs
-- `VoiceKey.Unknown(ssrc)` when only SSRC is known
-
-### VoiceTick
-
-A snapshot for a single tick.
-
-- `VoiceTick.get(key)` → `Optional[pyarrow.Int16Array]`
-  - Returns PCM only when the key is speaking in this tick.
-  - Returns `None` if the key is silent or not present in this tick.
-- `VoiceTick.is_silent(key)` → `bool`
-  - `True` if the key is marked silent in this tick.
-- `VoiceTick.all_keys()` → `set[VoiceKey]`
-  - All keys present in this tick (speaking + silent).
-- `VoiceTick.speaking_keys()` → `set[VoiceKey]`
-  - Keys with PCM data in this tick.
-- `VoiceTick.silent_keys()` → `set[VoiceKey]`
-  - Keys marked silent in this tick.
 
 ## BufferSink Behavior
 
-`BufferSink` accumulates `VoiceTick` entries in an internal queue.
+`BufferSink` accumulates Arrow `RecordBatch` entries in an internal queue.
 
-- **Register**: `vc.listen(sink)` subscribes to Songbird `VoiceTick` and `SpeakingStateUpdate` events.
-- **Stop**: `sink.stop()` stops further buffering (the sink remains registered).
-- **Consume**:
-  - `async for tick in sink:` yields `VoiceTick` entries.
-  - `async for pcm in sink[VoiceKey.User(user_id)]:` yields `pyarrow.Int16Array | None` for a specific key.
-- **Consumption is destructive**: ticks are popped from the queue and cannot be read again.
-- **No waiting**: iteration ends when the queue is empty; it does not block for new ticks.
-- **Buffer limit**:
-  - `max_duration_secs` caps the buffer window in seconds (keyword-only).
-  - `drop_oldest` is keyword-only.
-  - `drop_oldest` controls whether old ticks are discarded when full.
-  - Implementation detail: it is converted to a tick count based on **20 ms per tick** (50 ticks/sec),
-    so the initial capacity is `max_duration_secs * 50`.
+- `vc.listen(sink)` subscribes to Songbird receive events.
+- `sink.stop()` stops further buffering; it does not unregister the sink.
+- `async for batch in sink:` yields `pyarrow.RecordBatch` snapshots.
+- `async for pcm in sink[VoiceKey.User(user_id)]:` yields `pyarrow.Int16Array | None`.
+- Consumption is destructive: entries are popped from the queue and cannot be read again.
+- Iteration ends when the queue is empty; it does not wait for new ticks.
+- `max_duration_secs` caps the buffer window and must be greater than zero when set.
+- `drop_oldest` controls whether old ticks are discarded when full.
 
 ## StreamSink Behavior
 
-`StreamSink` pushes ticks through a broadcast channel and is consumed via a stream handle.
+`StreamSink` pushes Arrow `RecordBatch` entries through a broadcast channel.
 
-- **Register**: `vc.listen(sink)` subscribes to `VoiceTick` and `SpeakingStateUpdate` (and disconnect) events.
-- **Stream handle**: `async with sink.stream()` acquires a permit for one consumer.
-- **Concurrency**: `max_concurrent` limits simultaneous stream handles.
-- **Retention**:
-  - `retain=False` drops ticks when no streams are active (default).
-  - `retain=True` keeps ticks in the broadcast buffer (up to `retain_secs`).
-  - Implementation detail: the buffer size is `retain_secs * 50` ticks (20 ms per tick).
-
-### Receive Processing (High-Level)
-
-- `SpeakingStateUpdate` events populate the SSRC → User ID map.
-- On each `VoiceTick`:
-  - Entries with `decoded_voice` become **speaking** PCM data.
-  - Entries without `decoded_voice` are marked **silent** (no PCM stored).
-  - SSRCs in the `silent` list are also marked **silent**.
+- `async with sink.stream()` acquires a permit for one consumer.
+- `max_concurrent` limits simultaneous stream handles and must be greater than zero.
+- `retain_secs` controls broadcast buffer capacity and must be greater than zero.
+- `retain=False` drops ticks when no streams are active.
+- `retain=True` keeps ticks in the broadcast buffer up to `retain_secs`.
 
 ## API Surface (Excerpt)
 
@@ -174,14 +158,20 @@ sink.stop() -> None
 
 vc.listen(sink) -> None  # SongbirdClient
 
-async for tick in sink: ...
+async for batch in sink: ...
 async for pcm in sink[receive.VoiceKey.User(user_id)]: ...
-async with stream_sink.stream() as stream: ...
+async with stream_sink.stream() as stream:
+    async for batch in stream: ...
 ```
 
 ## Limitations & Notes
 
-- **Custom Python sinks are not supported**: `SinkBase` is exposed but cannot be subclassed from Python today.
-- **Distinguish silent vs missing**: use `is_silent()`; `get()` alone cannot tell them apart.
-- **Unbounded buffering**: omit `max_duration_secs` only if you can tolerate growth.
-- **pyarrow dependency**: PCM is returned as `pyarrow.Int16Array`.
+- Custom Python sinks are not supported; `SinkBase` is exposed but cannot be subclassed from Python today.
+- `key_kind` values are stable: `0` is user ID, `1` is unknown SSRC.
+- `VoiceKey.Unknown(ssrc)` is used only while Songbird has not yet observed a
+  `SpeakingStateUpdate` with a user ID for that SSRC. Discord voice state data
+  does not expose SSRCs, so the receive layer does not guess from channel
+  membership.
+- Silent and missing keys are distinct in batch form: silent keys have rows with `speaking=False`; missing keys have no row.
+- Omit `max_duration_secs` only if you can tolerate unbounded buffering.
+- PCM is returned through Arrow and requires the package's Arrow dependencies.
