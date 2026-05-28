@@ -1,5 +1,6 @@
 pub(crate) mod audio;
 mod data;
+pub mod opus;
 pub mod pcm;
 pub mod stream;
 

@@ -9,11 +9,14 @@ from .native import receive as receive
 
 InputBase = player.InputBase
 AudioInput = player.AudioInput
+OpusPacketInput = player.OpusPacketInput
+OpusPacketStreamInput = player.OpusPacketStreamInput
 RawPCMInput = player.RawPCMInput
 StreamInput = player.StreamInput
 Track = player.Track
 TrackHandle = player.TrackHandle
 Queue = player.Queue
+supported_codecs = player.supported_codecs
 
 PySongbirdError = error.PySongbirdError
 PyPlayerError = error.PyPlayerError
@@ -30,6 +33,9 @@ __all__ = (
     "Track",
     "TrackHandle",
     "AudioInput",
+    "OpusPacketInput",
+    "OpusPacketStreamInput",
     "RawPCMInput",
     "StreamInput",
+    "supported_codecs",
 )

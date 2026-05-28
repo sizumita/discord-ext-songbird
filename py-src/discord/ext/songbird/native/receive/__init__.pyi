@@ -9,13 +9,13 @@ connections. The primary entry point is `BufferSink`.
 Classes
 -------
 BufferSink
-    Buffering sink that yields `VoiceTick` snapshots.
+    Buffering sink that yields Arrow `RecordBatch` snapshots.
 StreamSink
-    Streaming sink that yields `VoiceTick` snapshots.
+    Streaming sink that yields Arrow `RecordBatch` snapshots.
 Stream
     Async stream handle returned by `StreamSink.stream()`.
 VoiceTick
-    Per-tick snapshot of speaking and silent sources.
+    Compatibility wrapper for per-tick helpers.
 VoiceKey
     Identifier for a voice source (user ID or SSRC).
 SinkBase
@@ -31,16 +31,15 @@ vc = await channel.connect(cls=songbird.SongbirdClient)
 sink = receive.BufferSink(max_duration_secs=5)
 vc.listen(sink)
 
-async for tick in sink:
-    pcm = tick.get(receive.VoiceKey.User(user_id))
-    if pcm is not None:
-        handle_pcm(pcm)
+async for batch in sink:
+    handle_batch(batch)
 ```
 
 Notes
 -----
-PCM is returned as `pyarrow.Int16Array`. Use `VoiceTick.is_silent()` to
-distinguish silent from missing keys.
+Receive iterators return `pyarrow.RecordBatch` values with `key_kind`,
+`key_id`, `speaking`, and `pcm` columns. Per-key convenience iterators still
+return `pyarrow.Int16Array | None`.
 """
 
 import builtins
@@ -63,7 +62,7 @@ class BufferSink(SinkBase):
     r"""
     Buffering sink for received voice data.
 
-    Collects `VoiceTick` snapshots and exposes them via async iteration.
+    Collects columnar Arrow record batches and exposes them via async iteration.
 
     Examples
     --------
@@ -75,10 +74,8 @@ class BufferSink(SinkBase):
     sink = receive.BufferSink(max_duration_secs=5)
     vc.listen(sink)
 
-    async for tick in sink:
-        pcm = tick.get(receive.VoiceKey.User(user_id))
-        if pcm is not None:
-            handle_pcm(pcm)
+    async for batch in sink:
+        handle_batch(batch)
     ```
     """
     def __new__(
@@ -99,6 +96,7 @@ class BufferSink(SinkBase):
         -----
         Internally converted to a tick count based on 20 ms per tick (50 ticks/sec).
         Parameters are keyword-only.
+        `max_duration_secs=0` is invalid.
 
         Returns
         -------
@@ -138,18 +136,18 @@ class BufferSink(SinkBase):
                 handle_pcm(pcm)
         ```
         """
-    def __aiter__(self) -> model.PyAsyncIterator[VoiceTick]:
+    def __aiter__(self) -> model.PyAsyncIterator[pyarrow.RecordBatch]:
         r"""
-        Return an async iterator over buffered `VoiceTick` entries.
+        Return an async iterator over buffered Arrow record batches.
 
         Returns
         -------
-        PyAsyncIterator[VoiceTick]
+        PyAsyncIterator[pyarrow.RecordBatch]
 
         Examples
         --------
         ```python
-        async for tick in sink:
+        async for batch in sink:
             ...
         ```
         """
@@ -189,13 +187,13 @@ class Stream:
         -------
         Stream
         """
-    def __aiter__(self) -> model.PyAsyncIterator[VoiceTick]:
+    def __aiter__(self) -> model.PyAsyncIterator[pyarrow.RecordBatch]:
         r"""
-        Return an async iterator over `VoiceTick` entries.
+        Return an async iterator over Arrow record batches.
 
         Returns
         -------
-        PyAsyncIterator[VoiceTick]
+        PyAsyncIterator[pyarrow.RecordBatch]
         """
     def __aexit__(
         self, _exc_type: typing.Any, _exc_val: typing.Any, _exc_tb: typing.Any
@@ -236,7 +234,8 @@ class StreamSink(SinkBase):
     Streaming sink for received voice data.
 
     Unlike `BufferSink`, this sink exposes a stream interface backed by a
-    broadcast channel and supports concurrent consumers via permits.
+    broadcast channel and supports concurrent consumers via permits. Stream
+    iteration yields Arrow record batches.
 
     Examples
     --------
@@ -249,7 +248,7 @@ class StreamSink(SinkBase):
     vc.listen(sink)
 
     async with sink.stream() as stream:
-        async for tick in stream:
+        async for batch in stream:
             ...
     ```
     """
@@ -266,8 +265,10 @@ class StreamSink(SinkBase):
         retain_secs : int, optional
             Retention window in seconds for the broadcast buffer.
             Internally converted to a tick count based on 20 ms per tick (50 ticks/sec).
+            Must be greater than zero.
         max_concurrent : int, optional
             Maximum number of concurrent streams.
+            Must be greater than zero.
 
         Returns
         -------
@@ -287,7 +288,7 @@ class StreamSink(SinkBase):
         --------
         ```python
         async with sink.stream() as stream:
-            async for tick in stream:
+            async for batch in stream:
                 ...
         ```
         """
@@ -380,16 +381,12 @@ class VoiceKey:
 @typing.final
 class VoiceTick:
     r"""
-    Snapshot of received voice data for a single tick.
+    Compatibility wrapper for a received voice tick.
 
-    Examples
-    --------
-    ```python
-    key = receive.VoiceKey.User(user_id)
-    pcm = tick.get(key)
-    if pcm is None and tick.is_silent(key):
-        print(\"silent\")
-    ```
+    Notes
+    -----
+    New receive iterators yield `pyarrow.RecordBatch` objects. This class remains
+    available for Rust-side compatibility helpers.
     """
     def get(self, key: VoiceKey) -> typing.Optional[pyarrow.Int16Array]:
         r"""
@@ -404,14 +401,6 @@ class VoiceTick:
         -------
         pyarrow.Int16Array | None
             PCM when speaking, otherwise None.
-
-        Examples
-        --------
-        ```python
-        pcm = tick.get(receive.VoiceKey.User(user_id))
-        if pcm is not None:
-            handle_pcm(pcm)
-        ```
         """
     def is_silent(self, key: VoiceKey) -> builtins.bool:
         r"""
@@ -425,13 +414,6 @@ class VoiceTick:
         Returns
         -------
         bool
-
-        Examples
-        --------
-        ```python
-        if tick.is_silent(receive.VoiceKey.User(user_id)):
-            ...
-        ```
         """
     def all_keys(self) -> builtins.set[VoiceKey]:
         r"""
@@ -440,13 +422,6 @@ class VoiceTick:
         Returns
         -------
         set[VoiceKey]
-
-        Examples
-        --------
-        ```python
-        for key in tick.all_keys():
-            ...
-        ```
         """
     def speaking_keys(self) -> builtins.set[VoiceKey]:
         r"""
@@ -455,13 +430,6 @@ class VoiceTick:
         Returns
         -------
         set[VoiceKey]
-
-        Examples
-        --------
-        ```python
-        for key in tick.speaking_keys():
-            ...
-        ```
         """
     def silent_keys(self) -> builtins.set[VoiceKey]:
         r"""
@@ -470,11 +438,12 @@ class VoiceTick:
         Returns
         -------
         set[VoiceKey]
+        """
+    def record_batch(self) -> pyarrow.RecordBatch:
+        r"""
+        Return this tick as a columnar Arrow record batch.
 
-        Examples
-        --------
-        ```python
-        for key in tick.silent_keys():
-            ...
-        ```
+        Returns
+        -------
+        pyarrow.RecordBatch
         """

@@ -12,9 +12,17 @@ pub struct ArrowArray<'py, T>(Bound<'py, PyAny>, PhantomData<T>)
 where
     T: ArrayElementType;
 
+pub struct ArrowRecordBatch<'py>(Bound<'py, PyAny>);
+
 impl<'py, T: ArrayElementType> From<Bound<'py, PyAny>> for ArrowArray<'py, T> {
     fn from(value: Bound<'py, PyAny>) -> Self {
         Self(value, PhantomData)
+    }
+}
+
+impl<'py> From<Bound<'py, PyAny>> for ArrowRecordBatch<'py> {
+    fn from(value: Bound<'py, PyAny>) -> Self {
+        Self(value)
     }
 }
 
@@ -34,6 +42,19 @@ where
     }
 }
 
+impl PyStubType for ArrowRecordBatch<'_> {
+    fn type_output() -> TypeInfo {
+        let mut imports = HashSet::new();
+        imports.insert("pyarrow".into());
+        TypeInfo {
+            name: "pyarrow.RecordBatch".into(),
+            source_module: None,
+            import: imports,
+            type_refs: Default::default(),
+        }
+    }
+}
+
 impl<'py, T> IntoPyObject<'py> for ArrowArray<'py, T>
 where
     T: ArrayElementType,
@@ -41,6 +62,16 @@ where
     type Target = PyAny;
     type Output = Bound<'py, Self::Target>;
     type Error = pyo3::PyErr;
+    fn into_pyobject(self, _py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        Ok(self.0)
+    }
+}
+
+impl<'py> IntoPyObject<'py> for ArrowRecordBatch<'py> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = pyo3::PyErr;
+
     fn into_pyobject(self, _py: Python<'py>) -> Result<Self::Output, Self::Error> {
         Ok(self.0)
     }

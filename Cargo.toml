@@ -23,10 +23,32 @@ crate-type = ["cdylib", "rlib"]
 name = "stub_gen"
 doc = false
 
+[features]
+default = ["codec-full"]
+codec-full = ["symphonia/all", "codec-simd"]
+codec-minimal = ["codec-pcm", "format-wav"]
+codec-simd = ["symphonia/opt-simd"]
+codec-aac = ["symphonia/aac"]
+codec-adpcm = ["symphonia/adpcm"]
+codec-alac = ["symphonia/alac"]
+codec-flac = ["symphonia/flac"]
+codec-mp1 = ["symphonia/mp1"]
+codec-mp2 = ["symphonia/mp2"]
+codec-mp3 = ["symphonia/mp3"]
+codec-pcm = ["symphonia/pcm"]
+codec-vorbis = ["symphonia/vorbis"]
+format-aiff = ["symphonia/aiff"]
+format-caf = ["symphonia/caf"]
+format-isomp4 = ["symphonia/isomp4"]
+format-mkv = ["symphonia/mkv"]
+format-ogg = ["symphonia/ogg"]
+format-wav = ["symphonia/wav"]
+
 [dependencies]
 arrow = {version = "58.3.0"}
 log = "0.4.29"
 nonmax = "0.5.5"
+opus2 = "0.4.0"
 pyo3 = { version = "0.28.3", features = ["experimental-async"] }
 pyo3-log = "0.13.3"
 pyo3-async-runtimes = { version = "0.28.0", features = ["tokio", "tokio-runtime"] }
@@ -36,7 +58,7 @@ songbird = { version = "0.6.0", features = ["receive", "driver", "tws", "rustls"
 tokio = {version = "1.48.0", features = ["macros", "sync"]}
 async-trait = "0.1.83"
 dashmap = "6.1.0"
-symphonia = { features = ["wav", "pcm", "mp3", "opt-simd", "aac"], version = "0.5.5" }
+symphonia = { version = "0.5.5", default-features = false }
 env_logger = "0.11.8"
 tokio-stream = {version = "0.1.17", features = ["full"]}
 async-stream = "0.3.6"

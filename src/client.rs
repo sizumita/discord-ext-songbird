@@ -5,6 +5,7 @@ use crate::player::queue::PyQueue;
 use crate::player::track::PyTrack;
 use crate::receive::HandlerWrapper;
 use crate::receive::sink::SinkBase;
+use crate::receive::{VoiceIdentityMap, VoiceIdentityTracker};
 use crate::update::VoiceUpdater;
 use pyo3::prelude::PyAnyMethods;
 use pyo3::types::PyTuple;
@@ -17,7 +18,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use songbird::driver::{DecodeConfig, DecodeMode};
 use songbird::id::{ChannelId, GuildId, UserId};
 use songbird::shards::Shard;
-use songbird::{Call, Config};
+use songbird::{Call, Config, CoreEvent, Event, EventHandler};
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,6 +59,7 @@ pub struct SongbirdImpl {
     guild_id: GuildId,
     application_id: UserId,
     call: Arc<Mutex<CallWrapper>>,
+    identity_map: Arc<VoiceIdentityMap>,
     current_loop: Option<Py<PyAny>>,
 }
 
@@ -112,6 +114,7 @@ impl SongbirdImpl {
             guild_id: guild_id.into(),
             application_id: application_id.into(),
             call: Arc::new(Mutex::new(CallWrapper::new())),
+            identity_map: Arc::new(VoiceIdentityMap::default()),
             current_loop: Some(current_loop),
         })
     }
@@ -147,6 +150,7 @@ impl SongbirdImpl {
             .gateway_timeout(Some(Duration::from_secs_f32(timeout)))
             .decode_mode(DecodeMode::Decode(DecodeConfig::default()));
         let self_call = slf.call.clone();
+        let identity_map = slf.identity_map.clone();
         let guild_id = slf.guild_id;
         let channel_id = slf.channel_id;
         let application_id = slf.application_id;
@@ -164,7 +168,18 @@ impl SongbirdImpl {
         let shard = Shard::Generic(Arc::new(VoiceUpdater(slf.into_py_any(py)?.into_any())));
 
         future_into_py(py, async move {
-            let call = Call::from_config(guild_id, shard, application_id, config);
+            identity_map.clear();
+            let mut call = Call::from_config(guild_id, shard, application_id, config);
+            let identity_tracker: Arc<dyn EventHandler + Send + Sync> =
+                Arc::new(VoiceIdentityTracker::new(identity_map.clone()));
+            call.add_global_event(
+                Event::Core(CoreEvent::SpeakingStateUpdate),
+                HandlerWrapper(identity_tracker.clone()),
+            );
+            call.add_global_event(
+                Event::Core(CoreEvent::ClientDisconnect),
+                HandlerWrapper(identity_tracker),
+            );
             {
                 let mut guard = self_call.lock().await;
                 guard.set(call);
@@ -213,7 +228,9 @@ impl SongbirdImpl {
         );
         let mut guard = self.call.lock().await;
         let call = guard.get_mut()?;
-        call.leave().await.into_pyerr()
+        call.leave().await.into_pyerr()?;
+        self.identity_map.clear();
+        Ok(())
     }
 
     /// |coro|
@@ -399,6 +416,7 @@ impl SongbirdImpl {
                channel: Option<Bound<'py, PyAny>>,
     ) -> PyResult<PyFuture<'py, ()>> {
         let call = self.call.clone();
+        let identity_map = self.identity_map.clone();
         if let Some(channel) = channel {
             let id = channel.getattr("id")?.extract::<NonZeroU64>()?;
             log::debug!(
@@ -407,6 +425,7 @@ impl SongbirdImpl {
                 id
             );
             future_into_py(py, async move {
+                identity_map.clear();
                 let mut guard = call.lock().await;
                 let call = guard.get_mut()?;
                 call.join(id).await.into_pyerr()?;
@@ -422,6 +441,7 @@ impl SongbirdImpl {
                 let mut guard = call.lock().await;
                 let call = guard.get_mut()?;
                 call.leave().await.into_pyerr()?;
+                identity_map.clear();
                 Ok(())
             })
             .map(|x| x.into())
@@ -453,6 +473,7 @@ impl SongbirdImpl {
     fn listen<'py>(&self, _py: Python<'py>, sink: PyRef<'py, SinkBase>) -> PyResult<()> {
         let mut guard = self.call.blocking_lock();
         let call = guard.get_mut()?;
+        sink.bind_identity(self.identity_map.clone())?;
 
         sink.receive_events.iter().for_each(|event| {
             call.add_global_event(*event, HandlerWrapper(sink.get_subscriber()));

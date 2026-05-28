@@ -76,10 +76,15 @@ Native input types are exported from `discord.ext.songbird.player`.
 - `RawPCMInput`: `pyarrow.Float32Array` PCM input
 - `AudioInput`: encoded audio in a `pyarrow.Array`
 - `StreamInput`: `asyncio.StreamReader`
+- `OpusPacketInput`: pre-encoded 20 ms Opus frames in a `pyarrow.BinaryArray`
+- `OpusPacketStreamInput`: live pre-encoded 20 ms Opus packet stream
 
 `AudioInput` and `StreamInput` no longer take a codec argument. Songbird 0.6
 detects encoded stream formats internally, so `SupportedCodec` has been removed
 from the Python API.
+For Ogg/WebM/DCA Opus sources, Songbird may use Opus passthrough internally.
+For raw Opus packets, use `OpusPacketInput` or `OpusPacketStreamInput`.
+Passthrough requires a single active track, 20 ms Opus frames, and volume `1.0`.
 
 ```python
 import asyncio
@@ -88,6 +93,15 @@ from discord.ext.songbird import player
 buffer = asyncio.StreamReader()
 source = player.StreamInput(buffer)
 track = player.Track(source)
+```
+
+```python
+import pyarrow as pa
+from discord.ext.songbird import player
+
+frames = pa.array([opus_frame_0, opus_frame_1], type=pa.binary())
+source = player.OpusPacketInput(frames)
+track = player.Track(source)  # keep volume at 1.0 for passthrough
 ```
 
 ### Voice receive
@@ -100,13 +114,21 @@ from discord.ext.songbird import receive
 sink = receive.BufferSink(max_duration_secs=5)
 vc.listen(sink)
 
-async for tick in sink:
-    pcm = tick.get(receive.VoiceKey.User(user_id))
+async for batch in sink:
+    # batch is a pyarrow.RecordBatch with key_kind, key_id, speaking, and pcm columns
+    handle_batch(batch)
+
+async for pcm in sink[receive.VoiceKey.User(user_id)]:
     if pcm is not None:
         handle_pcm(pcm)
 ```
 
-`VoiceTick.get()` returns `pyarrow.Int16Array` (PCM).
+Receive iteration is columnar. The `pcm` column is `list<int16>` and stores all
+speaking users for a tick in one shared Arrow buffer. Per-key convenience
+iteration still returns `pyarrow.Int16Array | None`.
+SSRC to user ID mapping is tracked at the voice connection level from
+Songbird's speaking updates, so `VoiceKey.Unknown(ssrc)` is limited to packets
+seen before Discord has exposed that mapping.
 
 ## Examples
 
@@ -128,6 +150,14 @@ Published CPython wheels are split by ABI. The release workflow builds regular
 `cp314` wheels and free-threaded `cp314t` wheels for the supported platforms, so
 a normal Python 3.14 environment installs the regular wheel while Python 3.14t
 installs the free-threaded wheel.
+Published wheels are built with the full Symphonia codec/format set enabled.
+Rust codec features are compile-time options, so installed wheels cannot switch
+codec sets at runtime. For a smaller source build, pass Cargo features through
+Maturin:
+
+```bash
+pip install . --config-settings="maturin.build-args=--no-default-features --features codec-minimal"
+```
 
 ## Development
 
