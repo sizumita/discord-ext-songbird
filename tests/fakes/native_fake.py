@@ -25,7 +25,7 @@ import time
 import types
 import weakref
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 VERSION = "0.6.0"
@@ -356,11 +356,20 @@ _PCM16_CODES = {"h", "<h", "=h", "@h"}
 _F32_CODES = {"f", "<f", "=f", "@f"}
 
 
-def _buffer_bytes(data: Any, encoding: str | None, max_bytes: tuple[str, int] | None = None) -> bytes:
-    """Like the native ``extract_audio``: the size is checked against ``max_bytes`` before copying."""
+def _buffer_bytes(
+    data: Any, encoding: str | None, max_bytes: tuple[str, int] | Callable[[int], None] | None = None
+) -> bytes:
+    """Like the native ``extract_audio``/``extract_bytes``: the size is checked against ``max_bytes``
+    (``(what, max)`` → ``LimitExceeded``, or a callable raising its own error) before copying."""
+
+    def check(n: int) -> None:
+        if callable(max_bytes):
+            max_bytes(n)
+        elif max_bytes is not None:
+            _check_int(max_bytes[0], n, 0, max_bytes[1])
+
     if isinstance(data, bytes):
-        if max_bytes is not None:
-            _check_int(max_bytes[0], len(data), 0, max_bytes[1])
+        check(len(data))
         return data
     try:
         mv = memoryview(data)
@@ -375,8 +384,7 @@ def _buffer_bytes(data: Any, encoding: str | None, max_bytes: tuple[str, int] | 
         )
         if not allowed:
             raise _invalid(f"buffer format {code!r} does not match the stream encoding {encoding}")
-        if max_bytes is not None:
-            _check_int(max_bytes[0], mv.nbytes, 0, max_bytes[1])
+        check(mv.nbytes)
         return mv.tobytes()
 
 
@@ -416,9 +424,13 @@ def _opus_samples(packet: bytes) -> int | None:
     return int(frames * dur * 48)
 
 
+def _opus_size(n: int) -> None:
+    if not 1 <= n <= 1275:
+        raise _invalid(f"Opus packets must be 1..=1275 bytes (got {n})")
+
+
 def _validate_opus(packet: bytes) -> None:
-    if not 1 <= len(packet) <= 1275:
-        raise _invalid(f"Opus packets must be 1..=1275 bytes (got {len(packet)})")
+    _opus_size(len(packet))
     if _opus_samples(packet) != 960:
         raise _invalid("Opus packets must contain exactly 960 samples (20 ms at 48 kHz)")
 
@@ -954,8 +966,7 @@ class AudioFile:
 
     def __init__(self, data: Any) -> None:
         _ensure_not_forked()
-        raw = _buffer_bytes(data, None)
-        _check_int("source_bytes", len(raw), 0, 1 << 30)
+        raw = _buffer_bytes(data, None, ("source_bytes", 1 << 30))
         codec, rate, ch, dur = _probe(raw)
         self._data = raw
         self._info = (codec, rate, ch, dur)
@@ -1060,7 +1071,7 @@ class OpusPackets:
         _ensure_not_forked()
         out: list[bytes] = []
         for p in packets:
-            b = _buffer_bytes(p, None)
+            b = _buffer_bytes(p, None, _opus_size)
             _validate_opus(b)
             out.append(b)
             if len(out) > 1_000_000:
@@ -2174,12 +2185,10 @@ class EncodedSink:
         return NativeTrack(self._track)
 
     def write(self, data: Any) -> None:
-        raw = _buffer_bytes(data, None)
+        raw = _buffer_bytes(data, None, ("write_bytes", self._max))
         with self._lock:
             if self._closed or self._finished or self._conn.closing:
                 raise _errors().StreamClosed("connection_closed" if self._conn.closing else "closed")
-            if len(raw) > self._max:
-                raise _limit("write_bytes", len(raw), 0, self._max)
             if len(self._buf) + len(raw) > self._max:
                 self._wanted = len(raw)
                 raise _errors().PlaybackFull(0, 0)
@@ -2246,7 +2255,7 @@ class OpusSink:
         return NativeTrack(self._track)
 
     def send(self, packet: Any) -> None:
-        raw = _buffer_bytes(packet, None)
+        raw = _buffer_bytes(packet, None, _opus_size)
         _validate_opus(raw)
         with self._lock:
             if self._closed or self._conn.closing:

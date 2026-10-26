@@ -4,9 +4,10 @@
 //!   by a decref after the sbcore call returns. `str` is never audio (`TypeError`).
 //! * Any other buffer-protocol object must be C-contiguous and its format code must match the stream
 //!   encoding. Its size is checked against the caller's limit **before** anything is allocated
-//!   (`LimitExceeded`), then it is copied once into an owned `Vec<u8>` (`try_reserve` →
-//!   `MemoryError`), and the buffer is released **before** returning, so no `PyBuffer` ever overlaps
-//!   a Rust lock.
+//!   (`LimitExceeded`, or `InvalidAudio` where the limit is a format rule such as the 1275-byte Opus
+//!   packet), then it is copied once into an owned `Vec<u8>` (`try_reserve` → `MemoryError`), and the
+//!   buffer is released **before** returning, so no `PyBuffer` ever overlaps a Rust lock.
+//! * Every extraction takes a [`MaxBytes`]: there is no unbounded copy of a user buffer.
 //! * An `AudioChunk` carries its own format, which must equal the stream format (`InvalidAudio`).
 
 use std::ffi::CStr;
@@ -16,36 +17,63 @@ use pyo3::buffer::PyUntypedBuffer;
 use pyo3::exceptions::{PyMemoryError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use sbcore::limits::{LimitScalar, check};
+use sbcore::limits::{LimitScalar, MAX_SOURCE_BYTES, check};
+use sbcore::tx::opus_stream::{MAX_OPUS_PACKET, OPUS_PACKET_SIZE_MSG};
 use sbcore::{Encoding, Format, LimitError, LimitNum};
 
 use crate::errors::{CoreResultExt, Exc, limit_exc, msg_exc};
 use crate::py::chunk::AudioChunk;
 
-/// The largest buffer a call accepts, checked before any copy (`LimitExceeded` naming `what`).
+/// The largest buffer a call accepts, checked before any copy.
 #[derive(Clone, Copy, Debug)]
-pub struct MaxBytes {
-    pub what: &'static str,
-    pub max: u64,
+pub enum MaxBytes {
+    /// A size limit: a larger buffer raises `LimitExceeded` naming `what`.
+    Limit { what: &'static str, max: u64 },
+    /// A format rule (e.g. the 1275-byte Opus packet): a larger buffer raises `InvalidAudio(msg)`,
+    /// the same error sbcore raises for a borrowed `bytes` of that size.
+    Invalid { msg: &'static str, max: u64 },
 }
 
 impl MaxBytes {
+    /// `LimitExceeded(what)` above `max` bytes.
+    pub const fn limit(what: &'static str, max: usize) -> Self {
+        MaxBytes::Limit {
+            what,
+            max: max as u64,
+        }
+    }
+
+    /// `InvalidAudio(msg)` above `max` bytes.
+    pub const fn invalid(msg: &'static str, max: usize) -> Self {
+        MaxBytes::Invalid {
+            msg,
+            max: max as u64,
+        }
+    }
+
     fn check(self, py: Python<'_>, len: usize) -> PyResult<()> {
         let len = len as u64;
-        if len <= self.max {
-            return Ok(());
+        match self {
+            MaxBytes::Limit { max, .. } | MaxBytes::Invalid { max, .. } if len <= max => Ok(()),
+            MaxBytes::Limit { what, max } => Err(limit_exc(
+                py,
+                &LimitError {
+                    what,
+                    value: LimitNum::Int(i128::from(len)),
+                    min: LimitNum::Int(0),
+                    max: LimitNum::Int(i128::from(max)),
+                },
+            )),
+            MaxBytes::Invalid { msg, .. } => Err(msg_exc(py, Exc::InvalidAudio, msg)),
         }
-        Err(limit_exc(
-            py,
-            &LimitError {
-                what: self.what,
-                value: LimitNum::Int(i128::from(len)),
-                min: LimitNum::Int(0),
-                max: LimitNum::Int(i128::from(self.max)),
-            },
-        ))
     }
 }
+
+/// One Opus packet (`OpusSink.send`, each `OpusPackets` item): over 1275 bytes is `InvalidAudio`.
+pub const OPUS_PACKET_MAX: MaxBytes = MaxBytes::invalid(OPUS_PACKET_SIZE_MSG, MAX_OPUS_PACKET);
+
+/// An in-memory source (`AudioFile`, `RawPcm`): over 1 GiB is `LimitExceeded("source_bytes")`.
+pub const SOURCE_MAX: MaxBytes = MaxBytes::limit("source_bytes", MAX_SOURCE_BYTES);
 
 /// Audio handed to sbcore: borrowed bytes or an owned copy of a buffer.
 #[derive(Debug)]
@@ -90,11 +118,11 @@ fn format_str(f: &CStr) -> String {
 /// Copies a C-contiguous buffer into an owned `Vec<u8>` after checking its format against
 /// `encoding` and its size against `max` (both before allocating), releasing the buffer while still
 /// attached.
-pub fn copy_buffer(
+fn copy_buffer(
     py: Python<'_>,
     obj: &Bound<'_, PyAny>,
     encoding: Option<Encoding>,
-    max: Option<MaxBytes>,
+    max: MaxBytes,
 ) -> PyResult<Vec<u8>> {
     let buf = PyUntypedBuffer::get(obj)
         .map_err(|_| PyTypeError::new_err("expected bytes or a buffer-protocol object"))?;
@@ -116,9 +144,7 @@ pub fn copy_buffer(
             ));
         }
         let len = buf.len_bytes();
-        if let Some(max) = max {
-            max.check(py, len)?;
-        }
+        max.check(py, len)?;
         let mut out: Vec<u8> = Vec::new();
         out.try_reserve_exact(len)
             .map_err(|_| PyMemoryError::new_err("allocation failed"))?;
@@ -153,7 +179,7 @@ pub fn extract_audio<'a>(
             "audio must be a bytes-like object, not str",
         ));
     }
-    copy_buffer(obj.py(), obj, Some(encoding), Some(max)).map(AudioData::Owned)
+    copy_buffer(obj.py(), obj, Some(encoding), max).map(AudioData::Owned)
 }
 
 /// `InvalidAudio` if `obj` is an `AudioChunk` whose format is not `fmt` (its buffer format code
@@ -178,12 +204,15 @@ pub fn check_chunk_format(obj: &Bound<'_, PyAny>, fmt: Format) -> PyResult<()> {
     ))
 }
 
-/// Extracts raw (encoded) bytes: `bytes` (borrowed) or a C-contiguous byte buffer (copied).
-pub fn extract_bytes<'a>(obj: &'a Bound<'_, PyAny>) -> PyResult<AudioData<'a>> {
+/// Extracts raw (encoded) bytes: `bytes` (borrowed) or a C-contiguous byte buffer (copied). Either
+/// is size-checked against `max` first, so an oversized buffer is never copied.
+pub fn extract_bytes<'a>(obj: &'a Bound<'_, PyAny>, max: MaxBytes) -> PyResult<AudioData<'a>> {
     if let Ok(b) = obj.cast::<PyBytes>() {
-        return Ok(AudioData::Bytes(b.as_bytes()));
+        let b = b.as_bytes();
+        max.check(obj.py(), b.len())?;
+        return Ok(AudioData::Bytes(b));
     }
-    copy_buffer(obj.py(), obj, None, None).map(AudioData::Owned)
+    copy_buffer(obj.py(), obj, None, max).map(AudioData::Owned)
 }
 
 /// A Python integer argument checked against `range` **before** narrowing to `T`, so an out-of-range

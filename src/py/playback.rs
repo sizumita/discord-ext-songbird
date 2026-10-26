@@ -19,7 +19,9 @@ use sbcore::tx::queue::{
 };
 use sbcore::tx::{CloseMode, LiveSource, PcmProvider};
 
-use crate::convert::{MaxBytes, check_chunk_format, extract_audio, extract_bytes, int_arg};
+use crate::convert::{
+    MaxBytes, OPUS_PACKET_MAX, check_chunk_format, extract_audio, extract_bytes, int_arg,
+};
 use crate::errors::{CoreResultExt, ensure_not_forked};
 use crate::py::tracks::NativeTrack;
 
@@ -114,7 +116,7 @@ impl Playback {
         ensure_not_forked(py)?;
         let fmt = PcmProvider::format(&*self.q);
         check_chunk_format(data, fmt)?;
-        let max = MaxBytes {
+        let max = MaxBytes::Limit {
             what: "write_bytes",
             max: self.q.max_write_bytes(),
         };
@@ -331,7 +333,9 @@ impl EncodedSink {
         data: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         ensure_not_forked(py)?;
-        let bytes = extract_bytes(data)?;
+        // Checked against the ring before a non-`bytes` buffer is copied (§7.3).
+        let max = MaxBytes::limit("write_bytes", self.enc.max_write_bytes());
+        let bytes = extract_bytes(data, max)?;
         self.enc.write(bytes.bytes()).py(py)
     }
 
@@ -415,7 +419,7 @@ impl OpusSink {
         packet: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         ensure_not_forked(py)?;
-        let bytes = extract_bytes(packet)?;
+        let bytes = extract_bytes(packet, OPUS_PACKET_MAX)?;
         self.q.send(bytes.bytes()).py(py)
     }
 

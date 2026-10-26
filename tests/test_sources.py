@@ -313,6 +313,55 @@ async def test_encoded_stream_plumbing(connected_vc: HarnessClient) -> None:
         stream.write_nowait(b"x")
 
 
+class _RecordingSink:
+    """Forwards to a native ``EncodedSink``, recording what each write received; the next ``full``
+    writes raise ``PlaybackFull`` instead."""
+
+    def __init__(self, sink: Any) -> None:
+        self._sink = sink
+        self.writes: list[Any] = []
+        self.full = 0
+
+    def write(self, data: Any) -> None:
+        self.writes.append(data)
+        if self.full:
+            self.full -= 1
+            raise songbird.PlaybackFull(0, 0)
+        self._sink.write(data)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sink, name)
+
+
+async def test_encoded_stream_copies_each_write_at_most_once(connected_vc: HarnessClient) -> None:
+    vc = connected_vc
+    stream = vc.open_encoded_stream(max_buffer_bytes=64 << 10)
+    rec = _RecordingSink(stream._sink)
+    stream._sink = rec  # type: ignore
+    data = wav_bytes(100)
+    first = data[:500]
+
+    async def chunks() -> AsyncIterator[bytes]:
+        yield first
+        yield data[500:-200]
+
+    # A bytes chunk that fits is handed over as is (the sink borrows it); a larger one is split into
+    # zero-copy views (each size-checked natively before it is copied).
+    assert await stream.feed_from(chunks(), chunk_size=512, finish=False) == len(data) - 200
+    assert rec.writes[0] is first
+    assert len(rec.writes) > 2
+    assert all(type(w) is memoryview for w in rec.writes[1:])
+    # A retried write is copied once into bytes, which every retry then borrows.
+    rec.writes.clear()
+    rec.full = 2
+    tail = bytearray(data[-200:])
+    await stream.write(tail)
+    assert [type(w) for w in rec.writes] == [bytearray, bytes, bytes]
+    assert rec.writes[1] is rec.writes[2]
+    assert rec.writes[2] == tail
+    stream.close()
+
+
 async def test_opus_stream_plumbing(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
     async with vc.open_opus_stream(max_packets=2) as stream:

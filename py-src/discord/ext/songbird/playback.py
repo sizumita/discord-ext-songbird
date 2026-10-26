@@ -331,7 +331,13 @@ class EncodedStream:
         self.track = TrackHandle(sink.track, pump)
 
     async def write(self, data: Buffer, *, timeout: float | None = None) -> None:
-        """Append encoded bytes, waiting while the buffer is full."""
+        """Append encoded bytes, waiting while the buffer is full.
+
+        Raises
+        ------
+        LimitExceeded
+            The write is larger than the whole buffer (checked before anything is copied).
+        """
         n = memoryview(data).nbytes
         async with asyncio.timeout(timeout):
             spins = 0
@@ -341,6 +347,10 @@ class EncodedStream:
                     return
                 except PlaybackFull:
                     pass
+                if not isinstance(data, bytes):
+                    # The sink copies any other buffer on every attempt; it fits the buffer (it was
+                    # not LimitExceeded), so copy it once and let every retry borrow it.
+                    data = bytes(data)
                 if self._sink.arm_space(n):
                     spins += 1  # space was reported but taken (another thread): never spin
                     await _yield_before_retry(spins)
@@ -380,7 +390,11 @@ class EncodedStream:
                 total += len(chunk)
         else:
             async for chunk in src:
-                view = memoryview(chunk)
+                if isinstance(chunk, bytes) and len(chunk) <= chunk_size:
+                    await self.write(chunk)  # borrowed by the sink: no copy before the ring's
+                    total += len(chunk)
+                    continue
+                view = memoryview(chunk)  # split without copying; the sink checks each piece first
                 for start in range(0, view.nbytes, chunk_size):
                     piece = view[start : start + chunk_size]
                     await self.write(piece)

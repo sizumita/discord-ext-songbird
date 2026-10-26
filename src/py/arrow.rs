@@ -45,6 +45,7 @@ mod imp {
     use pyo3_arrow::ffi::{to_array_pycapsules, to_schema_pycapsule};
     use sbcore::limits::{MAX_OPUS_PACKETS, MAX_SOURCE_BYTES, check};
     use sbcore::rx::{ChunkData, Delivered};
+    use sbcore::tx::memory::OpusFrames;
     use sbcore::{CoreError, Encoding};
 
     use super::SampleKind;
@@ -244,7 +245,8 @@ mod imp {
         owned(b.value(i))
     }
 
-    fn all_binary<O: OffsetSizeTrait>(a: &ArrayRef) -> Result<Vec<Vec<u8>>, CoreError> {
+    /// Every value, validated and copied once, straight from the Arrow buffer into the frames.
+    fn all_binary<O: OffsetSizeTrait>(a: &ArrayRef) -> Result<OpusFrames, CoreError> {
         let b = a
             .as_any()
             .downcast_ref::<GenericBinaryArray<O>>()
@@ -253,12 +255,7 @@ mod imp {
         check("packets", b.len(), 0..=MAX_OPUS_PACKETS)?;
         let total: usize = (0..b.len()).map(|i| b.value(i).len()).sum();
         check("bytes", total, 0..=MAX_SOURCE_BYTES)?;
-        let mut out = Vec::new();
-        out.try_reserve_exact(b.len())?;
-        for i in 0..b.len() {
-            out.push(owned(b.value(i))?);
-        }
-        Ok(out)
+        OpusFrames::from_packets((0..b.len()).map(|i| b.value(i)))
     }
 
     pub(crate) fn import_bytes(
@@ -301,10 +298,10 @@ mod imp {
         out
     }
 
-    pub(crate) fn import_binary(
+    pub(crate) fn import_opus_frames(
         py: Python<'_>,
         array: &Bound<'_, PyAny>,
-    ) -> Result<Vec<Vec<u8>>, CoreError> {
+    ) -> Result<OpusFrames, CoreError> {
         let _ = py;
         let a = import(array)?;
         let out = match a.data_type() {
@@ -370,15 +367,15 @@ mod imp {
         Err(CoreError::FeatureMissing("arrow"))
     }
 
-    pub(crate) fn import_binary(
+    pub(crate) fn import_opus_frames(
         _py: Python<'_>,
         _a: &Bound<'_, PyAny>,
-    ) -> Result<Vec<Vec<u8>>, CoreError> {
+    ) -> Result<sbcore::tx::memory::OpusFrames, CoreError> {
         Err(CoreError::FeatureMissing("arrow"))
     }
 }
 
-pub(crate) use imp::{import_binary, import_bytes, import_samples};
+pub(crate) use imp::{import_bytes, import_opus_frames, import_samples};
 
 /// Zero-copy export of one chunk: `(schema capsule, array capsule)`.
 pub(crate) fn export_chunk<'py>(

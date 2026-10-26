@@ -43,6 +43,10 @@ use crate::wake::{WakeId, WakeToken};
 /// Maximum Opus packet size accepted by `send` (bytes).
 pub const MAX_OPUS_PACKET: usize = 1_275;
 
+/// The `InvalidAudio` message for a packet outside `1..=MAX_OPUS_PACKET` bytes (the binding raises
+/// the same error before copying an oversized buffer).
+pub const OPUS_PACKET_SIZE_MSG: &str = "an Opus packet must be 1..=1275 bytes long";
+
 /// Without packets for this long, the track pauses (no RTP).
 pub const OPUS_IDLE_MS: u32 = 250;
 
@@ -64,9 +68,7 @@ pub struct OpusStreamSpec {
 /// 1..=1275 bytes and exactly 960 samples at 48 kHz (`InvalidAudio` otherwise).
 pub fn validate_opus_packet(p: &[u8]) -> Result<(), CoreError> {
     if p.is_empty() || p.len() > MAX_OPUS_PACKET {
-        return Err(CoreError::invalid(
-            "an Opus packet must be 1..=1275 bytes long",
-        ));
+        return Err(CoreError::invalid(OPUS_PACKET_SIZE_MSG));
     }
     match opus::packet::get_nb_samples(p, 48_000) {
         Ok(960) => Ok(()),

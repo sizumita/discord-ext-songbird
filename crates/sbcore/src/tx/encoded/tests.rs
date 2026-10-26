@@ -226,6 +226,8 @@ fn ring_limits_and_space_wakeups() {
     let _s = SERIAL.lock();
     assert!(matches!(erig(1_000), Err(CoreError::Limit(_))));
     let r = erig(64 << 10).unwrap();
+    // The binding checks a buffer against this before copying it (§7.3).
+    assert_eq!(r.shared.max_write_bytes(), 64 << 10);
     assert!(matches!(
         r.shared.write(&vec![0u8; (64 << 10) + 1]),
         Err(CoreError::Limit(_))

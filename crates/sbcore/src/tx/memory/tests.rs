@@ -97,6 +97,41 @@ fn from_any_rate_resamples_to_48k_with_the_expected_length_and_level() {
 }
 
 #[test]
+fn opus_frames_builder_copies_once_without_slack() {
+    set_role(Role::Harness);
+    let pk = opus_packets(4, 960);
+    let mut b = OpusFramesBuilder::new();
+    // Packets are appended to one buffer: amortised growth, never one allocation per packet.
+    let g = crate::alloc_count::CountGuard::new();
+    let before = crate::alloc_count::count();
+    for i in 0..2_000 {
+        b.push(&pk[i % pk.len()]).unwrap();
+    }
+    let grows = crate::alloc_count::count() - before;
+    drop(g);
+    assert!(grows < 64, "{grows} allocations for 2000 packets");
+    // An oversized or invalid packet is rejected before anything is reserved or copied.
+    let g = crate::alloc_count::CountGuard::new();
+    let before = crate::alloc_count::count();
+    let big = vec![0xf8u8; 4 << 20];
+    let after_big = crate::alloc_count::count();
+    assert!(matches!(
+        b.push(&big),
+        Err(CoreError::InvalidAudio(m)) if m == crate::tx::opus_stream::OPUS_PACKET_SIZE_MSG
+    ));
+    assert!(matches!(b.push(&[]), Err(CoreError::InvalidAudio(_))));
+    assert_eq!(crate::alloc_count::count(), after_big);
+    assert_eq!(after_big - before, 1);
+    drop(g);
+    // The shared buffers keep no growth slack.
+    let f = b.finish();
+    assert_eq!(f.len(), 2_000);
+    assert_eq!(f.bytes.capacity(), f.bytes.len());
+    assert_eq!(f.offsets.capacity(), f.offsets.len());
+    assert_eq!(f.packet(1_999).unwrap(), &pk[1_999 % pk.len()][..]);
+}
+
+#[test]
 fn opus_frames_validate_and_seek_by_index() {
     set_role(Role::Harness);
     let pk = opus_packets(10, 960);

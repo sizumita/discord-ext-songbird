@@ -459,37 +459,73 @@ pub struct OpusFrames {
     offsets: Arc<Vec<u32>>,
 }
 
+/// Builds [`OpusFrames`] one borrowed packet at a time: each packet is validated, then copied
+/// once, straight into the shared byte buffer (no per-packet allocation, no second concatenation).
+#[derive(Debug)]
+pub struct OpusFramesBuilder {
+    bytes: Vec<u8>,
+    offsets: Vec<u32>,
+}
+
+impl Default for OpusFramesBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OpusFramesBuilder {
+    pub fn new() -> Self {
+        OpusFramesBuilder {
+            bytes: Vec::new(),
+            offsets: vec![0],
+        }
+    }
+
+    /// Validates `p` (`validate_opus_packet`, ≤ `MAX_OPUS_PACKETS`, ≤ `MAX_SOURCE_BYTES` in total)
+    /// before copying it in (`try_reserve`: `MemoryError` instead of an abort).
+    pub fn push(&mut self, p: &[u8]) -> Result<(), CoreError> {
+        if self.offsets.len() > MAX_OPUS_PACKETS {
+            return Err(too_big(
+                "opus_packets",
+                self.offsets.len() as u64,
+                MAX_OPUS_PACKETS as u64,
+            ));
+        }
+        validate_opus_packet(p)?;
+        let total = self.bytes.len() + p.len();
+        if total > MAX_SOURCE_BYTES {
+            return Err(too_big(
+                "source_bytes",
+                total as u64,
+                MAX_SOURCE_BYTES as u64,
+            ));
+        }
+        self.bytes.try_reserve(p.len())?;
+        self.offsets.try_reserve(1)?;
+        self.bytes.extend_from_slice(p);
+        self.offsets.push(u32::try_from(total).unwrap_or(u32::MAX));
+        Ok(())
+    }
+
+    /// The frames, with the growth slack released (they live as long as the source object).
+    pub fn finish(mut self) -> OpusFrames {
+        self.bytes.shrink_to_fit();
+        self.offsets.shrink_to_fit();
+        OpusFrames {
+            bytes: Arc::new(self.bytes),
+            offsets: Arc::new(self.offsets),
+        }
+    }
+}
+
 impl OpusFrames {
     /// Validates every packet (`validate_opus_packet`, ≤ `MAX_OPUS_PACKETS`, ≤ `MAX_SOURCE_BYTES`).
     pub fn from_packets<'a>(it: impl IntoIterator<Item = &'a [u8]>) -> Result<Self, CoreError> {
-        let mut bytes: Vec<u8> = Vec::new();
-        let mut offsets: Vec<u32> = vec![0];
+        let mut b = OpusFramesBuilder::new();
         for p in it {
-            if offsets.len() > MAX_OPUS_PACKETS {
-                return Err(too_big(
-                    "opus_packets",
-                    offsets.len() as u64,
-                    MAX_OPUS_PACKETS as u64,
-                ));
-            }
-            validate_opus_packet(p)?;
-            let total = bytes.len() + p.len();
-            if total > MAX_SOURCE_BYTES {
-                return Err(too_big(
-                    "source_bytes",
-                    total as u64,
-                    MAX_SOURCE_BYTES as u64,
-                ));
-            }
-            bytes.try_reserve(p.len())?;
-            bytes.extend_from_slice(p);
-            offsets.try_reserve(1)?;
-            offsets.push(u32::try_from(total).unwrap_or(u32::MAX));
+            b.push(p)?;
         }
-        Ok(OpusFrames {
-            bytes: Arc::new(bytes),
-            offsets: Arc::new(offsets),
-        })
+        Ok(b.finish())
     }
 
     /// Number of packets.

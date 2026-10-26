@@ -958,11 +958,22 @@ struct QueueAtomics {
 
 | Input type | Handling |
 |---|---|
-| `bytes` | Borrowed as `&[u8]`, zero copies. Its length is checked against the cap (`PcmQueue::max_write_bytes`, `LimitExceeded("write_bytes")`). |
+| `bytes` | Borrowed as `&[u8]`, zero copies. Its length is checked against the cap (`PcmQueue::max_write_bytes`, `LimitExceeded("write_bytes")`; see the caps below). |
 | `AudioChunk` | Carries its own format, which must equal the stream format, else `InvalidAudio` (its buffer code alone cannot tell 24 kHz mono from 48 kHz stereo). Then handled like any other buffer. |
 | `str` | Rejected with `TypeError` (`str` is never audio; decode text-encoded audio in user code first). |
 | any other buffer-protocol object (`bytearray`, `memoryview`, numpy, `array`) | Must be C-contiguous. The **format code is checked against the stream encoding**: `'B'`, `'b'` and `'c'` (raw bytes) are accepted for every encoding; `'h'`/`'<h'` (or `'='`-prefixed) only for `pcm16le`; `'f'`/`'<f'` only for `f32le`. Anything else raises `InvalidAudio`, for example a float32 array written to a `pcm16le` stream, a big-endian `'>i2'` buffer or an `'i'` array. Its length is checked against the cap **before** anything is allocated (`LimitExceeded("write_bytes")`; `"source_bytes"` for `RawPcm`). Copied once into an owned `Vec<u8>` (`try_reserve` → `MemoryError`), and the `PyUntypedBuffer` is released **before** calling sbcore. |
 | Arrow arrays (`__arrow_c_array__`, `arrow` feature) | Primitive arrays without nulls whose type matches the encoding (Int16 ↔ pcm16le, Float32 ↔ f32le, UInt8 ↔ any) are copied. The import is dropped while still attached, because pyarrow's release callback needs the interpreter. |
+
+**Every extraction has a cap** (`convert::MaxBytes`; there is no unbounded copy of a user buffer), checked for `bytes` and for any other buffer before anything is allocated:
+
+| Entry point | Cap | Error above it |
+|---|---|---|
+| `PlaybackStream.write` | `PcmQueue::max_write_bytes` | `LimitExceeded("write_bytes")` |
+| `EncodedStream.write` | `EncodedShared::max_write_bytes` (the `ByteRing` cap, `max_buffer_bytes`) | `LimitExceeded("write_bytes")` |
+| `OpusPacketStream.send`, each `OpusPackets` item | 1275 bytes (`MAX_OPUS_PACKET`) | `InvalidAudio`, the same message sbcore raises for an oversized `bytes` |
+| `AudioFile(data)`, `RawPcm(data, …)`, `RawPcm.from_samples(data, …)` | `MAX_SOURCE_BYTES` (1 GiB) | `LimitExceeded("source_bytes")` |
+
+Sources copy a buffer once: `RawPcm` parses a `bytes` input straight from the borrow (inside `py.detach` above 1 MiB; the object is immutable and referenced by the caller), `AudioFile` copies it once because it keeps the data, and `OpusPackets` appends each item to one shared buffer (`OpusFramesBuilder`, below). `EncodedStream.write` retries a `PlaybackFull` non-`bytes` buffer as a single `bytes` copy, so later attempts borrow it instead of copying again, and `feed_from` hands `bytes` chunks that fit `chunk_size` over unchanged (larger ones are split into zero-copy `memoryview` pieces, each cap-checked natively).
 
 **`PcmQueue::write(data: &[u8], WriteMeta{tag, at_ms}, now)`** (sbcore). It is all-or-nothing.
 
@@ -1139,7 +1150,7 @@ The cut becomes audible at the next pull. Audio already pulled (≤ 1 tick) and 
 | `vc.open_opus_stream(max_packets=250)` → `OpusPacketStream` | `OpusQueue` (L7) + `OpusStreamReader` + the registry Opus decoder (`get_codec_registry().make(&params, &DecoderOptions::default())`) | Parsed, `CODEC_TYPE_OPUS`, 48 kHz | `try_lock`. Pops a packet and **moves** its `Box<[u8]>` into `Packet::new_from_boxed_slice`. On underrun, contention or self-mute it uses a pre-allocated `SILENT_FRAME` box from a 64-entry reserve that the housekeeper refills (it allocates 3 bytes only if the reserve is empty). | no | **Starts paused**; the first `send` resumes it, and the housekeeper pauses it again after `idle_ms` without packets (§7.5), so an unfed stream sends no RTP. Passthrough when it is the only playing track at volume 1.0 (`mix_logic.rs:69-94`). `send_nowait` validates 1–1275 bytes and `opus::packet::get_nb_samples(p, 48000) == 960`. EOF only after close and drain. |
 | `AudioFile(data)`, `AudioFile.from_path(path, *, max_bytes=256 MiB)`, `await AudioFile.load(path, …)`, `AudioFile.from_arrow(array)` | `EncodedBytes{data: Arc<[u8]>, info}`; copied once (`try_reserve` → `MemoryError`); **eagerly probed** inside `py.detach` (raises `SourceError`; exposes `codec`, `sample_rate`, `channels`, `duration_ms` from the probe result) | `Input::Live(LiveInput::Raw(AudioStream{input: Box::new(DoneSource::new(Cursor::new(ArcBytes(data)), done))}), None)`. `AudioStream` has only an `input` field in 0.6.1 (`input/audiostream.rs:2-8`). Probed on songbird's BlockyTaskPool from memory. | songbird decodes from memory (no disk I/O on the mixer) | yes | `from_path` reads the file **inside `py.detach`**. `load()` wraps it in `asyncio.to_thread`. `from_arrow` accepts a UInt8 primitive array, or a single-value Binary/LargeBinary array, without nulls (pyarrow arrays do not implement the buffer protocol); it is copied once and released while attached (§8.12). No `hint` parameter (see the EncodedStream row). Reusable: each play gets a fresh cursor over the same `Arc`. |
 | `RawPcm(data, format)`, `RawPcm.from_arrow(array, format)`, `RawPcm.from_samples(data, sample_rate, channels=2, encoding="f32le")` | `MemPcm{fmt, samples: Arc<[i16]>}`. `RawPcm(...)`/`from_arrow` store the input rate (8/16/24/48 kHz), parsed once and detached above 1 MiB. `from_samples` accepts **any rate from 8 to 192 kHz** (pcm16le or f32le, buffer or Arrow array, as 0.5's `RawPCMInput` did). Unless the rate is one of the four stream rates, it resamples once to 48 kHz with `dsp::StreamResampler` inside `py.detach` and stores 48 kHz. | Parsed: `MemPcmReader` + `PcmDecoder` (the same decoder, resampling on the mixer side), `supports_backseek: true` | slice copy + resample | yes (ts → frame; resampler reset) | Reusable. |
-| `OpusPackets(frames)`, `OpusPackets.from_arrow(binary_array)` | `OpusFrames{bytes: Arc<[u8]>, offsets: Arc<[u32]>}`, each frame validated as above | Parsed: `MemOpusReader` + registry Opus decoder, `supports_backseek: true` | one packet-sized `Box` copy per tick (symphonia's `Packet` owns its buffer; songbird's own inputs do the same) | yes (by index) | Passthrough-capable. |
+| `OpusPackets(frames)`, `OpusPackets.from_arrow(binary_array)` | `OpusFrames{bytes: Arc<[u8]>, offsets: Arc<[u32]>}`, each frame validated as above. Built by `OpusFramesBuilder`: each item is size-checked (1275 bytes) before a non-`bytes` buffer is copied, then validated and appended to the one shared buffer (no per-packet allocation; `from_arrow` appends straight from the Arrow buffer). The growth slack is released when it is built. | Parsed: `MemOpusReader` + registry Opus decoder, `supports_backseek: true` | one packet-sized `Box` copy per tick (symphonia's `Packet` owns its buffer; songbird's own inputs do the same) | yes (by index) | Passthrough-capable. |
 
 **No `Compose` is implemented anywhere.** Every input passes `None`, so 0.5's `unimplemented!()`/`todo!()` paths cannot exist. `DoneSource<M: MediaSource>` forwards `read`, `seek`, `is_seekable` and `byte_len`. It records `EOF_SEEN` in its `TrackFlags` when `read` returns 0, and drops its `DoneGuard` on drop. `MemPcmReader`, `MemOpusReader` and `LiveReader` likewise record `EOF_SEEN` when they return EOF (§7.10).
 
@@ -3032,6 +3043,8 @@ impl MemPcm { pub fn from_bytes(fmt: Format, data: &[u8]) -> Result<Self, CoreEr
               pub fn duration_ms(&self) -> u64; }
 pub struct OpusFrames { /* bytes: Arc<[u8]>, offsets: Arc<[u32]> */ }
 impl OpusFrames { pub fn from_packets<'a>(it: impl IntoIterator<Item = &'a [u8]>) -> Result<Self, CoreError>; pub fn len(&self) -> usize; }
+pub struct OpusFramesBuilder { /* bytes: Vec<u8>, offsets: Vec<u32> */ }
+impl OpusFramesBuilder { pub fn new() -> Self; pub fn push(&mut self, p: &[u8]) -> Result<(), CoreError>; pub fn finish(self) -> OpusFrames; }
 #[derive(Clone)] pub struct EncodedFactory { pub spec: EncodedSpec }       // lazy: nothing allocated until current
 #[derive(Clone)] pub enum SourceSpec { File(Arc<EncodedBytes>), Pcm(Arc<MemPcm>), Opus(Arc<OpusFrames>), Encoded(EncodedFactory) }
 impl SourceSpec { /// Encoded: spawns ByteRing + decode thread now (only called when the entry becomes current).
@@ -3164,6 +3177,8 @@ These use pytest 9.1.1 with pytest-asyncio 1.4.1 (`asyncio_mode = "auto"`) and r
   - `PCM16_48K.silence(10**12)`, `F32_48K_STEREO.silence(10**10)`, `silence(-1)`;
   - `seek(-1)`, `seek(float("nan"))`, `seek(float("inf"))`, `seek(1e300)`;
   - a 200 MiB `write()` against a 100 ms buffer as `bytes`, `bytearray` and `memoryview` (rejected before parsing and before any copy, no RSS spike);
+  - oversized `bytes`, `bytearray`, `memoryview` and anonymous `mmap` buffers passed to `EncodedStream.write` (200 MiB vs a 1 MiB ring), `OpusPacketStream.send` and an `OpusPackets` item (200 MiB vs 1275 bytes), and `AudioFile` (1 GiB + 1, `bytes` and `mmap`): each rejected before any copy, no RSS spike;
+  - one copy per source: `RawPcm`/`RawPcm.from_samples` of 200 MiB `bytes` grow RSS by < 1.5× (the parsed samples only), and `OpusPackets` of 100k 1000-byte packets by < 1.5× the data;
   - `open_playback(max_buffer_ms=100, prebuffer_ms=1000)` and `open_playback(max_buffer_ms=100, max_gap_ms=10_000)`;
   - `RawPcm.from_samples(b"", 7_999, 2)` and `RawPcm.from_samples(b"", 192_001, 2)`;
   - `driver_retries=0` (rejected, with a message explaining that 0 would mean infinite in songbird);

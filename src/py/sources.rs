@@ -1,6 +1,7 @@
 //! `native.AudioFile`, `native.RawPcm` and `native.OpusPackets` (W4, §7.9, §9.8): reusable
-//! in-memory sources. Input is copied once into Rust-owned memory and released **before** the
-//! (possibly detached) sbcore call (I8).
+//! in-memory sources. Every input is size-checked before anything is copied, then copied once into
+//! Rust-owned memory: `bytes` is borrowed and parsed (or copied) directly, any other buffer is copied
+//! and released **before** the (possibly detached) sbcore call (I8).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,25 +10,21 @@ use pyo3::exceptions::{PyMemoryError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyString, PyType};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
-use sbcore::limits::{MAX_OPUS_PACKETS, MAX_SOURCE_BYTES, SOURCE_RATE_HZ};
-use sbcore::tx::memory::{EncodedBytes, MemPcm, OpusFrames, read_file};
+use sbcore::limits::{MAX_SOURCE_BYTES, SOURCE_RATE_HZ};
+use sbcore::tx::memory::{EncodedBytes, MemPcm, OpusFrames, OpusFramesBuilder, read_file};
 use sbcore::tx::source::SourceSpec;
-use sbcore::{Encoding, Format, LimitError, LimitNum};
+use sbcore::{Encoding, Format};
 
 use crate::convert::{
-    AudioData, MaxBytes, check_chunk_format, extract_audio, extract_bytes, int_arg,
+    AudioData, OPUS_PACKET_MAX, SOURCE_MAX, check_chunk_format, extract_audio, extract_bytes,
+    int_arg,
 };
-use crate::errors::{CoreResultExt, Exc, ensure_not_forked, limit_exc, msg_exc};
-use crate::py::arrow::{SampleKind, import_binary, import_bytes, import_samples};
+use crate::errors::{CoreResultExt, Exc, ensure_not_forked, msg_exc};
+use crate::py::arrow::{SampleKind, import_bytes, import_opus_frames, import_samples};
 use crate::py::format::PyAudioFormat;
 
 /// Inputs above this size are parsed with the thread state detached (§5.2).
 const DETACH_ABOVE: usize = 1 << 20;
-/// Raw PCM sources are limited to `MAX_SOURCE_BYTES`; checked before a buffer is copied.
-const SOURCE_MAX: MaxBytes = MaxBytes {
-    what: "source_bytes",
-    max: MAX_SOURCE_BYTES as u64,
-};
 
 /// `AudioFormat | str` → `Format`.
 fn format_arg(obj: &Bound<'_, PyAny>) -> PyResult<Format> {
@@ -42,7 +39,7 @@ fn format_arg(obj: &Bound<'_, PyAny>) -> PyResult<Format> {
     ))
 }
 
-/// An owned copy of raw audio bytes.
+/// An owned copy of raw audio bytes (`AudioFile` keeps them; a buffer's copy is reused).
 fn owned(data: AudioData<'_>) -> PyResult<Vec<u8>> {
     match data {
         AudioData::Owned(v) => Ok(v),
@@ -100,7 +97,7 @@ impl AudioFile {
         data: &Bound<'_, PyAny>,
     ) -> PyResult<Self> {
         ensure_not_forked(py)?;
-        let bytes = owned(extract_bytes(data)?)?;
+        let bytes = owned(extract_bytes(data, SOURCE_MAX)?)?;
         let b = py.detach(|| EncodedBytes::new(bytes)).py(py)?;
         Ok(AudioFile { b: Arc::new(b) })
     }
@@ -204,11 +201,13 @@ impl RawPcm {
         ensure_not_forked(py)?;
         let fmt = format_arg(format)?;
         check_chunk_format(data, fmt)?;
-        let bytes = owned(extract_audio(data, fmt.encoding, SOURCE_MAX)?)?;
+        // Parsed straight from a borrowed `bytes` (immutable, kept alive by `data`): one copy.
+        let audio = extract_audio(data, fmt.encoding, SOURCE_MAX)?;
+        let bytes = audio.bytes();
         let p = if bytes.len() > DETACH_ABOVE {
-            py.detach(|| MemPcm::from_bytes(fmt, &bytes))
+            py.detach(|| MemPcm::from_bytes(fmt, bytes))
         } else {
-            MemPcm::from_bytes(fmt, &bytes)
+            MemPcm::from_bytes(fmt, bytes)
         }
         .py(py)?;
         Ok(RawPcm { p: Arc::new(p) })
@@ -258,7 +257,7 @@ impl RawPcm {
         };
         let is_buffer = data.cast::<pyo3::types::PyBytes>().is_ok()
             || data.hasattr("__buffer__").unwrap_or(false);
-        let bytes = if !is_buffer && data.hasattr("__arrow_c_array__").unwrap_or(false) {
+        let audio = if !is_buffer && data.hasattr("__arrow_c_array__").unwrap_or(false) {
             let (kind, bytes) = import_samples(py, data).py(py)?;
             let ok = matches!(
                 (kind, enc),
@@ -271,12 +270,13 @@ impl RawPcm {
                     "the Arrow array type does not match the encoding",
                 ));
             }
-            bytes
+            AudioData::Owned(bytes)
         } else {
-            owned(extract_audio(data, enc, SOURCE_MAX)?)?
+            extract_audio(data, enc, SOURCE_MAX)?
         };
+        let bytes = audio.bytes();
         let p = py
-            .detach(|| MemPcm::from_any_rate(sample_rate, channels, enc, &bytes))
+            .detach(|| MemPcm::from_any_rate(sample_rate, channels, enc, bytes))
             .py(py)?;
         Ok(RawPcm { p: Arc::new(p) })
     }
@@ -308,10 +308,6 @@ pub struct OpusPackets {
     f: Arc<OpusFrames>,
 }
 
-fn opus_frames(py: Python<'_>, packets: Vec<Vec<u8>>) -> PyResult<OpusFrames> {
-    OpusFrames::from_packets(packets.iter().map(Vec::as_slice)).py(py)
-}
-
 #[gen_stub_pymethods]
 #[pymethods]
 impl OpusPackets {
@@ -322,33 +318,15 @@ impl OpusPackets {
         packets: &Bound<'_, PyAny>,
     ) -> PyResult<Self> {
         ensure_not_forked(py)?;
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        let mut total = 0usize;
+        // Each item is size-checked before a non-`bytes` buffer is copied, then appended straight
+        // to the shared byte buffer (validated there): one copy of the data, no per-packet `Vec`.
+        let mut b = OpusFramesBuilder::new();
         for item in packets.try_iter()? {
             let item = item?;
-            let p = owned(extract_bytes(&item)?)?;
-            total = total.saturating_add(p.len());
-            if out.len() >= MAX_OPUS_PACKETS || total > MAX_SOURCE_BYTES {
-                let (what, value, max) = if out.len() >= MAX_OPUS_PACKETS {
-                    ("opus_packets", out.len() + 1, MAX_OPUS_PACKETS)
-                } else {
-                    ("source_bytes", total, MAX_SOURCE_BYTES)
-                };
-                return Err(limit_exc(
-                    py,
-                    &LimitError {
-                        what,
-                        value: LimitNum::Int(value as i128),
-                        min: LimitNum::Int(0),
-                        max: LimitNum::Int(max as i128),
-                    },
-                ));
-            }
-            out.try_reserve(1)
-                .map_err(|_| PyMemoryError::new_err("allocation failed"))?;
-            out.push(p);
+            let p = extract_bytes(&item, OPUS_PACKET_MAX)?;
+            b.push(p.bytes()).py(py)?;
         }
-        let f = opus_frames(py, out)?;
+        let f = b.finish();
         Ok(OpusPackets { f: Arc::new(f) })
     }
 
@@ -360,8 +338,7 @@ impl OpusPackets {
         #[gen_stub(override_type(type_repr = "object"))] array: &Bound<'_, PyAny>,
     ) -> PyResult<Self> {
         ensure_not_forked(py)?;
-        let packets = import_binary(py, array).py(py)?;
-        let f = opus_frames(py, packets)?;
+        let f = import_opus_frames(py, array).py(py)?;
         Ok(OpusPackets { f: Arc::new(f) })
     }
 

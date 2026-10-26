@@ -117,3 +117,81 @@ print("GROWTH", rss() - before)
     assert "REJECTED write_bytes" in proc.stdout, proc.stdout
     growth = int(proc.stdout.split("GROWTH")[1])
     assert growth < 50 << 20, growth
+
+
+#: Oversized raw-byte buffers. ``bytes`` is borrowed and every other buffer would be copied, so each
+#: is size-checked first; an ``mmap`` is only backed by memory once its pages are touched, so a copy
+#: of one shows up as RSS growth in full (§10, defect 6).
+OVERSIZED_KINDS = {
+    "bytes": "bytes({n})",
+    "bytearray": "bytearray({n})",
+    "memoryview": "memoryview(bytearray({n}))",
+    "mmap": "mmap.mmap(-1, {n})",
+}
+
+#: Every entry point taking encoded bytes: ``(setup, call, expected rejection, payload size)``.
+OVERSIZED_CALLS = {
+    "encoded_write": (
+        "c = conn(); s = c.open_encoded(1 << 20)",
+        "s.write(payload)",
+        "LimitExceeded write_bytes",
+        200 << 20,
+    ),
+    "opus_send": ("c = conn(); s = c.open_opus()", "s.send(payload)", "InvalidAudio", 200 << 20),
+    "opus_packets": ("", "songbird.OpusPackets([b'\\xf8\\xff\\xfe', payload])", "InvalidAudio", 200 << 20),
+    # Above MAX_SOURCE_BYTES; only lazily backed buffers (and bytes) to keep the test's RSS small.
+    "audio_file": ("", "songbird.AudioFile(payload)", "LimitExceeded source_bytes", (1 << 30) + 1),
+}
+
+OVERSIZED_PARAMS = [
+    (call, kind)
+    for call in OVERSIZED_CALLS
+    for kind in OVERSIZED_KINDS
+    if call != "audio_file" or kind in ("bytes", "mmap")
+]
+
+
+@pytest.mark.parametrize(("call", "kind"), OVERSIZED_PARAMS)
+def test_oversized_encoded_bytes_are_rejected_before_copying(call: str, kind: str) -> None:
+    setup, body, expected, n = OVERSIZED_CALLS[call]
+    proc = run_isolated(
+        PRELUDE
+        + f"""
+import mmap
+{setup}
+payload = {OVERSIZED_KINDS[kind].format(n=n)}
+before = rss()
+try:
+    {body}
+except (songbird.LimitExceeded, songbird.InvalidAudio) as e:
+    print("REJECTED", type(e).__name__, getattr(e, "what", ""))
+print("GROWTH", rss() - before)
+"""
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert f"REJECTED {expected}" in proc.stdout, proc.stdout
+    growth = int(proc.stdout.split("GROWTH")[1])
+    assert growth < 50 << 20, growth
+
+
+def growth_of(setup: str, body: str) -> int:
+    proc = run_isolated(PRELUDE + f"\n{setup}\nbefore = rss()\n{body}\nprint('GROWTH', rss() - before)\n")
+    assert proc.returncode == 0, proc.stderr
+    return int(proc.stdout.split("GROWTH")[1])
+
+
+@pytest.mark.parametrize(
+    "call",
+    ["songbird.RawPcm(payload, songbird.PCM16_48K)", "songbird.RawPcm.from_samples(payload, 48_000, 2, 'pcm16le')"],
+)
+def test_raw_pcm_parses_borrowed_bytes(call: str) -> None:
+    # 200 MiB of pcm16 parse into 200 MiB of samples; an owned copy of the bytes first would double it.
+    growth = growth_of("payload = b'\\x01' * (200 << 20)", f"src = {call}")
+    assert growth < 300 << 20, growth
+
+
+def test_opus_packets_copy_each_packet_once() -> None:
+    # 100k packets of 1000 bytes (one shared object, so the input costs nothing): ~95 MiB of frames.
+    # A per-packet copy concatenated again afterwards would need twice that.
+    growth = growth_of("packets = [b'\\xf8' + bytes(999)] * 100_000", "src = songbird.OpusPackets(packets)")
+    assert growth < 143 << 20, growth

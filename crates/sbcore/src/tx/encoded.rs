@@ -166,6 +166,12 @@ impl EncodedShared {
         Ok(())
     }
 
+    /// The largest single write (`max_buffer_bytes`): the binding checks a buffer against it before
+    /// copying it (§7.3).
+    pub fn max_write_bytes(&self) -> usize {
+        self.ring.cap
+    }
+
     /// Arms a space wake-up for `n` bytes; `true` ⇒ there is already enough space (or closed).
     pub fn arm_space(&self, n: usize) -> bool {
         let mut g = lock_checked(&self.ring.inner);
