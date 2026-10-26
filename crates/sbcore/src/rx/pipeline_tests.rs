@@ -607,7 +607,7 @@ fn set_filter_rehomes_at_a_boundary_without_gap_or_duplicate() {
 }
 
 #[test]
-fn watchdog_reports_a_stall_once() {
+fn watchdog_reports_a_stall_on_every_timer_call_while_it_lasts() {
     let mut r = Rig::new();
     r.p.on_input(RxInput::LinkUp { ssrc: Some(1) }, r.now);
     r.advance(1_999);
@@ -619,12 +619,12 @@ fn watchdog_reports_a_stall_once() {
     assert_eq!(t.stalled_since, Some(r.t0));
     r.advance(1_000);
     assert_eq!(r.timer().stalled_since, Some(r.t0));
-    let stalls = r
-        .events()
-        .iter()
-        .filter(|e| matches!(e, EventData::ReceiveStalled { since_ms: 0 }))
-        .count();
-    assert_eq!(stalls, 1);
+    // The ConnWorker emits `ReceiveStalled` (once per stall); the pipeline never does.
+    assert!(
+        !r.events()
+            .iter()
+            .any(|e| matches!(e, EventData::ReceiveStalled { .. }))
+    );
     r.tick(vec![]);
     assert_eq!(r.timer().stalled_since, None);
     // Link down: no stall detection.

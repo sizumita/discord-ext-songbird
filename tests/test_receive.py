@@ -83,7 +83,9 @@ async def test_speaking_and_speakers(connected_vc: HarnessClient, testing: Any) 
     assert [c.speaking for c in b] == [True, False, False]
     assert b[0].speakers == frozenset({B}) and b[1].speakers == frozenset()
     assert m[0].voiced_ms == 20 and m[2].voiced_ms == 0
-    assert b[1].to_bytes() == bytes(len(b[1]))  # absent user: digital silence
+    # Absent user: digital silence once the 48 → 24 kHz converter's tail of the last packet (its
+    # ~1.3 ms delay, docs/deviations/w1.md §2) has been emitted at the start of the next chunk.
+    assert b[2].to_bytes() == bytes(len(b[2]))
 
 
 async def test_absent_user_stream_is_silent_and_continuous(connected_vc: HarnessClient, testing: Any) -> None:

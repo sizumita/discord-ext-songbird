@@ -14,6 +14,7 @@ use super::*;
 use crate::conn::TEST_LOCK;
 use crate::conn::settings::RawVoiceSettings;
 use crate::events::Pop;
+use crate::rx::queue::RxSource;
 use crate::wake::Doorbell;
 
 pub(super) fn bell() -> (Doorbell, UnixStream) {
@@ -422,6 +423,11 @@ fn an_executor_panic_does_not_wedge_the_state_machine() {
 #[test]
 fn a_forked_child_leaks_the_driver_instead_of_dropping_it() {
     let _serial = TEST_LOCK.lock();
+    // A connection of an earlier test may still be closing on a runtime thread (its last `Arc`
+    // was a worker's temporary upgrade): start from no Driver, or the counts below race it.
+    assert!(wait_until(Duration::from_secs(15), || live(
+        &live::OWNED_DRIVER
+    ) == 0));
     let (b, _peer) = bell();
     let foreign = std::process::id().wrapping_add(1);
     let conn =

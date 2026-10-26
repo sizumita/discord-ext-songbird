@@ -156,6 +156,7 @@ async def test_full_lifecycle_returns_to_baseline() -> None:
         with pytest.raises(ConnectFailed) as ei:
             await task
         assert ei.value.reason == "requested"
+        del ei  # its traceback holds connect()'s frames, and with them the client
         assert [op.channel_id for op in guild.op4].count(None) == 1
         for s in accepted:
             s.close()

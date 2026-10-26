@@ -36,7 +36,7 @@ use crate::limits::{
     SOURCE_RATE_HZ, check,
 };
 use crate::runtime::{LiveCounter, live};
-use crate::tracks::flags::{DECODE_ERROR, DoneGuard, EOF_SEEN};
+use crate::tracks::flags::{DECODE_ERROR, DoneGuard, EOF_SEEN, PANICKED};
 
 fn too_big(what: &'static str, value: u64, max: u64) -> CoreError {
     CoreError::Limit(LimitError {
@@ -615,7 +615,7 @@ impl FormatReader for MemOpusReader {
         match catch_unwind(AssertUnwindSafe(|| self.next_inner())) {
             Ok(r) => r,
             Err(_) => {
-                self.done.flags().hint(DECODE_ERROR);
+                self.done.flags().hint(DECODE_ERROR | PANICKED);
                 self.idx = self.frames.len();
                 Err(SymphError::IoError(ErrorKind::UnexpectedEof.into()))
             }

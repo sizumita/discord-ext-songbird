@@ -19,7 +19,7 @@
 
 pub mod harness;
 pub mod mixer;
-mod registry;
+pub(crate) mod registry;
 pub mod rtp;
 
 pub use harness::{
@@ -35,7 +35,10 @@ use crate::tracks::flags::TrackRef;
 /// The `FakeTrackControl` call log of a track of a detached connection (`"pause"`, `"play"`,
 /// `"stop"`), oldest first. Empty for other tracks.
 pub fn track_log(t: &TrackRef) -> Vec<&'static str> {
-    registry::fake_log(&t.flags)
+    match t.fake.get() {
+        Some(f) => f.log(),
+        None => registry::fake_log(&t.flags),
+    }
 }
 
 /// Allocations on the calling thread while a counting guard is active (§13.1). `MixerHarness::pull`

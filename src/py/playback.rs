@@ -58,8 +58,17 @@ impl Playback {
     }
 }
 
+/// §4.10: in a forked child no lock may be taken (a vanished parent thread may hold it); the
+/// handles are then simply freed. Same rule as `EventSubscription`.
+fn forked() -> bool {
+    sbcore::runtime::check_not_forked().is_err()
+}
+
 impl Drop for Playback {
     fn drop(&mut self) {
+        if forked() {
+            return;
+        }
         // Abort, unless a drain close was already requested (it completes on its own).
         self.q.abandon();
     }
@@ -253,7 +262,10 @@ impl Playback {
     /// Closes the playback (``drain=True``: once everything queued has played). Idempotent.
     #[pyo3(signature = (drain = false))]
     fn close(&self, drain: bool) {
-        LiveSource::close(&*self.q, close_mode(drain));
+        // A no-op after fork() (§4.10, see Drop).
+        if !forked() {
+            LiveSource::close(&*self.q, close_mode(drain));
+        }
     }
 
     #[getter]
@@ -299,6 +311,9 @@ impl EncodedSink {
 
 impl Drop for EncodedSink {
     fn drop(&mut self) {
+        if forked() {
+            return;
+        }
         // Abort, unless the input is complete (`finish()`): the decoded audio still plays out.
         self.enc.abandon();
     }
@@ -339,7 +354,10 @@ impl EncodedSink {
     /// Idempotent (``drain=True``: once the decoded audio has played).
     #[pyo3(signature = (drain = false))]
     fn close(&self, drain: bool) {
-        LiveSource::close(&*self.enc, close_mode(drain));
+        // A no-op after fork() (§4.10, see Drop).
+        if !forked() {
+            LiveSource::close(&*self.enc, close_mode(drain));
+        }
     }
 
     #[getter]
@@ -375,6 +393,9 @@ impl OpusSink {
 
 impl Drop for OpusSink {
     fn drop(&mut self) {
+        if forked() {
+            return;
+        }
         // Abort, unless a drain close was already requested (it completes on its own).
         self.q.abandon();
     }
@@ -420,7 +441,10 @@ impl OpusSink {
     /// Idempotent (``drain=True``: once the queued packets have played).
     #[pyo3(signature = (drain = false))]
     fn close(&self, drain: bool) {
-        LiveSource::close(&*self.q, close_mode(drain));
+        // A no-op after fork() (§4.10, see Drop).
+        if !forked() {
+            LiveSource::close(&*self.q, close_mode(drain));
+        }
     }
 
     #[getter]

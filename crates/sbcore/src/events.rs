@@ -307,7 +307,9 @@ impl EventQueue {
 
     fn pop_inner(&self, arm: bool) -> Pop<EventData> {
         let mut g = self.inner.lock(); // L5q
-        if g.lagged > 0 && !g.items.is_empty() && self.kinds.0 & KindMask::LAGGED != 0 {
+        // §8.11: after drops a synthetic `Lagged` precedes the next delivered event, whatever the
+        // queue's kind mask (a stream filtered to a few kinds still learns that it lost events).
+        if g.lagged > 0 && !g.items.is_empty() {
             let dropped = std::mem::take(&mut g.lagged);
             return Pop::Item(EventData::Lagged { dropped });
         }
@@ -330,8 +332,7 @@ impl EventQueue {
     }
 
     /// Pops the next event, or arms the wake-up in the same critical section if empty. After drops,
-    /// a synthetic `Lagged { dropped }` precedes the next delivered event (if the mask selects
-    /// `Lagged`).
+    /// a synthetic `Lagged { dropped }` precedes the next delivered event.
     pub fn try_pop_or_arm(&self) -> Pop<EventData> {
         self.pop_inner(true)
     }
@@ -342,13 +343,17 @@ impl EventQueue {
     }
 
     /// Closes the queue at the subscriber's request (`EventStream.close()`, `Drop`) and frees the
-    /// queued events now. Idempotent. The hub prunes it on its next `emit`/`subscribe`.
+    /// queued events now. Idempotent, and first close wins: a queue T6 already closed keeps its
+    /// events (ending with `Disconnected`) readable, since `SongbirdClient.cleanup()` closes every
+    /// child stream right after the connection closed (§6.5, §8.11). The hub prunes it on its next
+    /// `emit`/`subscribe`.
     pub fn close(&self) {
         let freed = {
             let mut g = self.inner.lock();
-            if g.closed.is_none() {
-                g.closed = Some(CloseReason::Closed);
+            if g.closed.is_some() {
+                return;
             }
+            g.closed = Some(CloseReason::Closed);
             self.closed_flag.store(true, Ordering::Release);
             g.lagged = 0;
             std::mem::take(&mut g.items)
@@ -457,13 +462,17 @@ mod tests {
         assert_eq!(user(q.try_pop()), Some(3));
         assert_eq!(user(q.try_pop()), Some(4));
         assert!(matches!(q.try_pop(), Pop::Empty));
-        // Lagged is not synthesised for a mask without the Lagged bit.
+        // §8.11: Lagged is synthesised whatever the mask (here without the Lagged bit).
         let q2 = hub
             .subscribe(1, KindMask(KindMask::of(&ev(0))), wake.alloc().unwrap())
             .unwrap();
         hub.emit(&ev(10));
         hub.emit(&ev(11));
         assert_eq!(q2.dropped(), 1);
+        assert!(matches!(
+            q2.try_pop(),
+            Pop::Item(EventData::Lagged { dropped: 1 })
+        ));
         assert_eq!(user(q2.try_pop()), Some(11));
     }
 
@@ -498,7 +507,12 @@ mod tests {
                 }
             }
         }
-        // Full queue: the oldest was dropped to make room for the final event, which is last.
+        // Full queue: the oldest was dropped to make room for the final event, which is last; the
+        // drop is reported first (§8.11, whatever the mask).
+        assert!(matches!(
+            seen.first(),
+            Some(EventData::Lagged { dropped: 1 })
+        ));
         assert!(matches!(
             seen.last(),
             Some(EventData::Disconnected {
@@ -506,8 +520,34 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(seen.len(), 2);
+        assert_eq!(seen.len(), 3);
         assert!(q.is_closed());
+    }
+
+    /// First close wins: the subscriber's `close()` after T6 keeps the final `Disconnected`
+    /// readable (`SongbirdClient.cleanup()` closes every child stream, §6.5).
+    #[test]
+    fn subscriber_close_after_teardown_keeps_the_final_event() {
+        let (hub, wake, _peer) = hub_with_wake();
+        let q = hub
+            .subscribe(4, KindMask::ALL, wake.alloc().unwrap())
+            .unwrap();
+        hub.emit(&ev(1));
+        hub.close_all(Some(&EventData::Disconnected {
+            reason: "requested",
+            code: None,
+            will_retry: false,
+        }));
+        q.close();
+        assert_eq!(user(q.try_pop()), Some(1));
+        assert!(matches!(
+            q.try_pop(),
+            Pop::Item(EventData::Disconnected { .. })
+        ));
+        assert!(matches!(
+            q.try_pop(),
+            Pop::Closed(CloseReason::ConnectionClosed)
+        ));
     }
 
     #[test]

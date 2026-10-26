@@ -441,17 +441,20 @@ fn queue_entry_becomes_current_through_the_worker() {
     assert!(d.conn.tracks_need_poll(), "an entry waits to be advanced");
     d.step(20);
     assert_eq!(d.conn.queue().len(), 0);
-    // Either it started (fake control) and is current, or its input failed to build: it ended
-    // with `error` and the queue moved past it.
-    if entry.is_started() {
-        assert!(d.conn.queue().current().is_some_and(|c| c.same(&entry)));
-    } else {
-        assert_eq!(entry.flags.ended(), Some(TrackEndReason::Error));
-        assert!(entry.flags.error().is_some());
-        assert!(d.conn.queue().current().is_none());
-    }
+    // It started (a paused live source with a fake control) and is current; its stream is handed
+    // out once and counts towards the playing tracks, not the `open_*` live sources.
+    assert!(entry.is_started());
+    assert!(d.conn.queue().current().is_some_and(|c| c.same(&entry)));
+    assert_eq!(entry.fake_log(), Vec::<&str>::new(), "started paused");
+    let stream = d.conn.queue_take_stream(&entry).expect("the lazy stream");
+    assert!(d.conn.queue_take_stream(&entry).is_none());
+    assert_eq!(d.conn.queue().live_current(), 1);
     d.conn.close(CloseReason::Cleanup);
-    assert!(entry.flags.ended().is_some());
+    assert_eq!(entry.flags.ended(), Some(TrackEndReason::Disconnected));
+    assert!(matches!(
+        stream.write(b"x"),
+        Err(CoreError::StreamClosed(CloseReason::ConnectionClosed))
+    ));
 }
 
 #[test]

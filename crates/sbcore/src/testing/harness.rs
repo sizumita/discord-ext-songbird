@@ -49,7 +49,8 @@ pub struct Harness {
 
 impl Harness {
     /// Builds a detached connection. `bell` is the doorbell to adopt; `None` creates an internal
-    /// one whose bytes are drained by `step` (tests then poll `take_ready` directly).
+    /// one whose bytes are drained by `step` (tests then poll `take_ready` directly). `Connect`
+    /// actions wait for an injected outcome (`DriverEvent::Connect` / `ConnectFailed`).
     pub fn detached(
         guild_id: NonZeroU64,
         user_id: NonZeroU64,
@@ -74,6 +75,9 @@ impl Harness {
             clock,
         };
         let (conn, worker) = ConnShared::new_detached(params, bell)?;
+        // No Driver runs the connect future: the test supplies its outcome
+        // (`inject_driver_event(Connect | ConnectFailed)`), so the state stays `connecting` until then.
+        conn.set_detached_auto_connect(false);
         let key = registry::key_of(&conn);
         registry::register_conn(key, &manual);
         let harness = Harness {
@@ -234,7 +238,7 @@ pub enum DriverEvent {
 /// silently dropping like `Dispatch`; a closed channel (connection closed, or receive disabled)
 /// drops the input like `Dispatch` does.
 fn send_rx(conn: &ConnShared, input: RxInput) -> Result<(), CoreError> {
-    let Some(tx) = conn.test_rx_sender() else {
+    let Some(tx) = conn.rx_sender_ref() else {
         return Ok(());
     };
     match tx.try_send(input) {
@@ -302,10 +306,13 @@ pub fn inject_user_left(conn: &ConnShared, user_id: u64) -> Result<(), CoreError
 }
 
 /// `DriverConnect` / `DriverReconnect` / `DriverDisconnect` (and the connect future's result).
+///
+/// Driver events take the `Dispatch` handler's own path (`apply()`, then `RxInput::LinkUp` /
+/// `LinkDown` on the tick channel, overflowing into the control queue like `Dispatch` does).
 pub fn inject_driver_event(conn: &ConnShared, ev: DriverEvent) -> Result<(), CoreError> {
     match ev {
         DriverEvent::Connect { ssrc } => {
-            conn.apply(GwInput::DriverConnect { ssrc });
+            conn.inject_driver_connect(ssrc, false);
             let st = conn.status();
             if st.state == "connecting" {
                 conn.apply(GwInput::ConnectResult {
@@ -313,7 +320,7 @@ pub fn inject_driver_event(conn: &ConnShared, ev: DriverEvent) -> Result<(), Cor
                     result: Ok(()),
                 });
             }
-            send_rx(conn, RxInput::LinkUp { ssrc: Some(ssrc) })
+            Ok(())
         }
         DriverEvent::ConnectFailed { timed_out } => {
             let st = conn.status();
@@ -328,12 +335,12 @@ pub fn inject_driver_event(conn: &ConnShared, ev: DriverEvent) -> Result<(), Cor
             Ok(())
         }
         DriverEvent::Reconnect { ssrc } => {
-            conn.apply(GwInput::DriverReconnect { ssrc });
-            send_rx(conn, RxInput::LinkUp { ssrc: Some(ssrc) })
+            conn.inject_driver_connect(ssrc, true);
+            Ok(())
         }
         DriverEvent::Disconnect { kind, reason } => {
-            conn.apply(GwInput::DriverDisconnect { kind, reason });
-            send_rx(conn, RxInput::LinkDown)
+            conn.inject_driver_disconnect(kind, reason);
+            Ok(())
         }
     }
 }
@@ -371,21 +378,18 @@ mod tests {
 
     #[test]
     fn detached_follows_the_connshared_contract() {
-        // `ConnShared::new_detached` is W2's; until it is implemented `detached` must surface its
-        // error rather than panic, and must not leak the internal doorbell or registry entries.
+        // Serialised with the tests that assert the process-wide connection counters.
+        let _serial = crate::conn::TEST_LOCK.lock();
         let id = NonZeroU64::new(1).unwrap();
-        match Harness::detached(id, id, settings(), None, true) {
-            Ok((conn, h)) => {
-                assert_eq!(conn.status().state, "idle");
-                h.step(0).unwrap();
-                h.step(100).unwrap();
-                assert_eq!(h.elapsed(), Duration::from_millis(100));
-                assert_eq!(h.parked(), 0);
-                conn.close(crate::error::CloseReason::Requested);
-                h.step(20).unwrap();
-            }
-            Err(e) => assert!(matches!(e, CoreError::Internal(_)), "{e:?}"),
-        }
+        let (conn, h) = Harness::detached(id, id, settings(), None, true).unwrap();
+        assert!(conn.is_detached());
+        assert_eq!(conn.status().state, "idle");
+        h.step(0).unwrap();
+        h.step(100).unwrap();
+        assert_eq!(h.elapsed(), Duration::from_millis(100));
+        assert_eq!(h.parked(), 0);
+        conn.close(crate::error::CloseReason::Requested);
+        h.step(20).unwrap();
     }
 
     #[test]

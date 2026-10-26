@@ -38,7 +38,7 @@ use crate::limits::{
 };
 use crate::runtime::{LiveCounter, Role, live, set_role};
 use crate::sync::lock_checked;
-use crate::tracks::flags::{DECODE_ERROR, DoneGuard, TrackFlags};
+use crate::tracks::flags::{DECODE_ERROR, DoneGuard, PANICKED, TrackFlags};
 use crate::wake::{WakeId, WakeToken};
 
 /// Live decode threads in this process (`MAX_ENCODED_WORKERS`).
@@ -201,15 +201,21 @@ impl EncodedShared {
     }
 
     /// The internal decoded-audio queue (the songbird track reads it).
-    #[allow(dead_code)] // called by W2's ConnShared::open_* / play (phase-2 integration)
+    #[cfg(test)]
     pub(crate) fn pcm(&self) -> &Arc<PcmQueue> {
         &self.pcm
     }
 
-    /// Attaches songbird's track (or a `FakeTrackControl`), once.
-    #[allow(dead_code)] // called by W2's ConnShared::open_* / play (phase-2 integration)
+    /// Attaches songbird's track (or a `FakeTrackControl`), once (`ConnShared::open_encoded` and
+    /// the queue's lazy `Encoded` entries). The first decoded frame resumes it.
     pub(crate) fn attach_track(&self, t: Box<dyn TrackControl>) {
         self.pcm.attach_track(t);
+    }
+
+    /// User pause (`paused=True` queue entries): the decoded audio is held and the track stays
+    /// paused until `pause(false)`.
+    pub(crate) fn pause(&self, paused: bool) {
+        self.pcm.pause(paused);
     }
 
     /// Bytes buffered in the ring (not yet decoded).
@@ -312,6 +318,15 @@ impl LiveSource for EncodedShared {
         self.pcm.conn_closed();
         // Wake writers waiting for ring space: they now get StreamClosed("connection_closed").
         self.token.notify();
+    }
+
+    fn set_user_paused(&self, paused: bool) -> bool {
+        self.pcm.pause(paused);
+        true
+    }
+
+    fn set_source_volume(&self, v: f32) -> bool {
+        self.pcm.set_volume(v).is_ok()
     }
 }
 
@@ -638,6 +653,7 @@ fn decode_main(shared: Arc<EncodedShared>, flags: Arc<TrackFlags>, slot: WorkerS
     let outcome = match catch_unwind(AssertUnwindSafe(|| decode_loop(&shared))) {
         Ok(o) => o,
         Err(_) => {
+            flags.hint(PANICKED);
             ::log::error!(
                 "encoded stream {}: the decode thread panicked; the track ends with reason \
                  'error' (please report this bug)",
@@ -667,22 +683,32 @@ fn decode_main(shared: Arc<EncodedShared>, flags: Arc<TrackFlags>, slot: WorkerS
 /// Opens the ring, spawns the decode thread and builds the (paused) songbird input
 /// (`LimitExceeded` beyond `MAX_ENCODED_WORKERS`). The internal `PcmQueue` takes its id from
 /// `tx::next_source_id()`, and `EncodedShared`'s `LiveSource::id` is that id. Self-mute is not
-/// shared with the connection: use [`spawn_encoded_with`].
+/// shared with the connection and the internal queue uses the real clock: use
+/// [`spawn_encoded_with`].
 pub fn spawn_encoded(
     spec: EncodedSpec,
     token: WakeToken,
     done: DoneGuard,
 ) -> Result<(Arc<EncodedShared>, songbird::input::Input), CoreError> {
-    spawn_encoded_with(spec, token, done, Arc::new(AtomicBool::new(false)))
+    spawn_encoded_with(
+        spec,
+        token,
+        done,
+        Arc::new(AtomicBool::new(false)),
+        Clock::Real,
+    )
 }
 
 /// [`spawn_encoded`] with the connection's send-mute flag (§7.8), so the stream holds its
-/// position while self-muted like every other live source.
+/// position while self-muted like every other live source, and the connection's clock, so the
+/// internal queue's idle detection and positions use the same time base as the housekeeper (a
+/// detached connection's `ManualClock`).
 pub fn spawn_encoded_with(
     spec: EncodedSpec,
     token: WakeToken,
     done: DoneGuard,
     send_muted: Arc<AtomicBool>,
+    clock: Clock,
 ) -> Result<(Arc<EncodedShared>, songbird::input::Input), CoreError> {
     let cap = check(
         "max_buffer_bytes",
@@ -702,14 +728,7 @@ pub fn spawn_encoded_with(
         volume,
         when_disconnected: DisconnectPolicy::Buffer,
     };
-    let pcm = PcmQueue::new_internal(
-        next_source_id(),
-        &pcm_spec,
-        None,
-        Clock::Real,
-        send_muted,
-        false,
-    )?;
+    let pcm = PcmQueue::new_internal(next_source_id(), &pcm_spec, None, clock, send_muted, false)?;
     let flags = done.flags().clone();
     let provider: Arc<dyn PcmProvider> = pcm.clone();
     let input = live_pcm_input(provider, done, false)?;

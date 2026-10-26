@@ -357,6 +357,10 @@ pub struct PcmQueue {
     base: Instant,
     /// `PlaybackStarted/Idle/Ended` events (off for internal queues).
     emit_events: bool,
+    /// Internal queue of an encoded stream: its end of input (`close(Drain)`) keeps a
+    /// **user-paused** track that still holds audio (the queue entry's `resume()` plays it out),
+    /// instead of stopping it like a `PlaybackStream` drain-close does.
+    hold_paused_drain: bool,
     house: Mutex<HouseLocal>,
     track: OnceLock<Box<dyn TrackControl>>,
     _live: LiveCounter,
@@ -442,6 +446,7 @@ impl PcmQueue {
             clock,
             base: now,
             emit_events,
+            hold_paused_drain: !emit_events,
             house: Mutex::new(HouseLocal {
                 spare: Vec::with_capacity(GRAVE_CAP),
                 state: HouseState::default(),
@@ -1056,7 +1061,6 @@ impl PcmQueue {
 
     /// Attaches songbird's track (or a `FakeTrackControl`), once, and brings it to the state the
     /// queue wants (a write that raced ahead of the attach resumes it now).
-    #[allow(dead_code)] // called by W2's ConnShared::open_* / play (phase-2 integration)
     pub(crate) fn attach_track(&self, t: Box<dyn TrackControl>) {
         if self.track.set(t).is_err() {
             return;
@@ -1069,7 +1073,7 @@ impl PcmQueue {
             // never written) can never drain, so it is stopped.
             let stop = match g.closed {
                 Some(CloseMode::Abort) => true,
-                Some(CloseMode::Drain) => !g.track_playing,
+                Some(CloseMode::Drain) => self.drain_cannot_play(&g),
                 None => false,
             };
             if stop && !g.stop_sent {
@@ -1078,6 +1082,12 @@ impl PcmQueue {
             }
         }
         self.finish(after);
+    }
+
+    /// Whether a drain-closed track can never play its rest (so it is stopped): it is not playing,
+    /// unless it is an encoded stream's queue that a user pause holds with audio left.
+    fn drain_cannot_play(&self, g: &QueueInner) -> bool {
+        !g.track_playing && !(self.hold_paused_drain && g.paused_user && g.queued_frames > 0)
     }
 
     /// The encoded decode thread failed: let the decoded audio drain, then the decoder reports an
@@ -1501,7 +1511,7 @@ impl LiveSource for PcmQueue {
             g.gate.armed = false;
             // A paused (idle or user) track is never pulled, so it cannot drain: stop it. A
             // playing one returns EOF once empty.
-            let nothing_to_drain = !g.track_playing;
+            let nothing_to_drain = self.drain_cannot_play(&g);
             if mode == CloseMode::Abort {
                 self.abort_locked(&mut g, &mut after);
             } else if std::mem::take(&mut g.space_wanted) > 0 || std::mem::take(&mut g.idle_waiting)
@@ -1530,6 +1540,15 @@ impl LiveSource for PcmQueue {
         if ring {
             self.ring();
         }
+    }
+
+    fn set_user_paused(&self, paused: bool) -> bool {
+        self.pause(paused);
+        true
+    }
+
+    fn set_source_volume(&self, v: f32) -> bool {
+        self.set_volume(v).is_ok()
     }
 }
 

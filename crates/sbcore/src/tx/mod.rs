@@ -93,12 +93,14 @@ impl TrackControl for songbird::tracks::TrackHandle {
 }
 
 /// Test double for detached connections (§13.2): records calls; `stop()` resolves the flags as a
-/// Dispatch `End(Stop)` would.
+/// Dispatch `End(Stop)` would. It also keeps the pause state songbird would see (the log is
+/// bounded, so the state cannot be derived from it).
 #[cfg(feature = "test-hooks")]
 #[derive(Debug)]
 pub struct FakeTrackControl {
     log: Mutex<Vec<&'static str>>,
     flags: Arc<TrackFlags>,
+    paused: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -106,16 +108,28 @@ impl FakeTrackControl {
     /// Calls beyond this many are not recorded (test-only bound).
     pub const LOG_CAP: usize = 4096;
 
+    /// A control for a track handed over paused (live sources start paused, §4.9).
     pub fn new(flags: Arc<TrackFlags>) -> Self {
+        Self::with_paused(flags, true)
+    }
+
+    /// A control for a track handed over paused or playing (memory tracks: `paused=`).
+    pub fn with_paused(flags: Arc<TrackFlags>, paused: bool) -> Self {
         FakeTrackControl {
             log: Mutex::new(Vec::new()),
             flags,
+            paused: std::sync::atomic::AtomicBool::new(paused),
         }
     }
 
     /// The recorded calls (`"pause"`, `"play"`, `"stop"`), oldest first.
     pub fn log(&self) -> Vec<&'static str> {
         self.log.lock().clone()
+    }
+
+    /// Whether songbird would consider the track paused (the last `pause`/`play` wins).
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
     }
 
     fn record(&self, call: &'static str) {
@@ -129,16 +143,22 @@ impl FakeTrackControl {
 #[cfg(feature = "test-hooks")]
 impl TrackControl for FakeTrackControl {
     fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
         self.record("pause");
     }
 
     fn play(&self) {
+        self.paused.store(false, Ordering::SeqCst);
         self.record("play");
     }
 
     fn stop(&self) {
         self.record("stop");
-        self.flags.resolve(TrackEndReason::Stopped, None);
+        // Like a songbird handle: once the connection is closing the Driver is gone (T2 removed
+        // the Dispatch), so no `End(Stop)` arrives and T8 resolves the track `disconnected`.
+        if !self.flags.conn_closing() {
+            self.flags.resolve(TrackEndReason::Stopped, None);
+        }
     }
 }
 
@@ -161,6 +181,16 @@ pub trait LiveSource: Send + Sync {
     /// `StreamClosed("connection_closed")`. See `docs/deviations/W4.md`.
     fn conn_closed(&self) {
         self.close(CloseMode::Abort);
+    }
+    /// `TrackHandle.pause()/resume()` of this source's track: `true` if the source keeps the
+    /// user pause itself (it then pauses/resumes its songbird track), `false` to use the handle.
+    fn set_user_paused(&self, _paused: bool) -> bool {
+        false
+    }
+    /// `TrackHandle.set_volume()`: `true` if the source applies the volume itself (its decoder),
+    /// `false` to use the songbird track's volume.
+    fn set_source_volume(&self, _v: f32) -> bool {
+        false
     }
 }
 

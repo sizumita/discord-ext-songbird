@@ -41,14 +41,14 @@ use crate::limits::{
 };
 use crate::runtime::{self, LiveCounter, live};
 use crate::rx::pipeline::{RxConfig, RxPipeline};
-use crate::rx::queue::{RxCmd, RxSource, SubQueue, SubSpec, Subscription};
+use crate::rx::queue::{RxCmd, SubQueue, SubSpec, Subscription};
 use crate::rx::raw::RxSender;
 use crate::rx::router::{RouterHandle, RouterQueue, RouterSpec};
 use crate::sync::lock_checked;
 use crate::tracks::flags::{PlayOpts, TrackEndReason, TrackKind, TrackRef, loop_state};
 use crate::tracks::queue::TrackQueue;
 use crate::tracks::registry::TrackRegistry;
-use crate::tx::encoded::{EncodedShared, EncodedSpec, spawn_encoded};
+use crate::tx::encoded::{EncodedShared, EncodedSpec, spawn_encoded_with};
 use crate::tx::opus_stream::{OpusQueue, OpusStreamSpec, opus_stream_input};
 use crate::tx::queue::{PcmQueue, PlaybackSpec};
 use crate::tx::reader::live_pcm_input;
@@ -79,6 +79,16 @@ pub(crate) enum Exec {
     Link { seq: u64, up: bool },
 }
 
+/// One registered live source.
+struct SourceEntry {
+    src: Weak<dyn LiveSource>,
+    /// Counted towards `MAX_LIVE_SOURCES_PER_CONN` (`open_*`). A lazy `Encoded` queue entry is a
+    /// live source too, but it is the queue's current entry and counts towards
+    /// `MAX_PLAYING_TRACKS_PER_CONN` instead, so songbird never holds more than
+    /// `MAX_LIVE_SOURCES_PER_CONN + MAX_PLAYING_TRACKS_PER_CONN` (= the 48 preallocated) tracks.
+    counted: bool,
+}
+
 /// Everything one voice connection owns (§4.3).
 pub struct ConnShared {
     me: Weak<ConnShared>,
@@ -104,8 +114,8 @@ pub struct ConnShared {
     #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
     rx_tx: Option<RxSender>,
     dispatch: Dispatch,
-    /// L10: live sources, pruned on insert, closed at T5.
-    sources: Mutex<Vec<Weak<dyn LiveSource>>>,
+    /// L10: live sources, pruned on insert, closed at T5 (`conn_closed`).
+    sources: Mutex<Vec<SourceEntry>>,
     /// L10: connect tasks (op tasks live in `ops`). The ConnWorker exits on the shutdown flag.
     tasks: Mutex<Vec<AbortHandle>>,
     ops: OpRegistry,
@@ -121,10 +131,10 @@ pub struct ConnShared {
     next_sub_id: AtomicU64,
     stats: ConnStats,
     /// Race-free I6 admissions (free-threaded callers): `MAX_PLAYING_TRACKS_PER_CONN`,
-    /// `MAX_LIVE_SOURCES_PER_CONN`, `MAX_SUBS_PER_CONN` (subscriptions and routers).
+    /// `MAX_LIVE_SOURCES_PER_CONN`, `MAX_SUBS_PER_CONN` for routers (subscription queues are
+    /// admitted by `WorkerShared::reserve_sub`, which router-created streams share).
     playing_adm: Admission,
     live_adm: Admission,
-    subs_adm: Admission,
     routers_adm: Admission,
     #[cfg(feature = "test-hooks")]
     pub(super) det: super::detached::DetachedState,
@@ -265,7 +275,6 @@ impl ConnShared {
                 stats: ConnStats::default(),
                 playing_adm: Admission::new(),
                 live_adm: Admission::new(),
-                subs_adm: Admission::new(),
                 routers_adm: Admission::new(),
                 #[cfg(feature = "test-hooks")]
                 det: super::detached::DetachedState::new(),
@@ -290,10 +299,12 @@ impl ConnShared {
         Ok((conn, worker))
     }
 
-    /// A fresh receive pipeline (creation, and rebuild after a caught worker panic).
+    /// A fresh receive pipeline (creation, and rebuild after a caught worker panic), attached to
+    /// the connection's `WorkerShared` so router-created streams are budget-checked, registered
+    /// for T6 and counted towards `MAX_SUBS_PER_CONN`.
     pub(crate) fn new_pipeline(&self) -> RxPipeline {
         let s = &self.settings;
-        RxPipeline::new(
+        let mut p = RxPipeline::new(
             RxConfig {
                 enabled: s.receive,
                 hangover_ms: s.hangover_ms,
@@ -306,7 +317,9 @@ impl ConnShared {
             self.events.clone(),
             self.ctrl.clone(),
             self.unclassified.clone(),
-        )
+        );
+        p.attach_worker(Arc::downgrade(&self.worker));
+        p
     }
 
     // ── gateway ──────────────────────────────────────────────────────────────────────────────────
@@ -382,6 +395,13 @@ impl ConnShared {
         self.worker.timeline_ms()
     }
 
+    /// The timeline position (whole 20 ms ticks since the origin `t0`) of the instant `t`.
+    pub(crate) fn timeline_ms_at(&self, t: Instant) -> u64 {
+        let ms =
+            u64::try_from(t.saturating_duration_since(self.t0).as_millis()).unwrap_or(u64::MAX);
+        ms - ms % u64::from(TICK_MS)
+    }
+
     // ── signalling to Python ─────────────────────────────────────────────────────────────────────
 
     /// Ready wake ids (Python only, after `sock_recv` returned).
@@ -418,11 +438,7 @@ impl ConnShared {
         }
         spec.validate()?;
         // Held until the queue is registered (visible to `open_queues`).
-        let _slot = self
-            .subs_adm
-            .reserve("subscriptions", MAX_SUBS_PER_CONN, || {
-                self.worker.open_queues()
-            })?;
+        let _slot = self.worker.reserve_sub()?;
         let budget = self.worker.reserve_budget(spec.budget_bytes()?)?;
         let token = self.wake.alloc()?;
         let queue = SubQueue::new(&spec, token);
@@ -452,15 +468,14 @@ impl ConnShared {
         if !self.settings.receive {
             return Err(CoreError::ReceiveDisabled);
         }
-        // The streams it creates use these parameters: validate them like a subscription.
-        SubSpec {
-            source: RxSource::User(0),
-            format: spec.format,
-            chunk_ms: spec.chunk_ms,
-            max_queue_ms: spec.max_queue_ms,
-            overflow: spec.overflow,
-        }
-        .validate()?;
+        // The streams it creates use these parameters: validate them like a subscription, and
+        // refuse a router whose single stream could never fit the receive budget.
+        spec.validate()?;
+        check(
+            "max_receive_mb",
+            spec.stream_budget_bytes()?,
+            0..=self.settings.max_receive_bytes,
+        )?;
         // Held until the router is registered (visible to `open_routers`).
         let _slot = self
             .routers_adm
@@ -516,10 +531,18 @@ impl ConnShared {
         )?;
         let (track, done) = self.tracks.register(TrackKind::Playback);
         let input = live_pcm_input(q.clone(), done, false)?;
-        let ctl = self.start_live(&track, input, Some(id))?;
+        // Volume 1.0: the decoder applies the playback's volume (5 ms ramp).
+        let ctl = match self.start_live(&track, input, Some(id), 1.0) {
+            Ok(ctl) => ctl,
+            Err(e) => {
+                q.conn_closed();
+                return Err(e);
+            }
+        };
         q.attach_track(ctl);
         let weak: Weak<dyn LiveSource> = Arc::downgrade(&q) as Weak<dyn LiveSource>;
-        self.add_source(weak);
+        track.set_live(weak.clone());
+        self.add_source(weak, true);
         Ok((q, track))
     }
 
@@ -533,12 +556,27 @@ impl ConnShared {
         let _slot = self.reserve_live()?;
         let token = self.wake.alloc()?;
         let (track, done) = self.tracks.register(TrackKind::EncodedStream);
-        let (shared, input) = spawn_encoded(spec, token, done)?;
-        // Integration point (phase 2, W4): the encoded stream resumes its paused track on the
-        // first decoded frame; it needs this control once `EncodedShared` can take it.
-        let _ctl = self.start_live(&track, input, Some(shared.id()))?;
+        let (shared, input) = spawn_encoded_with(
+            spec,
+            token,
+            done,
+            self.send_muted.clone(),
+            self.clock.clone(),
+        )?;
+        // Volume 1.0: the decoder applies the stream's volume. The first decoded frame resumes
+        // the paused track through this control.
+        let ctl = match self.start_live(&track, input, Some(shared.id()), 1.0) {
+            Ok(ctl) => ctl,
+            Err(e) => {
+                // Ends the decode thread (it waits on the ring otherwise).
+                shared.conn_closed();
+                return Err(e);
+            }
+        };
+        shared.attach_track(ctl);
         let weak: Weak<dyn LiveSource> = Arc::downgrade(&shared) as Weak<dyn LiveSource>;
-        self.add_source(weak);
+        track.set_live(weak.clone());
+        self.add_source(weak, true);
         Ok((shared, track))
     }
 
@@ -554,11 +592,18 @@ impl ConnShared {
         let q = OpusQueue::new(&spec, token, self.send_muted.clone())?;
         let (track, done) = self.tracks.register(TrackKind::OpusStream);
         let input = opus_stream_input(q.clone(), done)?;
-        // Integration point (phase 2, W4): the first `send` resumes the paused track; it needs
-        // this control once `OpusQueue` can take it.
-        let _ctl = self.start_live(&track, input, Some(q.id()))?;
+        // songbird decodes Opus streams, so the track carries the stream's volume. The first
+        // `send` resumes the paused track through this control.
+        let ctl = match self.start_live(&track, input, Some(q.id()), q.volume()) {
+            Ok(ctl) => ctl,
+            Err(e) => {
+                q.conn_closed();
+                return Err(e);
+            }
+        };
+        q.attach_track(ctl);
         let weak: Weak<dyn LiveSource> = Arc::downgrade(&q) as Weak<dyn LiveSource>;
-        self.add_source(weak);
+        self.add_source(weak, true);
         Ok((q, track))
     }
 
@@ -575,7 +620,12 @@ impl ConnShared {
         // Held until the track is started (visible to `TrackRegistry::playing`).
         let _slot = self.reserve_playing()?;
         let (track, done) = self.tracks.register(src.kind());
-        let (input, _) = src.to_input(done, &self.wake)?;
+        let (input, _) = src.to_input_with(
+            done,
+            &self.wake,
+            self.send_muted.clone(),
+            self.clock.clone(),
+        )?;
         self.start_track(&track, input, opts)?;
         Ok(track)
     }
@@ -607,14 +657,14 @@ impl ConnShared {
         self.queue.stop();
         let sources: Vec<Arc<dyn LiveSource>> = lock_checked(&self.sources)
             .iter()
-            .filter_map(Weak::upgrade)
+            .filter_map(|e| e.src.upgrade())
             .collect();
         for s in &sources {
             s.close(CloseMode::Abort);
         }
         self.with_driver(|d| d.stop());
         #[cfg(feature = "test-hooks")]
-        self.det.drop_all();
+        self.drop_parked();
         self.worker.wake();
     }
 
@@ -727,10 +777,11 @@ impl ConnShared {
         if let Some(d) = driver {
             d.teardown();
         }
-        // T5: close every live source (queued audio freed now; writers get StreamClosed).
-        let sources: Vec<Weak<dyn LiveSource>> = std::mem::take(&mut *lock_checked(&self.sources));
-        for s in sources.iter().filter_map(Weak::upgrade) {
-            s.close(CloseMode::Abort);
+        // T5: close every live source (queued audio freed now; writers get
+        // StreamClosed("connection_closed"), waiters are woken).
+        let sources: Vec<SourceEntry> = std::mem::take(&mut *lock_checked(&self.sources));
+        for s in sources.iter().filter_map(|e| e.src.upgrade()) {
+            s.conn_closed();
         }
         // T6 (synchronous): close every subscription/router queue, then the event queues with the
         // final Disconnected event, then stop the worker.
@@ -750,7 +801,7 @@ impl ConnShared {
         self.tracks.finish_all(TrackEndReason::Disconnected);
         self.queue.close_all(TrackEndReason::Disconnected);
         #[cfg(feature = "test-hooks")]
-        self.det.drop_all();
+        self.drop_parked();
         self.ops.fail_all();
         self.ctrl.set_closed(reason);
         self.wake.notify(WAKE_TRACKS);
@@ -789,7 +840,13 @@ impl ConnShared {
             ("dispatch_panics", ld(&d.panics)),
             ("ctrl_dropped", ld(&d.ctrl_dropped)),
             ("heartbeat_misses", self.worker.heartbeat_misses()),
-            ("panics", self.worker.panics()),
+            (
+                "panics",
+                self.worker
+                    .panics()
+                    .saturating_add(ld(&d.panics))
+                    .saturating_add(self.tracks.panics()),
+            ),
             ("connects", ld(&self.stats.connects)),
             ("rejoins", ld(&self.stats.rejoins)),
             (
@@ -1046,10 +1103,7 @@ impl ConnShared {
     ) -> Result<(), CoreError> {
         #[cfg(feature = "test-hooks")]
         if self.detached {
-            let ctl = self.park(track, input, None);
-            if opts.paused {
-                ctl.pause();
-            }
+            let _ctl = self.park(track, input, None, opts.paused);
             return Ok(());
         }
         let t = songbird::tracks::Track::new(input)
@@ -1072,27 +1126,64 @@ impl ConnShared {
         done: crate::tracks::DoneGuard,
     ) -> Result<Option<Arc<EncodedShared>>, CoreError> {
         self.ensure_open()?;
-        let (input, stream) = src.to_input(done, &self.wake)?;
-        if let Some(s) = &stream {
-            let weak: Weak<dyn LiveSource> = Arc::downgrade(s) as Weak<dyn LiveSource>;
-            self.add_source(weak);
+        let SourceSpec::Encoded(fac) = src else {
+            let (input, _) = src.to_input_with(
+                done,
+                &self.wake,
+                self.send_muted.clone(),
+                self.clock.clone(),
+            )?;
+            self.start_track(track, input, opts)?;
+            return Ok(None);
+        };
+        // A lazy encoded stream is a live source (§4.9): it starts paused with volume 1.0 (the
+        // decoder applies the entry's current volume) and the first decoded frame resumes it.
+        // Live sources cannot loop. `paused=True` holds the decoded audio until resumed.
+        let spec = EncodedSpec {
+            volume: opts.volume,
+            ..fac.spec
+        };
+        let token = self.wake.alloc()?;
+        let (stream, input) = spawn_encoded_with(
+            spec,
+            token,
+            done,
+            self.send_muted.clone(),
+            self.clock.clone(),
+        )?;
+        if opts.paused {
+            stream.pause(true);
         }
-        self.start_track(track, input, opts)?;
-        Ok(stream)
+        // Registered first, so T5 closes it (or `add_source` does, if the connection is closing).
+        let weak: Weak<dyn LiveSource> = Arc::downgrade(&stream) as Weak<dyn LiveSource>;
+        track.set_live(weak.clone());
+        self.add_source(weak, false);
+        match self.start_live(track, input, Some(stream.id()), 1.0) {
+            Ok(ctl) => {
+                stream.attach_track(ctl);
+                Ok(Some(stream))
+            }
+            Err(e) => {
+                stream.conn_closed();
+                Err(e)
+            }
+        }
     }
 
-    /// Hands a live input to songbird **paused** (§4.9) and returns its track control.
+    /// Hands a live input to songbird **paused** (§4.9) with the given track volume and returns
+    /// its track control.
     fn start_live(
         &self,
         track: &TrackRef,
         input: songbird::input::Input,
         #[allow(unused_variables)] source_id: Option<u32>,
+        volume: f32,
     ) -> Result<Box<dyn TrackControl>, CoreError> {
         #[cfg(feature = "test-hooks")]
         if self.detached {
-            return Ok(self.park(track, input, source_id));
+            return Ok(self.park(track, input, source_id, true));
         }
-        let t = songbird::tracks::Track::new(input).pause();
+        let t = songbird::tracks::Track::new(input).volume(volume).pause();
         let Some(handle) = self.with_driver(|d| d.play(t)) else {
             return Err(self.closed_err());
         };
@@ -1113,31 +1204,37 @@ impl ConnShared {
         self.live_adm
             .reserve("live_sources", MAX_LIVE_SOURCES_PER_CONN, || {
                 let mut v = lock_checked(&self.sources);
-                v.retain(|w| w.strong_count() > 0);
-                v.len()
+                v.retain(|e| e.src.strong_count() > 0);
+                v.iter().filter(|e| e.counted).count()
             })
     }
 
-    /// One of `MAX_PLAYING_TRACKS_PER_CONN` (`play()` tracks plus the current queue entry); hold
-    /// the reservation until the track is started (`TrackRegistry::playing` counts it).
+    /// One of `MAX_PLAYING_TRACKS_PER_CONN` (`play()` tracks plus the current queue entry, also a
+    /// lazy encoded stream); hold the reservation until the track is started
+    /// (`TrackRegistry::playing` or `TrackQueue::live_current` counts it).
     pub(crate) fn reserve_playing(&self) -> Result<Reservation<'_>, CoreError> {
         self.playing_adm
             .reserve("playing_tracks", MAX_PLAYING_TRACKS_PER_CONN, || {
-                self.tracks.playing()
+                // Two leaf locks, one after the other (never nested).
+                self.tracks.playing() + self.queue.live_current()
             })
     }
 
-    /// Registers a live source for T5 and the housekeeper.
-    fn add_source(&self, s: Weak<dyn LiveSource>) {
+    /// Registers a live source for T5 and the housekeeper (`counted`: towards
+    /// `MAX_LIVE_SOURCES_PER_CONN`).
+    fn add_source(&self, s: Weak<dyn LiveSource>, counted: bool) {
         {
             let mut v = lock_checked(&self.sources);
-            v.retain(|w| w.strong_count() > 0);
-            v.push(s.clone());
+            v.retain(|e| e.src.strong_count() > 0);
+            v.push(SourceEntry {
+                src: s.clone(),
+                counted,
+            });
         }
         if self.is_closed() {
             // T5 may already have run.
             if let Some(src) = s.upgrade() {
-                src.close(CloseMode::Abort);
+                src.conn_closed();
             }
             return;
         }
@@ -1240,12 +1337,3 @@ fn input_kind(i: &GwInput) -> &'static str {
 
 #[cfg(test)]
 mod tests;
-
-/// Test hooks (§13.2, W5; see `docs/deviations/W5.md`): the tick-channel sender `Dispatch` feeds, so
-/// `testing::inject_*` deliver through the same path. `None` when no channel exists.
-#[cfg(feature = "test-hooks")]
-impl ConnShared {
-    pub(crate) fn test_rx_sender(&self) -> Option<&RxSender> {
-        self.rx_sender_ref()
-    }
-}

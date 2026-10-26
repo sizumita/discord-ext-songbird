@@ -18,12 +18,13 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use super::LogLimiter;
+use super::admission::{Admission, Reservation};
 use super::gateway::GwInput;
 use super::shared::ConnShared;
 use crate::clock::Clock;
 use crate::error::{CloseReason, CoreError};
 use crate::events::EventData;
-use crate::limits::{HEARTBEAT_MISS, TICK_CHANNEL_CAP, TICK_MS, check};
+use crate::limits::{HEARTBEAT_MISS, MAX_SUBS_PER_CONN, TICK_CHANNEL_CAP, TICK_MS, check};
 use crate::runtime::{LiveCounter, live};
 use crate::rx::pipeline::{RxCounts, RxPipeline};
 use crate::rx::queue::{RxCmd, SubQueue};
@@ -88,6 +89,9 @@ pub struct WorkerShared {
     known_queues: Mutex<Vec<Weak<SubQueue>>>,
     /// L10.
     known_routers: Mutex<Vec<Weak<RouterQueue>>>,
+    /// Race-free `MAX_SUBS_PER_CONN` admissions: `ConnShared::subscribe` (Python threads) and the
+    /// streams routers create (the worker) share it.
+    subs_adm: Admission,
     budget_used: AtomicUsize,
     budget_max: usize,
     /// Published by the worker after every step.
@@ -98,6 +102,9 @@ pub struct WorkerShared {
     panics: AtomicU64,
     /// Heartbeat gaps longer than `HEARTBEAT_MISS` (§8.8).
     heartbeat_misses: AtomicU64,
+    /// Makes the next worker step panic (panic-containment tests).
+    #[cfg(test)]
+    pub(crate) panic_next_step: std::sync::atomic::AtomicBool,
 }
 
 impl WorkerShared {
@@ -109,12 +116,15 @@ impl WorkerShared {
             shutdown: Shutdown::new(),
             known_queues: Mutex::new(Vec::new()),
             known_routers: Mutex::new(Vec::new()),
+            subs_adm: Admission::new(),
             budget_used: AtomicUsize::new(0),
             budget_max,
             timeline_ms: AtomicU64::new(0),
             rx_counts: Mutex::new(RxCounts::default()),
             panics: AtomicU64::new(0),
             heartbeat_misses: AtomicU64::new(0),
+            #[cfg(test)]
+            panic_next_step: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -169,6 +179,13 @@ impl WorkerShared {
         let mut v = lock_checked(&self.known_routers);
         v.retain(|w| w.strong_count() > 0);
         v.push(Arc::downgrade(q));
+    }
+
+    /// One of `MAX_SUBS_PER_CONN` subscription queues (explicit subscriptions and router-created
+    /// streams alike). Hold the reservation until the queue is registered (`register_queue`).
+    pub(crate) fn reserve_sub(&self) -> Result<Reservation<'_>, CoreError> {
+        self.subs_adm
+            .reserve("subscriptions", MAX_SUBS_PER_CONN, || self.open_queues())
     }
 
     /// Open subscription queues (for `MAX_SUBS_PER_CONN`).
@@ -348,6 +365,10 @@ impl ConnWorker {
     }
 
     fn step_inner(&mut self, conn: &Arc<ConnShared>, now: Instant) -> Option<Instant> {
+        #[cfg(test)]
+        if self.shared.panic_next_step.swap(false, Ordering::AcqRel) {
+            panic!("injected worker panic");
+        }
         // 1. Commands (subscribe/filter/source/link), applied at this tick boundary.
         std::mem::swap(&mut *lock_checked(&self.shared.cmds), &mut self.cmd_buf);
         for cmd in self.cmd_buf.drain(..) {
@@ -433,8 +454,8 @@ impl ConnWorker {
         if self.stall_reported != Some(since) {
             self.stall_reported = Some(since);
             self.stall_last_apply = None;
-            let since_ms =
-                u64::try_from(now.saturating_duration_since(since).as_millis()).unwrap_or(u64::MAX);
+            // The receive-timeline position at which the stall began (last real tick or link-up).
+            let since_ms = conn.timeline_ms_at(since);
             conn.events().emit(&EventData::ReceiveStalled { since_ms });
         }
         if self
@@ -679,9 +700,11 @@ mod hooked_tests {
             _ => None,
         })
         .collect();
+        // `since_ms` is the timeline position where the stall began (the connection was created
+        // at the same manual instant as `since`).
         assert!(matches!(
             stalls[..],
-            [EventData::ReceiveStalled { since_ms: 2_000 }]
+            [EventData::ReceiveStalled { since_ms: 0 }]
         ));
         let reinstalls = || {
             conn.stats()
@@ -699,9 +722,62 @@ mod hooked_tests {
         w.watch_stall(&conn, Some(m.now()), m.now());
         assert!(matches!(
             events.try_pop(),
-            Pop::Item(EventData::ReceiveStalled { since_ms: 0 })
+            Pop::Item(EventData::ReceiveStalled { since_ms: 5_000 })
         ));
         conn.close(CloseReason::Cleanup);
+    }
+
+    /// §5.7: a panic in a worker step closes every subscription with `internal_error`, counts in
+    /// `stats()["panics"]` and rebuilds the receive pipeline empty; receiving continues.
+    #[test]
+    fn a_worker_panic_closes_the_streams_and_rebuilds_the_pipeline() {
+        use crate::format::PCM16_24K;
+        use crate::rx::{Overflow, RouterSpec, RxSource, SubSpec};
+
+        let _serial = crate::conn::TEST_LOCK.lock();
+        let (conn, mut w, m, _peer) = detached();
+        let spec = SubSpec {
+            source: RxSource::User(7),
+            format: PCM16_24K,
+            chunk_ms: 20,
+            max_queue_ms: 200,
+            overflow: Overflow::DropOldest,
+        };
+        let sub = conn.subscribe(spec.clone()).unwrap();
+        let router = conn
+            .subscribe_router(RouterSpec {
+                format: PCM16_24K,
+                chunk_ms: 20,
+                max_queue_ms: 200,
+                overflow: Overflow::DropOldest,
+                include: None,
+                ignore_bots: false,
+                close_on_leave: true,
+            })
+            .unwrap();
+        w.step(m.now());
+        let stat = |k: &str| conn.stats().into_iter().find(|(n, _)| *n == k).unwrap().1;
+        assert_eq!((stat("subscriptions"), stat("routers")), (1, 1));
+        w.shared.panic_next_step.store(true, Ordering::Release);
+        m.advance(TICK);
+        assert_eq!(w.step(m.now()), Some(m.now() + TICK));
+        assert_eq!(stat("panics"), 1);
+        assert_eq!(sub.queue.close_reason(), Some(CloseReason::InternalError));
+        assert!(matches!(
+            router.queue.try_pop_or_arm(),
+            crate::events::Pop::Closed(_)
+        ));
+        // The rebuilt pipeline serves new subscriptions.
+        let again = conn.subscribe(spec).unwrap();
+        m.advance(TICK);
+        w.step(m.now());
+        assert_eq!((stat("subscriptions"), stat("routers")), (1, 0));
+        assert!(!again.queue.is_closed());
+        conn.close(CloseReason::Cleanup);
+        assert_eq!(
+            again.queue.close_reason(),
+            Some(CloseReason::ConnectionClosed)
+        );
     }
 
     #[test]

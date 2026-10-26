@@ -28,7 +28,7 @@ use super::{PcmProvider, enter_mixer};
 use crate::error::CoreError;
 use crate::limits::{FRAMES_PER_TICK_48K, MIX_RATE};
 use crate::runtime::{LiveCounter, live};
-use crate::tracks::flags::{DECODE_ERROR, DoneGuard, EOF_SEEN};
+use crate::tracks::flags::{DECODE_ERROR, DoneGuard, EOF_SEEN, PANICKED};
 
 fn eof() -> SymphError {
     SymphError::IoError(ErrorKind::UnexpectedEof.into())
@@ -75,7 +75,8 @@ impl LiveReader {
 
     fn next_inner(&mut self) -> SymphResult<Packet> {
         if self.poison.load(Ordering::Acquire) {
-            self.done.flags().hint(DECODE_ERROR);
+            // The decoder (or this reader) caught a panic: end the track (§5.7).
+            self.done.flags().hint(DECODE_ERROR | PANICKED);
             return Err(eof());
         }
         if self.p.should_end() {
@@ -143,6 +144,7 @@ impl FormatReader for LiveReader {
             Ok(r) => r,
             Err(_) => {
                 self.poison.store(true, Ordering::Release);
+                self.done.flags().hint(DECODE_ERROR | PANICKED);
                 self.p.on_poison();
                 Err(eof())
             }

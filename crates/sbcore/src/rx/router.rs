@@ -205,6 +205,10 @@ pub struct RouterHandle {
 
 impl Drop for RouterHandle {
     fn drop(&mut self) {
+        // §4.10: no lock in a forked child (see `Subscription`'s `Drop`).
+        if crate::runtime::check_not_forked().is_err() {
+            return;
+        }
         self.queue.close(true);
     }
 }

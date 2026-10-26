@@ -288,7 +288,7 @@ fn a_panic_in_pull_gives_silence_then_eof() {
     let p = Arc::new(Panicky {
         flags: AtomicU8::new(0),
     });
-    let (done, _) = guard();
+    let (done, track) = guard();
     let mut m = Mixer {
         p: parsed(live_pcm_input(p.clone(), done, false).unwrap()),
     };
@@ -296,6 +296,8 @@ fn a_panic_in_pull_gives_silence_then_eof() {
     assert!(out.iter().all(|s| *s == 0.0));
     assert_eq!(p.flags.load(std::sync::atomic::Ordering::Acquire) & 1, 1);
     assert!(m.tick().is_none());
+    // The track is marked, so the connection counts the panic (`stats()["panics"]`).
+    assert_ne!(track.hints() & crate::tracks::flags::PANICKED, 0);
     drop(m);
     assert_eq!(p.flags.load(std::sync::atomic::Ordering::Acquire) & 2, 2);
 }

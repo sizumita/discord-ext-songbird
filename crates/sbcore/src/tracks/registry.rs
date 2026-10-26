@@ -11,7 +11,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::Mutex;
 use songbird::tracks::{PlayMode, TrackHandle, TrackState};
 
-use super::flags::{DoneGuard, TrackEndReason, TrackFlags, TrackKind, TrackRef};
+use super::flags::{DoneGuard, PANICKED, TrackEndReason, TrackFlags, TrackKind, TrackRef};
 use crate::sync::lock_checked;
 
 /// Registry of a connection's tracks (L10).
@@ -23,6 +23,9 @@ pub struct TrackRegistry {
     map: Mutex<HashMap<u128, Weak<TrackFlags>>>,
     next_id: AtomicU64,
     conn_closing: Arc<AtomicBool>,
+    /// Tracks whose reader, decoder or decode thread caught a panic (`PANICKED`), counted when
+    /// their end is reported (`stats()["panics"]`, §5.7).
+    panics: AtomicU64,
 }
 
 impl TrackRegistry {
@@ -33,6 +36,7 @@ impl TrackRegistry {
             map: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             conn_closing,
+            panics: AtomicU64::new(0),
         }
     }
 
@@ -112,6 +116,9 @@ impl TrackRegistry {
             };
             f.finalise_dropped(tick);
             if f.take_report() {
+                if f.hints() & PANICKED != 0 {
+                    self.panics.fetch_add(1, Ordering::Relaxed);
+                }
                 if let Some(r) = f.ended() {
                     out.push((f.id, r));
                 }
@@ -119,6 +126,11 @@ impl TrackRegistry {
             }
             true
         });
+    }
+
+    /// Tracks whose reader, decoder or decode thread caught a panic (reported ends only).
+    pub fn panics(&self) -> u64 {
+        self.panics.load(Ordering::Relaxed)
     }
 
     /// Resolves every unresolved polled track with `r` (T8).
@@ -241,6 +253,25 @@ mod tests {
         s.flags.resolve(TrackEndReason::Stopped, None);
         r.watch(&s.flags);
         assert_eq!(s.flags.ended(), Some(TrackEndReason::Stopped));
+    }
+
+    #[test]
+    fn panicked_tracks_are_counted_once_when_reported() {
+        let (r, _) = reg();
+        let (a, _ga) = r.register(TrackKind::Playback);
+        let (b, _gb) = r.register(TrackKind::File);
+        r.mark_started(&a);
+        r.mark_started(&b);
+        a.flags.hint(super::super::flags::PANICKED);
+        let mut out = Vec::new();
+        r.poll_ended(0, &mut out);
+        assert_eq!(r.panics(), 0, "counted when the end is reported");
+        a.flags.resolve(TrackEndReason::Finished, None);
+        b.flags.resolve(TrackEndReason::Finished, None);
+        r.poll_ended(1, &mut out);
+        r.poll_ended(2, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(r.panics(), 1);
     }
 
     #[test]

@@ -416,7 +416,10 @@ impl SubQueue {
     }
 
     /// Closes the queue and frees every queued chunk (explicit `close()` / drop of the Python
-    /// object: nobody will read them).
+    /// object: nobody will read them). First close wins: on a queue that is already closed (by
+    /// T6, `UserLeft`, an overflow) it does nothing, so the chunks that close left readable stay
+    /// readable (`SongbirdClient.cleanup()` closes every child stream after the connection closed,
+    /// §6.5, and queued chunks must still drain, §4.9).
     pub fn close_and_clear(&self, r: CloseReason) {
         self.close_impl(r, true);
     }
@@ -424,10 +427,11 @@ impl SubQueue {
     fn close_impl(&self, r: CloseReason, clear: bool) {
         let (notify, freed, budget) = {
             let mut g = self.inner.lock();
-            if g.closed.is_none() {
+            let first = g.closed.is_none();
+            if first {
                 g.closed = Some(r);
             }
-            let freed = if clear {
+            let freed = if clear && first {
                 std::mem::take(&mut g.items)
             } else {
                 VecDeque::new()
@@ -613,6 +617,11 @@ impl Subscription {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
+        // §4.10: in a forked child never take a lock a vanished parent thread may hold (the
+        // worker's, a Python thread's): the queue is simply freed with its last reference.
+        if crate::runtime::check_not_forked().is_err() {
+            return;
+        }
         self.close();
     }
 }
@@ -953,6 +962,26 @@ mod tests {
         assert!(matches!(
             sub.set_filter(MixFilter::everyone()),
             Err(CoreError::InvalidAudio(_))
+        ));
+    }
+
+    /// First close wins: a stream T6 closed keeps its chunks readable when the consumer's
+    /// `close()` (or `SongbirdClient.cleanup()`) follows (§4.9, §6.5).
+    #[test]
+    fn closing_an_already_closed_queue_keeps_its_chunks() {
+        let (h, _r) = hub();
+        let q = SubQueue::new(&spec(1_000, Overflow::DropOldest), token(&h));
+        q.push(chunk(0, 20));
+        q.push(chunk(20, 20));
+        q.close(CloseReason::ConnectionClosed);
+        let sub = Subscription::detached(1, q.clone());
+        sub.close();
+        assert_eq!(q.close_reason(), Some(CloseReason::ConnectionClosed));
+        assert!(matches!(q.try_pop(), Pop::Item(_)));
+        assert!(matches!(q.try_pop(), Pop::Item(_)));
+        assert!(matches!(
+            q.try_pop(),
+            Pop::Closed(CloseReason::ConnectionClosed)
         ));
     }
 }

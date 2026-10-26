@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicBool;
 
 use super::encoded::{EncodedShared, EncodedSpec, spawn_encoded_with};
 use super::memory::{EncodedBytes, MemPcm, OpusFrames};
+use crate::clock::Clock;
 use crate::error::CoreError;
 use crate::tracks::flags::{DoneGuard, TrackKind};
 use crate::wake::WakeHub;
@@ -28,21 +29,24 @@ pub enum SourceSpec {
 impl SourceSpec {
     /// Builds the songbird input. `Encoded` spawns the ByteRing + decode thread now (only called
     /// when the entry becomes current) and allocates a wake token from `wake`. An encoded stream
-    /// built here does not follow the connection's self-mute; see [`SourceSpec::to_input_with`].
+    /// built here does not follow the connection's self-mute and uses the real clock; see
+    /// [`SourceSpec::to_input_with`].
     pub fn to_input(
         &self,
         done: DoneGuard,
         wake: &Arc<WakeHub>,
     ) -> Result<(songbird::input::Input, Option<Arc<EncodedShared>>), CoreError> {
-        self.to_input_with(done, wake, Arc::new(AtomicBool::new(false)))
+        self.to_input_with(done, wake, Arc::new(AtomicBool::new(false)), Clock::Real)
     }
 
-    /// [`SourceSpec::to_input`] with the connection's send-mute flag (used by `Encoded` only).
+    /// [`SourceSpec::to_input`] with the connection's send-mute flag and clock (used by `Encoded`
+    /// only, see `spawn_encoded_with`).
     pub fn to_input_with(
         &self,
         done: DoneGuard,
         wake: &Arc<WakeHub>,
         send_muted: Arc<AtomicBool>,
+        clock: Clock,
     ) -> Result<(songbird::input::Input, Option<Arc<EncodedShared>>), CoreError> {
         match self {
             SourceSpec::File(b) => Ok((b.to_input(done), None)),
@@ -50,7 +54,7 @@ impl SourceSpec {
             SourceSpec::Opus(f) => Ok((f.to_input(done)?, None)),
             SourceSpec::Encoded(fac) => {
                 let token = wake.alloc()?;
-                let (shared, input) = spawn_encoded_with(fac.spec, token, done, send_muted)?;
+                let (shared, input) = spawn_encoded_with(fac.spec, token, done, send_muted, clock)?;
                 Ok((input, Some(shared)))
             }
         }

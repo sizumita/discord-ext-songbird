@@ -6,7 +6,7 @@
 //! hint, which the housekeeper finalises after a 2-tick grace (`TrackRegistry::poll_ended`).
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use nonmax::NonMaxU32;
 use songbird::tracks::{ControlError, TrackHandle};
@@ -17,6 +17,7 @@ use crate::limits::check;
 use crate::runtime::{LiveCounter, live};
 #[cfg(feature = "test-hooks")]
 use crate::tx::FakeTrackControl;
+use crate::tx::LiveSource;
 
 /// Hint bit: the reader/`DoneGuard` was dropped (provisional; never final).
 pub const DROPPED: u8 = 1 << 0;
@@ -24,6 +25,9 @@ pub const DROPPED: u8 = 1 << 0;
 pub const EOF_SEEN: u8 = 1 << 1;
 /// Hint bit: a decode error was observed.
 pub const DECODE_ERROR: u8 = 1 << 2;
+/// Hint bit: a panic was caught in this track's reader, decoder or decode thread (§5.7). Counted
+/// once per track in the connection's `stats()["panics"]` when its end is reported.
+pub const PANICKED: u8 = 1 << 3;
 
 /// Why a track ended.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -107,7 +111,7 @@ pub struct TrackFlags {
     uuid: OnceLock<u128>,
     /// Final reason code (0 = unresolved).
     ended: AtomicU8,
-    /// `DROPPED | EOF_SEEN | DECODE_ERROR`.
+    /// `DROPPED | EOF_SEEN | DECODE_ERROR | PANICKED`.
     hints: AtomicU8,
     /// Housekeeper tick (+1) at which the `DROPPED` hint was first observed (0 = not yet).
     dropped_at_tick: AtomicU64,
@@ -154,7 +158,8 @@ impl TrackFlags {
             .is_ok()
     }
 
-    /// Records a hint bit (`EOF_SEEN` / `DECODE_ERROR` / `DROPPED`); atomics only (mixer-safe).
+    /// Records a hint bit (`EOF_SEEN` / `DECODE_ERROR` / `DROPPED` / `PANICKED`); atomics only
+    /// (mixer-safe).
     pub fn hint(&self, bit: u8) {
         self.hints.fetch_or(bit, Ordering::AcqRel);
     }
@@ -277,6 +282,11 @@ impl Drop for DoneGuard {
 pub struct TrackRef {
     pub flags: Arc<TrackFlags>,
     pub handle: Arc<OnceLock<songbird::tracks::TrackHandle>>,
+    /// Live sources (`open_playback`, `open_encoded`, lazy encoded queue entries): the source
+    /// itself owns its track's play/pause state (§4.9: it pauses when idle and resumes on new
+    /// audio), so `pause`/`resume`/`set_volume` go through it instead of the songbird handle,
+    /// whose direct pause the source would undo at its next resume.
+    pub live: Arc<OnceLock<Weak<dyn LiveSource>>>,
     /// Detached connections (§13.2): the `FakeTrackControl` standing in for the handle.
     #[cfg(feature = "test-hooks")]
     pub fake: Arc<OnceLock<Arc<FakeTrackControl>>>,
@@ -291,9 +301,19 @@ impl TrackRef {
         TrackRef {
             flags,
             handle: Arc::new(OnceLock::new()),
+            live: Arc::new(OnceLock::new()),
             #[cfg(feature = "test-hooks")]
             fake: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Routes this track's `pause`/`resume`/`set_volume` through its live source (once).
+    pub(crate) fn set_live(&self, src: Weak<dyn LiveSource>) {
+        let _ = self.live.set(src);
+    }
+
+    fn live_source(&self) -> Option<Arc<dyn LiveSource>> {
+        self.live.get().and_then(Weak::upgrade)
     }
 
     /// Whether the track was handed to songbird (or, detached, to the fake control).
@@ -323,13 +343,23 @@ impl TrackRef {
         Err(CoreError::Track("track has not started".into()))
     }
 
-    /// `TrackHandle.pause()` (`ControlError` → `Track`).
+    /// `TrackHandle.pause()` (`ControlError` → `Track`); a live source's own user pause.
     pub fn pause(&self) -> Result<(), CoreError> {
+        if self.flags.ended().is_none()
+            && self.live_source().is_some_and(|s| s.set_user_paused(true))
+        {
+            return Ok(());
+        }
         self.control(|h| h.pause().map_err(control_err), |f| f.pause())
     }
 
-    /// `TrackHandle.resume()`.
+    /// `TrackHandle.resume()`; a live source's own user pause.
     pub fn resume(&self) -> Result<(), CoreError> {
+        if self.flags.ended().is_none()
+            && self.live_source().is_some_and(|s| s.set_user_paused(false))
+        {
+            return Ok(());
+        }
         self.control(|h| h.play().map_err(control_err), |f| f.play())
     }
 
@@ -338,9 +368,15 @@ impl TrackRef {
         self.control(|h| h.stop().map_err(control_err), |f| f.stop())
     }
 
-    /// `0.0..=4.0`; applied by songbird's live mixer.
+    /// `0.0..=4.0`; applied by songbird's live mixer, or by the decoder of a live PCM source
+    /// (whose songbird track stays at 1.0).
     pub fn set_volume(&self, v: f32) -> Result<(), CoreError> {
         let v = check("volume", v, VOLUME)?;
+        if let Some(s) = self.live_source()
+            && s.set_source_volume(v)
+        {
+            return Ok(());
+        }
         self.control(|h| h.set_volume(v).map_err(control_err), |_| {})
     }
 

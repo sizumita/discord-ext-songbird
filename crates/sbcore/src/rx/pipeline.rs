@@ -80,7 +80,8 @@ pub struct RxConfig {
 pub struct RxTimer {
     pub next_wake: Option<Instant>,
     /// Set while no real tick has arrived for `stall_timeout` (receive on, link up). Reported on
-    /// every call while the stall lasts (the gateway rate-limits `RxStalled` itself).
+    /// every call while the stall lasts (the gateway rate-limits `RxStalled` itself). The
+    /// ConnWorker emits `ReceiveStalled` once per stall; the pipeline never does.
     pub stalled_since: Option<Instant>,
 }
 
@@ -207,7 +208,6 @@ pub struct RxPipeline {
     tick_index: u64,
     link_up: bool,
     stall_ref: Option<Instant>,
-    stall_reported: bool,
     // Per-tick scratch (reused).
     scratch: Box<[f32]>,
     tmp: Box<[f32; TICK_SAMPLES_48K]>,
@@ -295,7 +295,6 @@ impl RxPipeline {
             tick_index: 0,
             link_up: false,
             stall_ref: None,
-            stall_reported: false,
             scratch: vec![0.0f32; DECODE_SCRATCH_LEN].into_boxed_slice(),
             tmp: Box::new([0.0; TICK_SAMPLES_48K]),
             cur: Vec::new(),
@@ -331,11 +330,9 @@ impl RxPipeline {
             RxInput::LinkUp { .. } => {
                 self.link_up = true;
                 self.stall_ref = Some(now);
-                self.stall_reported = false;
             }
             RxInput::LinkDown => {
                 self.link_up = false;
-                self.stall_reported = false;
             }
         }
         self.flush_events();
@@ -794,7 +791,6 @@ impl RxPipeline {
 
     fn on_tick(&mut self, raw: RawTick, now: Instant) {
         self.stall_ref = Some(now);
-        self.stall_reported = false;
         if !self.cfg.enabled {
             return;
         }
@@ -930,11 +926,6 @@ impl RxPipeline {
         };
         if now < deadline {
             return (None, Some(deadline));
-        }
-        if !self.stall_reported {
-            self.stall_reported = true;
-            let since_ms = ticks_ms(self.expected(since));
-            self.ev.push(EventData::ReceiveStalled { since_ms });
         }
         (Some(since), now.checked_add(STALL_REPORT_INTERVAL))
     }
@@ -1153,10 +1144,23 @@ impl RxPipeline {
         // Mark first, so a failure is counted once rather than retried every voiced tick.
         r.routed.insert(user, Weak::new());
         let (spec, rq) = (r.spec.sub_spec(user), r.queue.clone());
-        if self.subs.len() >= MAX_SUBS_PER_CONN {
-            rq.count_dropped();
-            return;
-        }
+        let worker = self.worker.upgrade();
+        // `MAX_SUBS_PER_CONN` counts every open subscription queue of the connection (explicit
+        // ones still in flight included) when a worker is attached; else this pipeline's own.
+        let slot = match &worker {
+            Some(w) => match w.reserve_sub() {
+                Ok(slot) => Some(slot),
+                Err(_) => {
+                    rq.count_dropped();
+                    return;
+                }
+            },
+            None if self.subs.len() >= MAX_SUBS_PER_CONN => {
+                rq.count_dropped();
+                return;
+            }
+            None => None,
+        };
         let Ok(token) = rq.alloc_token() else {
             rq.count_dropped();
             return;
@@ -1164,15 +1168,16 @@ impl RxPipeline {
         let queue = SubQueue::new(&spec, token);
         let id = ROUTER_SUB_ID_BIT | self.next_router_sub;
         self.next_router_sub = self.next_router_sub.wrapping_add(1) & !ROUTER_SUB_ID_BIT;
-        let sub = match self.worker.upgrade() {
+        let sub = match &worker {
             Some(w) => {
                 let reserved = spec
                     .budget_bytes()
                     .and_then(|bytes| w.reserve_budget(bytes));
                 match reserved {
                     Ok(guard) => {
+                        // Registered for T6 and visible to `open_queues` from here on.
                         w.register_queue(&queue);
-                        Subscription::new(id, queue.clone(), Arc::downgrade(&w), guard)
+                        Subscription::new(id, queue.clone(), Arc::downgrade(w), guard)
                     }
                     Err(_) => {
                         rq.count_dropped();
@@ -1182,6 +1187,7 @@ impl RxPipeline {
             }
             None => Subscription::detached(id, queue.clone()),
         };
+        drop(slot);
         if !self.add_sub(id, &spec, queue.clone(), Some(tick)) {
             rq.count_dropped();
             return; // `sub` drops here and closes

@@ -181,7 +181,11 @@ impl ReceiveSubscription {
 
     /// Idempotent, any thread; unregisters at the next tick and frees queued chunks.
     fn close(&self) {
-        self.sub.close();
+        // A no-op after fork() (§4.10: no lock a vanished parent thread may hold; the inner
+        // `Subscription`'s Drop skips its close there too).
+        if sbcore::runtime::check_not_forked().is_ok() {
+            self.sub.close();
+        }
     }
 
     #[getter]
@@ -301,7 +305,10 @@ impl RouterSubscription {
     /// yet received are always closed.
     #[pyo3(signature = (close_streams = true))]
     fn close(&self, close_streams: bool) {
-        self.router.queue.close(close_streams);
+        // A no-op after fork() (§4.10, see `close` of `ReceiveSubscription`).
+        if sbcore::runtime::check_not_forked().is_ok() {
+            self.router.queue.close(close_streams);
+        }
     }
 }
 

@@ -151,7 +151,11 @@ async def test_clear_is_immediate(connected_vc: HarnessClient, testing: Any) -> 
     assert pb.buffered_ms == 0
     assert not any(floats(mh.pull(1)))  # silent at the next pull
     (item,) = res.items
-    assert item.tag == "item-1" and res.item("item-1") is item
+    # Equal, not identical: native objects are built per access (no Python object is kept in Rust
+    # state, I1).
+    by_tag = res.item("item-1")
+    assert by_tag is not None and (by_tag.tag, by_tag.played_ms) == (item.tag, item.played_ms)
+    assert item.tag == "item-1"
     assert item.played_ms == 20 and item.heard_ms <= item.written_ms == 1_000
     assert res.generation >= 1
     assert pb.stats().clears == 1

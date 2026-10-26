@@ -1,110 +1,69 @@
 //! Detached connections (feature `test-hooks`, §13.2): a full `ConnShared` with **no songbird
-//! Driver**. Every track gets a [`FakeTrackControl`] instead of a songbird handle, and the songbird
-//! `Input` built for it is parked here, so `MixerHarness` can take a playback's reader/decoder pair
-//! and dropping parked inputs runs the real `DoneGuard` path. `Connect` actions succeed instantly
-//! (configurable), and tests inject driver events through the same `apply()`/`RxSender` paths the
-//! `Dispatch` uses.
+//! Driver**. Every track gets a [`crate::tx::FakeTrackControl`] instead of a songbird handle, and the
+//! songbird `Input` built for it is parked in the test hooks' tables (`testing::registry`), so
+//! `MixerHarness` can take a playback's reader/decoder pair and dropping parked inputs runs the real
+//! `DoneGuard` path. `Connect` actions succeed instantly unless turned off
+//! (`set_detached_auto_connect(false)`, which `testing::Harness` does), and tests inject driver
+//! events through the same `apply()`/`RxSender` paths the `Dispatch` uses.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
-
-use parking_lot::Mutex;
 
 use super::gateway::{DiscKind, DiscReason, GwInput};
 use super::shared::ConnShared;
 use crate::rx::raw::RxSender;
-use crate::sync::lock_checked;
-use crate::tracks::flags::{TrackFlags, TrackRef};
-use crate::tx::{FakeTrackControl, TrackControl};
+use crate::testing::registry;
+use crate::tracks::flags::TrackRef;
+use crate::tx::TrackControl;
 
-/// One parked songbird input.
-struct Parked {
-    flags: Weak<TrackFlags>,
-    source_id: Option<u32>,
-    input: songbird::input::Input,
-}
-
-/// Per-connection detached state.
+/// Per-connection detached state. The parked inputs and the fake controls live in the test hooks'
+/// process-wide tables (`testing::registry`), keyed by this connection, so `MixerHarness`,
+/// `track_log` and `Harness::{step, parked}` see exactly what this connection parked.
 pub(crate) struct DetachedState {
     auto_connect: AtomicBool,
-    /// L10. Bounded: entries of ended or dropped tracks are pruned on every park.
-    parked: Mutex<Vec<Parked>>,
 }
 
 impl DetachedState {
     pub(crate) fn new() -> Self {
         DetachedState {
             auto_connect: AtomicBool::new(true),
-            parked: Mutex::new(Vec::new()),
         }
     }
 
     pub(crate) fn auto_connect(&self) -> bool {
         self.auto_connect.load(Ordering::Acquire)
     }
-
-    fn park(&self, flags: &Arc<TrackFlags>, source_id: Option<u32>, input: songbird::input::Input) {
-        let pruned: Vec<Parked> = {
-            let mut v = lock_checked(&self.parked);
-            let (keep, gone): (Vec<Parked>, Vec<Parked>) = v
-                .drain(..)
-                .partition(|p| p.flags.upgrade().is_some_and(|f| f.ended().is_none()));
-            *v = keep;
-            v.push(Parked {
-                flags: Arc::downgrade(flags),
-                source_id,
-                input,
-            });
-            gone
-        };
-        drop(pruned); // DoneGuards drop outside the lock
-    }
-
-    /// Drops every parked input (stop_all, T8): the real `DoneGuard` path.
-    pub(crate) fn drop_all(&self) {
-        let all = std::mem::take(&mut *lock_checked(&self.parked));
-        drop(all);
-    }
-
-    fn take_where(&self, pred: impl Fn(&Parked) -> bool) -> Option<songbird::input::Input> {
-        let mut v = lock_checked(&self.parked);
-        let i = v.iter().position(pred)?;
-        Some(v.swap_remove(i).input)
-    }
-}
-
-/// `Box<dyn TrackControl>` over a shared fake (the `TrackRef` keeps the other `Arc` for its log).
-struct SharedFake(Arc<FakeTrackControl>);
-
-impl TrackControl for SharedFake {
-    fn pause(&self) {
-        self.0.pause();
-    }
-
-    fn play(&self) {
-        self.0.play();
-    }
-
-    fn stop(&self) {
-        self.0.stop();
-    }
 }
 
 impl ConnShared {
-    /// Detached: attaches a `FakeTrackControl`, marks the track started and parks its input.
+    /// Detached: attaches a `FakeTrackControl` (handed over `paused` or playing), marks the track
+    /// started and parks its input (`source_id`: the live source's id, for `MixerHarness`).
     pub(super) fn park(
         &self,
         track: &TrackRef,
         input: songbird::input::Input,
         source_id: Option<u32>,
+        paused: bool,
     ) -> Box<dyn TrackControl> {
         let fake = track
             .fake
-            .get_or_init(|| Arc::new(FakeTrackControl::new(track.flags.clone())))
+            .get_or_init(|| registry::register_fake(&track.flags, paused))
             .clone();
         self.tracks().mark_started(track);
-        self.det.park(&track.flags, source_id, input);
-        Box::new(SharedFake(fake))
+        let key = registry::key_of(self);
+        if self.is_closed() {
+            // T8 already disposed of this connection's inputs: songbird would drop it at once.
+            drop(input);
+        } else {
+            // Inputs of ended tracks are disposed of as songbird would (keeps the table bounded).
+            registry::sweep(key, false);
+            registry::park_input(self, source_id, track.flags.clone(), input);
+        }
+        registry::fake_handle(fake)
+    }
+
+    /// Drops every parked input of this connection (`stop_all`, T8): the real `DoneGuard` path.
+    pub(super) fn drop_parked(&self) {
+        registry::sweep(registry::key_of(self), true);
     }
 
     /// Detached connections: whether `Connect` succeeds instantly (default `true`). With `false`,
@@ -134,21 +93,14 @@ impl ConnShared {
         self.rx_sender_ref().cloned()
     }
 
-    /// Takes the parked input of a memory/queue track of this detached connection.
+    /// Takes the parked input of a track of this detached connection.
     pub fn take_parked_input(&self, track: &TrackRef) -> Option<songbird::input::Input> {
-        self.det
-            .take_where(|p| std::ptr::eq(p.flags.as_ptr(), Arc::as_ptr(&track.flags)))
-    }
-
-    fn take_parked_source(&self, source_id: u32) -> Option<songbird::input::Input> {
-        self.det.take_where(|p| p.source_id == Some(source_id))
+        registry::take_parked_track(registry::key_of(self), &track.flags)
     }
 }
 
 /// Takes the parked input of the live source with `LiveSource::id() == source_id` (ids are unique
-/// per process), searching every registered connection (`MixerHarness::take`).
+/// per process); `MixerHarness::take_source` uses the same table.
 pub fn take_parked_live_input(source_id: u32) -> Option<songbird::input::Input> {
-    super::registry::registry_snapshot()
-        .iter()
-        .find_map(|c| c.take_parked_source(source_id))
+    registry::take_parked(source_id).map(|(_, _, input)| input)
 }

@@ -5,7 +5,6 @@
 //! a control is dropped (drops happen after unlocking).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -170,6 +169,15 @@ pub(crate) fn take_parked(source_id: u32) -> Option<(ConnKey, Arc<TrackFlags>, I
     Some((p.conn, p.flags, p.input))
 }
 
+/// Removes the parked input of the track with `flags` on connection `conn`.
+pub(crate) fn take_parked_track(conn: ConnKey, flags: &Arc<TrackFlags>) -> Option<Input> {
+    let mut parked = PARKED.lock();
+    let idx = parked
+        .iter()
+        .position(|p| p.conn == conn && Arc::ptr_eq(&p.flags, flags))?;
+    Some(parked.swap_remove(idx).input)
+}
+
 /// Drops the parked inputs of `conn`: every one if `all`, else those whose track has ended
 /// (songbird disposes a stopped/finished track's input). Drops happen after unlocking.
 pub(crate) fn sweep(conn: ConnKey, all: bool) -> usize {
@@ -193,50 +201,38 @@ pub(crate) fn parked_count(conn: ConnKey) -> usize {
 
 // ── fake track controls ─────────────────────────────────────────────────────────────────────────────
 
-/// A [`FakeTrackControl`] plus the track's pause state as songbird would see it.
-///
-/// The fake's call log is bounded ([`FakeTrackControl::LOG_CAP`]: later calls are not recorded), so
-/// the pause state cannot be derived from the log: a long test (many auto-pause/resume cycles) would
-/// freeze it at the state of the last recorded call. It is tracked here instead, on every call.
-struct SharedFake {
-    fake: FakeTrackControl,
-    /// Live sources start paused (§4.9); afterwards the last `pause`/`play` wins.
-    paused: AtomicBool,
-}
-
+/// The registered fakes, looked up by flags identity (`track_log`, the mixer harness's pause
+/// state). The [`FakeTrackControl`] itself keeps the pause state on every call: its call log is
+/// bounded ([`FakeTrackControl::LOG_CAP`]), so a long test (many auto-pause/resume cycles) could not
+/// derive the state from the log.
 struct FakeEntry {
     flags: Weak<TrackFlags>,
-    fake: Weak<SharedFake>,
+    fake: Weak<FakeTrackControl>,
 }
 
 static FAKES: Mutex<Vec<FakeEntry>> = Mutex::new(Vec::new());
 
-/// The `TrackControl` a detached connection attaches: forwards to the shared fake.
-struct FakeHandle(Arc<SharedFake>);
+/// The `TrackControl` a detached connection attaches: forwards to the shared fake (the track's
+/// `TrackRef::fake` holds the same `Arc`).
+struct FakeHandle(Arc<FakeTrackControl>);
 
 impl TrackControl for FakeHandle {
     fn pause(&self) {
-        self.0.paused.store(true, Ordering::SeqCst);
-        self.0.fake.pause();
+        self.0.pause();
     }
 
     fn play(&self) {
-        self.0.paused.store(false, Ordering::SeqCst);
-        self.0.fake.play();
+        self.0.play();
     }
 
     fn stop(&self) {
-        self.0.fake.stop();
+        self.0.stop();
     }
 }
 
-/// The track control a detached connection attaches instead of a songbird `TrackHandle` (§13.2):
-/// it records `pause`/`play`/`stop`, and `stop()` resolves `flags` as a Dispatch `End(Stop)` would.
-pub fn fake_track_control(flags: &Arc<TrackFlags>) -> Box<dyn TrackControl> {
-    let shared = Arc::new(SharedFake {
-        fake: FakeTrackControl::new(flags.clone()),
-        paused: AtomicBool::new(true),
-    });
+/// Creates and registers the fake of a track handed over `paused` (or playing).
+pub(crate) fn register_fake(flags: &Arc<TrackFlags>, paused: bool) -> Arc<FakeTrackControl> {
+    let fake = Arc::new(FakeTrackControl::with_paused(flags.clone(), paused));
     let evicted = {
         let mut fakes = FAKES.lock();
         fakes.retain(|e| e.fake.strong_count() > 0);
@@ -247,15 +243,27 @@ pub fn fake_track_control(flags: &Arc<TrackFlags>) -> Box<dyn TrackControl> {
         };
         fakes.push(FakeEntry {
             flags: Arc::downgrade(flags),
-            fake: Arc::downgrade(&shared),
+            fake: Arc::downgrade(&fake),
         });
         evicted
     };
     drop(evicted);
-    Box::new(FakeHandle(shared))
+    fake
 }
 
-fn find_fake(flags: &Arc<TrackFlags>) -> Option<Arc<SharedFake>> {
+/// A `Box<dyn TrackControl>` over a registered fake.
+pub(crate) fn fake_handle(fake: Arc<FakeTrackControl>) -> Box<dyn TrackControl> {
+    Box::new(FakeHandle(fake))
+}
+
+/// The track control a detached connection attaches instead of a songbird `TrackHandle` (§13.2):
+/// it records `pause`/`play`/`stop`, and `stop()` resolves `flags` as a Dispatch `End(Stop)` would.
+/// The track starts paused (live sources, §4.9).
+pub fn fake_track_control(flags: &Arc<TrackFlags>) -> Box<dyn TrackControl> {
+    fake_handle(register_fake(flags, true))
+}
+
+fn find_fake(flags: &Arc<TrackFlags>) -> Option<Arc<FakeTrackControl>> {
     FAKES
         .lock()
         .iter()
@@ -266,12 +274,12 @@ fn find_fake(flags: &Arc<TrackFlags>) -> Option<Arc<SharedFake>> {
 
 /// The call log of the fake control attached to `flags`; empty if there is none.
 pub(crate) fn fake_log(flags: &Arc<TrackFlags>) -> Vec<&'static str> {
-    find_fake(flags).map(|f| f.fake.log()).unwrap_or_default()
+    find_fake(flags).map(|f| f.log()).unwrap_or_default()
 }
 
 /// Whether songbird would consider the track paused: `None` if no fake control is attached.
 pub(crate) fn fake_paused(flags: &Arc<TrackFlags>) -> Option<bool> {
-    find_fake(flags).map(|f| f.paused.load(Ordering::SeqCst))
+    find_fake(flags).map(|f| f.is_paused())
 }
 
 #[cfg(test)]

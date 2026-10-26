@@ -340,6 +340,17 @@ impl TrackQueue {
             .map(|e| e.opts)
     }
 
+    /// 1 while the current entry is an unresolved live source (a lazy encoded stream, being
+    /// started or playing), else 0. It counts towards `MAX_PLAYING_TRACKS_PER_CONN` like a memory
+    /// entry, which `TrackRegistry::playing` (memory/file tracks only) does not see.
+    pub(crate) fn live_current(&self) -> usize {
+        let st = lock_checked(&self.state);
+        st.current
+            .as_ref()
+            .is_some_and(|c| c.track.flags.kind.is_live() && c.track.flags.ended().is_none())
+            .into()
+    }
+
     /// The encoded stream of the current lazy entry `t`, once (`queue_take_stream`).
     pub(crate) fn take_stream(&self, t: &TrackRef) -> Option<Arc<EncodedShared>> {
         let mut st = lock_checked(&self.state);

@@ -37,7 +37,7 @@ use crate::limits::{
 use crate::runtime::{LiveCounter, live};
 use crate::rx::opus::SILENT_FRAME;
 use crate::sync::lock_checked;
-use crate::tracks::flags::{DECODE_ERROR, DoneGuard, EOF_SEEN};
+use crate::tracks::flags::{DECODE_ERROR, DoneGuard, EOF_SEEN, PANICKED};
 use crate::wake::{WakeId, WakeToken};
 
 /// Maximum Opus packet size accepted by `send` (bytes).
@@ -298,8 +298,7 @@ impl OpusQueue {
         self.reader_gone.load(Ordering::Acquire)
     }
 
-    /// Attaches songbird's track (or a `FakeTrackControl`), once.
-    #[allow(dead_code)] // called by W2's ConnShared::open_* / play (phase-2 integration)
+    /// Attaches songbird's track (or a `FakeTrackControl`), once (`ConnShared::open_opus_stream`).
     pub(crate) fn attach_track(&self, t: Box<dyn TrackControl>) {
         if self.track.set(t).is_err() {
             return;
@@ -563,7 +562,7 @@ impl FormatReader for OpusStreamReader {
             Ok(r) => r,
             Err(_) => {
                 self.poisoned = true;
-                self.done.flags().hint(DECODE_ERROR);
+                self.done.flags().hint(DECODE_ERROR | PANICKED);
                 Err(SymphError::IoError(ErrorKind::UnexpectedEof.into()))
             }
         }
