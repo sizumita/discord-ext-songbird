@@ -1240,3 +1240,12 @@ fn input_kind(i: &GwInput) -> &'static str {
 
 #[cfg(test)]
 mod tests;
+
+/// Test hooks (§13.2, W5; see `docs/deviations/W5.md`): the tick-channel sender `Dispatch` feeds, so
+/// `testing::inject_*` deliver through the same path. `None` when no channel exists.
+#[cfg(feature = "test-hooks")]
+impl ConnShared {
+    pub(crate) fn test_rx_sender(&self) -> Option<&RxSender> {
+        self.rx_sender_ref()
+    }
+}

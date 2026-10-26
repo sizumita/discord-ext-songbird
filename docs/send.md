@@ -1,241 +1,158 @@
-# Send (Voice Output)
+# Sending audio
 
-This document describes the voice send API in `discord-ext-songbird`.
-The public Python surface is re-exported from `discord.ext.songbird.player`,
-which is backed by the native module `discord.ext.songbird.native.player`.
+Everything here hangs off a connected `SongbirdClient` (`vc`). Several outputs can be active at
+once; songbird mixes them.
 
-## Overview
+| You have | Use |
+|---|---|
+| AI speech / any realtime PCM (bytes or base64) | `vc.open_playback(fmt)` → `PlaybackStream` |
+| An encoded stream arriving over time (mp3/ogg/wav/…) | `vc.open_encoded_stream()` → `EncodedStream`, or `vc.queue.enqueue_stream(reader)` |
+| 20 ms Opus packets arriving over time | `vc.open_opus_stream()` → `OpusPacketStream` |
+| A file or bytes in memory | `AudioFile`, `RawPcm`, `OpusPackets` with `vc.play()` / `vc.enqueue()` |
 
-- Voice output is done by connecting with `SongbirdClient` and playing `Track` values.
-- Tracks are created from native input types such as `RawPCMInput`, `AudioInput`, and `StreamInput`.
-- `SongbirdClient.play()` starts a track immediately and returns a `TrackHandle`.
-- `SongbirdClient.enqueue()` adds a track to the call queue and returns a `TrackHandle`.
-- Playback can be controlled through `TrackHandle` and the call `Queue`.
-
-## Quick Start
+## `PlaybackStream`: realtime PCM
 
 ```python
-import discord
-import pyarrow as pa
-from discord.ext import songbird
-from discord.ext.songbird import player
+from discord.ext.songbird import GPT_LIVE, PlaybackFull
 
-# ... obtain a voice channel and connect
-vc = await channel.connect(cls=songbird.SongbirdClient)
-
-samples = pa.array([0.0, 0.1, 0.0, -0.1], type=pa.float32())
-source = player.RawPCMInput(samples, sample_rate=48000, channels=2)
-track = player.Track(source).volume(0.8)
-
-handle = await vc.play(track)
-handle.pause()
-handle.play()
+async with vc.open_playback(GPT_LIVE) as speaker:      # PCM16LE 24 kHz mono
+    speaker.write_nowait(pcm_bytes)                    # any size; partial frames are carried
+    speaker.write_base64_nowait(b64_delta, tag=item_id, at_ms=start_ms)
+    await speaker.write(more_pcm)                      # waits only while the buffer is full
+    await speaker.drain(timeout=5)                     # flush: wait until everything has played
 ```
 
-For queued playback:
+- **Starts paused.** Nothing is sent (no RTP, no speaking indicator) until the first accepted write;
+  the track resumes within one 20 ms tick. After `idle_ms` (250) without audio the stream goes idle,
+  emits `PlaybackIdle`, and auto-pauses again.
+- **Formats.** `write*` take data in the stream's format. `str` is base64. Typed buffers must match
+  the encoding (`'h'` arrays for pcm16le, `'f'` for f32le, or raw bytes): writing a float32 numpy
+  array to a pcm16le stream raises `InvalidAudio` instead of playing noise.
+- **Backpressure.** The buffer holds `max_buffer_ms` (60 s). `write_nowait` raises
+  `PlaybackFull(needed_ms, free_ms)` with nothing consumed; `await write()` waits for space.
+  In a task that reads a provider socket, always use the `*_nowait` variants.
+- **Underrun** plays silence; positions keep counting.
+
+### Provider timestamps: gap filling
+
+Pass the provider's timestamp of each delta (GPT-Live `start_ms`) as `at_ms`. The first timed write
+anchors the provider timeline to the wall clock; a later delta that starts after a gap gets that
+much silence inserted (up to `max_gap_ms`, default `min(2000, max_buffer_ms // 2)`), so the model's
+own pauses are preserved. Late or overlapping deltas are appended immediately — speech is never
+trimmed — and a gap longer than `max_gap_ms` is treated as a discontinuity. The anchor is wall-clock
+based, so a track that was idle-paused does not accumulate stale silence.
+
+### Barge-in: `clear()`
 
 ```python
-track = player.Track(source).pause()
-handle = await vc.enqueue(track)
-
-# The track was queued as paused. Start it when ready.
-handle.play()
+result = speaker.clear()                 # discard everything queued, now; any thread
+for item in result.items:                # open items and items heard in the last output_latency_ms
+    truncate(item.tag, item.heard_ms)    # ≤ written_ms by construction
 ```
 
-## Input Types
+- Capacity is released immediately; the cut is audible at the next pull (≤ 40 ms plus network).
+- **`reject_late=True`** (default) drops later writes for every open or interrupted tag: late
+  deltas of a cancelled OpenAI Realtime item never play.
+- **`reject_until_gap_ms=N`** (timed providers without item ids, e.g. GPT-Live): later *timed*
+  writes contiguous with the cleared audio are dropped until one starts at least `N` ms after it.
+- **`hold_ms`** drops *all* writes for a while — a fallback for untimed writes only.
 
-Native input types are exported from `discord.ext.songbird.player`.
+Items (`tag=`) are open from their first write until `end_item(tag)` (call it on the provider's
+"audio done" event), `clear()`, or the end of the turn (idle). `item(tag)` returns an
+`ItemProgress(tag, written_ms, played_ms, heard_ms, complete)`; `complete` becomes true once
+`end_item` was called and everything written has played.
 
-| input | source | intended use |
-| --- | --- | --- |
-| `RawPCMInput` | `pyarrow.Float32Array` | In-memory interleaved float32 PCM |
-| `AudioInput` | `pyarrow.Array` | In-memory encoded audio payload |
-| `StreamInput` | `asyncio.StreamReader` | Live or long-running encoded streams |
-| `OpusPacketInput` | `pyarrow.BinaryArray` or `pyarrow.LargeBinaryArray` | In-memory 20 ms Opus frames |
-| `OpusPacketStreamInput` | `await send(packet)` | Live 20 ms Opus packet streams |
+### Positions
 
-`AudioInput` and `StreamInput` do not take a codec argument. Songbird and
-Symphonia detect supported encoded formats from the payload or stream.
+| Property | Meaning |
+|---|---|
+| `written_ms` | accepted real audio (gap silence and rejected writes excluded) |
+| `played_ms` | real audio handed to the Discord encoder |
+| `heard_ms` | estimate: `played_ms` minus the not-yet-elapsed part of `output_latency_ms` (40) |
+| `position_ms` | playhead including silence |
+| `buffered_ms` | queued, including inserted gap silence |
 
-Use `player.supported_codecs()` to inspect the codecs and formats enabled in
-the native build.
+`stats()` adds `underrun_ms`, `gap_filled_ms`, `rejected_ms`, `discarded_ms`, `contended_ticks`,
+`clears` and `tags_evicted`. Network and listener jitter buffers (≈ 40–100 ms) lie downstream of
+`played_ms` and cannot be observed.
 
-## Raw PCM
+### Other controls
 
-`RawPCMInput` accepts interleaved float32 PCM samples. The defaults are
-48 kHz stereo, which matches Discord voice output.
+- `prebuffer_ms`: hold the start of each turn until this much is buffered (or the same time has
+  passed), smoothing bursty providers. `drain()`, `end_item()` and `aclose(drain=True)` release it.
+- `await wait_idle()`: the end of the current AI turn (GPT-Live has no output-done event).
+- `pause()`/`resume()`, `volume` (0.0–4.0, 5 ms ramp), `close()`, `await aclose(drain=True)`.
+- `when_disconnected="discard"` drops buffered audio while the voice link is down instead of
+  playing it after reconnect.
+- While the client is self-muted the stream holds its position: nothing is consumed or counted as
+  played, and `drain()` keeps waiting.
+
+## Files, PCM and Opus in memory
 
 ```python
-import pyarrow as pa
-from discord.ext.songbird import player
+from discord.ext.songbird import AudioFile, RawPcm, OpusPackets, load_audio_file
 
-samples = pa.array([0.0, 0.1, 0.0, -0.1], type=pa.float32())
-source = player.RawPCMInput(samples, sample_rate=48000, channels=2)
-track = player.Track(source)
-await vc.play(track)
+song = await load_audio_file("song.mp3")              # read + probe in a worker thread
+song = AudioFile.from_path("song.mp3")                # blocking variant (releases the GIL)
+clip = AudioFile(wav_bytes)                           # any bytes-like object
+pcm = RawPcm(pcm16_bytes, "pcm16_48k_stereo")          # 8/16/24/48 kHz in any stream encoding
+pcm = RawPcm.from_samples(float32_array, 44_100, 2)    # any rate 8–192 kHz, resampled once
+opus = OpusPackets(packets)                            # 20 ms / 48 kHz packets, passthrough-capable
+
+handle = vc.play(song, volume=0.8, loops=0)            # synchronous; mixed with everything else
+end = await handle.wait_ended()                        # TrackEnd(reason, error)
 ```
 
-## Encoded Audio Arrays
+Sources are immutable and reusable: each play gets its own cursor over the same memory. The
+container is detected from content (`supported_codecs()` lists what this build can decode); there is
+no `hint` parameter. At most 32 memory/file tracks play at once per connection.
 
-`AudioInput` accepts an encoded audio payload stored in a primitive Arrow
-array. The payload format is detected by Songbird/Symphonia.
+### `TrackHandle`
+
+`pause()`, `resume()`, `stop()`, `set_volume(v)`, `set_loops(n | None)`, `await seek(seconds)`,
+`await info()`, `await wait_ended()`, plus `id`, `uuid`, `kind`, `ended`, `end_reason`. Handles
+compare equal when they refer to the same track. `wait_ended()` resolves on every termination path:
+natural end (`"finished"`), `stop()` / `stop_all()` (`"stopped"`), a decode error (`"error"`), or the
+connection closing (`"disconnected"`).
+
+songbird processes track commands only while its mixer is live (something is playing); `seek()`
+and `info()` raise `TimeoutError` while it is parked.
+
+## The queue
 
 ```python
-import pyarrow as pa
-from discord.ext.songbird import player
+q = vc.queue
+first = vc.enqueue(AudioFile.from_path("a.mp3"))       # == q.enqueue(...)
+q.enqueue(AudioFile.from_path("b.ogg"), volume=0.5, loops=1, paused=False)
+q.enqueue_stream(response_body_iterator)                # fetched and decoded only once current
 
-payload = pa.array(encoded_bytes, type=pa.uint8())
-source = player.AudioInput(payload)
-await vc.enqueue(player.Track(source))
+q.current        # the playing entry (TrackHandle) or None
+len(q), q[0]     # pending entries only: index 0 is next up
+q.skip(); q.pause(); q.resume(); q.clear(); q.stop(); q.dequeue(i)
 ```
 
-## Stream Input
+Only the current entry is handed to songbird, so a long queue costs no mixer time. Pending entries
+are fully controllable (`pause`, `set_volume`, `set_loops` apply when they start; `stop()` removes
+them). Advancing is not gapless: expect 20–60 ms between entries. At most 10 000 entries.
 
-`StreamInput` wraps an `asyncio.StreamReader`. The player reads from the stream
-as the track is consumed, so this is the preferred API for radio streams,
-network responses, and other live encoded sources.
+## Push streams
 
 ```python
-import asyncio
-from discord.ext.songbird import player
+async with vc.open_encoded_stream() as stream:   # decoded on a dedicated thread, not the mixer
+    await stream.feed_from(http_response.content) # an asyncio.StreamReader or async iterable of bytes
 
-buffer = asyncio.StreamReader()
-source = player.StreamInput(buffer)
-handle = await vc.enqueue(player.Track(source))
-
-handle.play()
+async with vc.open_opus_stream(max_packets=250) as opus:
+    await opus.send(packet)                       # 20 ms packets; underrun sends Opus silence
 ```
 
-Feed bytes with `buffer.feed_data(chunk)` and signal end of input with
-`buffer.feed_eof()` when the stream is complete.
+Both start paused and resume on the first audio; an Opus stream pauses again after 250 ms without
+packets, so an idle stream sends no RTP.
 
-## Opus Packet Input
+## Limits
 
-`OpusPacketInput` and `OpusPacketStreamInput` are for pre-encoded Opus. Each
-packet must be one non-empty 20 ms Opus frame containing 960 samples at 48 kHz.
+16 live sources (playbacks + encoded + Opus streams) and 32 playing memory tracks per connection;
+16 encoded-stream decode threads per process. Every size is checked before anything is allocated
+(`LimitExceeded`).
 
-For finite packets:
-
-```python
-import pyarrow as pa
-from discord.ext.songbird import player
-
-frames = pa.array([opus_frame_0, opus_frame_1], type=pa.binary())
-source = player.OpusPacketInput(frames)
-await vc.play(player.Track(source))
-```
-
-For live packets:
-
-```python
-from discord.ext.songbird import player
-
-source = player.OpusPacketStreamInput(max_packets=128)
-handle = await vc.play(player.Track(source))
-
-await source.send(opus_frame)
-await source.close()
-```
-
-When an Opus packet input is the only active track and volume is `1.0`,
-Songbird can send frames without decoding and re-encoding them. Do not change
-volume if you need passthrough behavior.
-
-## Track And Playback Control
-
-`Track` is a builder for playback configuration. Its mutating methods return
-the same track object so calls can be chained before playback starts.
-
-```python
-track = player.Track(source).volume(0.5).pause()
-handle = await vc.enqueue(track)
-handle.play()
-```
-
-Common control methods:
-
-- `Track.play()` marks the initial track state as playing.
-- `Track.pause()` marks the initial track state as paused.
-- `Track.stop()` marks the initial track state as stopped.
-- `Track.volume(value)` sets the initial volume multiplier.
-- `TrackHandle.play()` resumes playback.
-- `TrackHandle.pause()` pauses playback.
-- `TrackHandle.stop()` stops playback.
-- `TrackHandle.seek(position)` seeks when the underlying source supports it.
-- `TrackHandle.enable_loop()`, `disable_loop()`, and `loop_for(times)` control looping.
-
-## Queue Behavior
-
-Use `SongbirdClient.queue()` to inspect or control the active call queue.
-
-```python
-queue = vc.queue()
-
-current = queue.current()
-queued = queue.tracks()
-
-queue.pause()
-queue.resume()
-queue.skip()
-queue.stop()
-```
-
-Key points:
-
-- `await vc.play(track)` starts a track immediately through Songbird's call handle.
-- `await vc.enqueue(track)` appends a track to the playback queue.
-- `vc.stop()` stops playback immediately.
-- `queue.current()` returns the current `TrackHandle`, if any.
-- `queue.dequeue(index)` removes a queued track by zero-based index.
-- `len(queue)` returns the queue length and `queue[index]` returns a handle or `None`.
-
-## Data Flow
-
-```text
-Python input source
-        |
-        v
-  player.InputBase
-        |
-        v
-  player.Track
-        |
-        v
-SongbirdClient.play/enqueue
-        |
-        v
- Songbird call / queue
-        |
-        v
- Discord voice output
-```
-
-## API Surface (Excerpt)
-
-```python
-from discord.ext.songbird import player
-
-source = player.RawPCMInput(samples, sample_rate=48000, channels=2)
-source = player.AudioInput(payload)
-source = player.StreamInput(stream_reader)
-source = player.OpusPacketInput(frames)
-source = player.OpusPacketStreamInput(max_packets=128)
-
-track = player.Track(source).volume(1.0).play()
-
-handle = await vc.play(track)
-handle = await vc.enqueue(track)
-
-vc.stop() -> None
-queue = vc.queue()
-```
-
-## Limitations & Notes
-
-- Custom Python input subclasses are not supported; use the native input types.
-- Live and streaming inputs are consumed as playback reads them; create a fresh input and track for replay.
-- `StreamInput` expects `read()` to return bytes-like data; non-bytes values are rejected.
-- Call `feed_eof()` on `asyncio.StreamReader` sources when no more data will arrive.
-- `OpusPacketStreamInput.close()` signals EOF to the player and prevents further sends.
-- Opus packet arrays must not contain nulls.
-- Published wheels are built with the full Symphonia codec/format set enabled.
+Note that an open live source keeps songbird's mixer live even while auto-paused: open a playback
+per AI session, not per bot.

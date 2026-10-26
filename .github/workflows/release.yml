@@ -12,6 +12,7 @@ permissions:
 
 env:
   CARGO_NET_RETRY: "10"
+  # Release wheels use the default features only: never `test-hooks` (scripts/smoke.py checks).
 
 jobs:
   linux:
@@ -80,7 +81,7 @@ jobs:
         run: |
           uv pip install --reinstall dist/*.whl
           if [[ "${{ matrix.python-version }}" == *t ]]; then export PYTHON_GIL=0; fi
-          uv run --no-sync python -c "import asyncio, pyarrow as pa; asyncio.set_event_loop(asyncio.new_event_loop()); from discord.ext import songbird; from discord.ext.songbird import player; assert not hasattr(songbird, 'SupportedCodec'); player.AudioInput(pa.array([1, 2, 3], type=pa.uint8())); player.RawPCMInput(pa.array([0.0, 0.0], type=pa.float32()), sample_rate=48000, channels=2); player.StreamInput(asyncio.StreamReader()); player.OpusPacketInput(pa.array([b'\xf8\xff\xfe'], type=pa.binary())); player.OpusPacketStreamInput(max_packets=1); assert 'opus' in player.supported_codecs()"
+          uv run --no-sync python scripts/smoke.py
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -207,7 +208,7 @@ jobs:
         run: |
           uv pip install --reinstall dist/*.whl
           if [[ "${{ matrix.python-version }}" == *t ]]; then export PYTHON_GIL=0; fi
-          uv run --no-sync python -c "import asyncio, pyarrow as pa; asyncio.set_event_loop(asyncio.new_event_loop()); from discord.ext import songbird; from discord.ext.songbird import player; assert not hasattr(songbird, 'SupportedCodec'); player.AudioInput(pa.array([1, 2, 3], type=pa.uint8())); player.RawPCMInput(pa.array([0.0, 0.0], type=pa.float32()), sample_rate=48000, channels=2); player.StreamInput(asyncio.StreamReader()); player.OpusPacketInput(pa.array([b'\xf8\xff\xfe'], type=pa.binary())); player.OpusPacketStreamInput(max_packets=1); assert 'opus' in player.supported_codecs()"
+          uv run --no-sync python scripts/smoke.py
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -287,7 +288,7 @@ jobs:
         run: |
           uv pip install --reinstall dist/*.whl
           if [[ "${{ matrix.python-version }}" == *t ]]; then export PYTHON_GIL=0; fi
-          uv run --no-sync python -c "import asyncio, pyarrow as pa; asyncio.set_event_loop(asyncio.new_event_loop()); from discord.ext import songbird; from discord.ext.songbird import player; assert not hasattr(songbird, 'SupportedCodec'); player.AudioInput(pa.array([1, 2, 3], type=pa.uint8())); player.RawPCMInput(pa.array([0.0, 0.0], type=pa.float32()), sample_rate=48000, channels=2); player.StreamInput(asyncio.StreamReader()); player.OpusPacketInput(pa.array([b'\xf8\xff\xfe'], type=pa.binary())); player.OpusPacketStreamInput(max_packets=1); assert 'opus' in player.supported_codecs()"
+          uv run --no-sync python scripts/smoke.py
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -314,12 +315,19 @@ jobs:
           args: --out dist
       - name: Syncing uv project
         run: uv sync --all-extras --dev --no-install-project --python "$pythonLocation/bin/python"
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopus-dev pkg-config cmake
+      - uses: dtolnay/rust-toolchain@stable
       - name: Test sdist
         run: |
           uv pip install dist/*.tar.gz
-      - name: Test sdist minimal codec build
+          uv run --no-sync python scripts/smoke.py
+      - name: Test sdist minimal codec build (no arrow)
         run: |
           uv pip install --reinstall dist/*.tar.gz --config-settings="maturin.build-args=--no-default-features --features codec-minimal"
+          uv run --no-sync python scripts/smoke.py
       - name: Upload sdist
         uses: actions/upload-artifact@v4
         with:
