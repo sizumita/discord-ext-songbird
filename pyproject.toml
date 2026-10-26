@@ -2,18 +2,11 @@
 name = "discord-ext-songbird"
 requires-python = ">=3.14"
 dependencies = [
-    "audioop-lts>=0.2.2",
-    "typing-extensions>=4.15.0",
-    "ty>=0.0.8",
-    "pyarrow>=22.0.0",
-    "arro3-core>=0.6.5",
-    "arro3-io>=0.6.5",
-    "arro3-compute>=0.6.5",
+    "discord.py>=2.7.1,<3",
 ]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
-    "Programming Language :: Python :: Implementation :: PyPy",
     "Development Status :: 4 - Beta",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.14",
@@ -21,26 +14,33 @@ classifiers = [
 readme = "README.md"
 dynamic = ["version", "description", "authors", "license"]
 
-[build-system]
-requires = ["hatchling>=1.28.0", "maturin>=1.10.2,<2.0"]
-build-backend = "maturin"
+[project.optional-dependencies]
+arrow = ["pyarrow>=26.0.0"]
+arro3 = ["arro3-core>=0.9.1"]
 
-[tool.uv.sources]
-"discord.py" = { git = "https://github.com/rapptz/discord.py" }
+[build-system]
+requires = ["maturin>=1.15.0,<2"]
+build-backend = "maturin"
 
 [dependency-groups]
 dev = [
-    "discord.py",
-    "hatchling>=1.28.0",
-    "maturin>=1.10.2",
-    "numpy>=2.4.0",
-    "ruff>=0.14.10",
-    "ty>=0.0.8",
+    "ruff==0.17.2",
+    "ty==0.0.92",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.1",
+    "numpy==2.5.4",
+    "pyarrow==26.0.0",
+    "arro3-core==0.9.1",
+    "websockets==17.3",
+    "maturin==1.15.0",
 ]
 
 [tool.maturin]
 python-source = "py-src"
 module-name = "discord.ext.songbird.native"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.ruff]
 include = ["py-src/**/*.py", "py-src/**/*.pyi", "examples/**/*.py"]

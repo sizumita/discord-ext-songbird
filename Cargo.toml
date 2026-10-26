@@ -1,19 +1,43 @@
+[workspace]
+members = [".", "crates/sbcore"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/sizumita/discord-ext-songbird"
+authors = ["Sumito Izumita <mail@smdr.io>"]
+
+[workspace.lints.clippy]
+await_holding_lock = "deny"
+
 [package]
 name = "discord-ext-songbird"
 description = "Library to replace the voice backend of discord.py with Songbird."
 readme = "README.md"
-version = "0.5.0"
-edition = "2024"
-license = "MIT"
-repository = "https://github.com/sizumita/discord-ext-songbird"
-authors = [
-    "Sumito Izumita <mail@smdr.io>"
-]
+version = "0.6.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 publish = false
+
+[lints]
+workspace = true
 
 [profile.release]
 lto = true
 codegen-units = 1
+
+# Realtime audio (rubato, opus, symphonia) is far too slow unoptimised; keep dependencies optimised in
+# dev builds (`maturin develop`) and optimise test binaries (DSP tests run 180 000 ticks).
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+opt-level = 2
 
 [lib]
 name = "discord_ext_songbird_native"
@@ -24,47 +48,37 @@ name = "stub_gen"
 doc = false
 
 [features]
-default = ["codec-full"]
-codec-full = ["symphonia/all", "codec-simd"]
-codec-minimal = ["codec-pcm", "format-wav"]
-codec-simd = ["symphonia/opt-simd"]
-codec-aac = ["symphonia/aac"]
-codec-adpcm = ["symphonia/adpcm"]
-codec-alac = ["symphonia/alac"]
-codec-flac = ["symphonia/flac"]
-codec-mp1 = ["symphonia/mp1"]
-codec-mp2 = ["symphonia/mp2"]
-codec-mp3 = ["symphonia/mp3"]
-codec-pcm = ["symphonia/pcm"]
-codec-vorbis = ["symphonia/vorbis"]
-format-aiff = ["symphonia/aiff"]
-format-caf = ["symphonia/caf"]
-format-isomp4 = ["symphonia/isomp4"]
-format-mkv = ["symphonia/mkv"]
-format-ogg = ["symphonia/ogg"]
-format-wav = ["symphonia/wav"]
+default = ["codec-full", "arrow"]
+codec-full = ["sbcore/codec-full"]
+codec-minimal = ["sbcore/codec-minimal"]
+codec-simd = ["sbcore/codec-simd"]
+codec-aac = ["sbcore/codec-aac"]
+codec-adpcm = ["sbcore/codec-adpcm"]
+codec-alac = ["sbcore/codec-alac"]
+codec-flac = ["sbcore/codec-flac"]
+codec-mp1 = ["sbcore/codec-mp1"]
+codec-mp2 = ["sbcore/codec-mp2"]
+codec-mp3 = ["sbcore/codec-mp3"]
+codec-pcm = ["sbcore/codec-pcm"]
+codec-vorbis = ["sbcore/codec-vorbis"]
+format-aiff = ["sbcore/format-aiff"]
+format-caf = ["sbcore/format-caf"]
+format-isomp4 = ["sbcore/format-isomp4"]
+format-mkv = ["sbcore/format-mkv"]
+format-ogg = ["sbcore/format-ogg"]
+format-wav = ["sbcore/format-wav"]
+arrow = ["dep:pyo3-arrow", "dep:arrow-array", "dep:arrow-buffer", "dep:arrow-schema"]
+# Exposes native._testing; never enabled in release wheels.
+test-hooks = ["sbcore/test-hooks"]
 
 [dependencies]
-arrow = {version = "58.3.0"}
-log = "0.4.29"
-nonmax = "0.5.5"
-opus2 = "0.4.0"
-pyo3 = { version = "0.28.3", features = ["experimental-async"] }
-pyo3-log = "0.13.3"
-pyo3-async-runtimes = { version = "0.28.0", features = ["tokio", "tokio-runtime"] }
-pyo3-arrow = "0.17.0"
-pyo3-stub-gen = "0.22.3"
-songbird = { version = "0.6.0", features = ["receive", "driver", "tws", "rustls", "gateway", "builtin-queue"], default-features = false }
-tokio = {version = "1.48.0", features = ["macros", "sync"]}
-async-trait = "0.1.83"
-dashmap = "6.1.0"
-symphonia = { version = "0.5.5", default-features = false }
-env_logger = "0.11.8"
-tokio-stream = {version = "0.1.17", features = ["full"]}
-async-stream = "0.3.6"
-futures = "0.3.31"
-bytemuck = "1.24.0"
-pin-project-lite = "0.2"
+sbcore = { path = "crates/sbcore", default-features = false }
+pyo3 = "=0.29.3"
+pyo3-stub-gen = { version = "=0.23.1", default-features = false, features = ["infer_signature"] }
+pyo3-arrow = { version = "=0.19.0", default-features = false, optional = true }
+arrow-array = { version = "=59.3.1", optional = true }
+arrow-buffer = { version = "=59.3.1", optional = true }
+arrow-schema = { version = "=59.3.1", optional = true }
 
 [build-dependencies]
-pyo3-build-config = "0.28.3"
+pyo3-build-config = "=0.29.3"
