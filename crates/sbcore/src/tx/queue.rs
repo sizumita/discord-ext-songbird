@@ -98,19 +98,12 @@ impl PlaybackSpec {
     }
 }
 
-/// Audio of one write: raw bytes in the stream encoding, or base64 text of them.
-#[derive(Clone, Copy, Debug)]
-pub enum WriteData<'a> {
-    Pcm(&'a [u8]),
-    Base64(&'a [u8]),
-}
-
 /// Per-write metadata.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WriteMeta<'a> {
-    /// Provider item id (≤ `MAX_TAG_LEN` bytes).
+    /// Application-defined segment tag (≤ `MAX_TAG_LEN` bytes).
     pub tag: Option<&'a str>,
-    /// Provider timestamp (gap filling, §7.6).
+    /// Source-timeline timestamp in ms (gap filling, §7.6).
     pub at_ms: Option<i64>,
 }
 
@@ -264,7 +257,7 @@ pub(crate) struct QueueInner {
     pub(crate) idle_waiting: bool,
     pub(crate) end_waiting: bool,
     pub(crate) active: bool,
-    /// The next accepted write starts a turn (never written, idle, or cleared since).
+    /// The next accepted write starts a segment (never written, idle, or cleared since).
     pub(crate) fresh_turn: bool,
     /// Wall time of the last accepted write or clear (idle detection).
     pub(crate) last_activity: Instant,
@@ -514,13 +507,9 @@ impl PcmQueue {
             .store(u8::try_from(w.len()).unwrap_or(0), Ordering::Release);
     }
 
-    /// All-or-nothing write (§7.3): decode + parse outside locks, L6w splice, L6 commit.
-    /// `PlaybackFull` consumes nothing.
-    pub fn write(
-        &self,
-        data: WriteData<'_>,
-        meta: WriteMeta<'_>,
-    ) -> Result<WriteOutcome, CoreError> {
+    /// All-or-nothing write (§7.3) of raw bytes in the stream encoding: parse outside locks, L6w
+    /// splice, L6 commit. `PlaybackFull` consumes nothing.
+    pub fn write(&self, data: &[u8], meta: WriteMeta<'_>) -> Result<WriteOutcome, CoreError> {
         self.check_open()?;
         if let Some(tag) = meta.tag
             && tag.len() > MAX_TAG_LEN
@@ -909,7 +898,7 @@ impl PcmQueue {
         }
     }
 
-    /// Barge-in (§7.7): discards everything queued now (L6 only, never L6w).
+    /// Interruption (§7.7): discards everything queued now (L6 only, never L6w).
     pub fn clear(&self, opts: ClearOpts) -> Result<ClearSummary, CoreError> {
         let hold_ms = check("hold_ms", opts.hold_ms, HOLD_MS)?;
         if let Some(n) = opts.reject_until_gap_ms {
@@ -1485,7 +1474,7 @@ impl LiveSource for PcmQueue {
             if !up && self.lim.when_disconnected == DisconnectPolicy::Discard {
                 self.abort_locked(&mut g, &mut after);
                 g.anchor = None;
-                // Like clear(): the next accepted write starts a turn (prebuffer gate re-armed).
+                // Like clear(): the next accepted write starts a segment (prebuffer gate re-armed).
                 g.fresh_turn = true;
                 g.generation += 1;
                 self.st.generation.store(g.generation, Ordering::Release);

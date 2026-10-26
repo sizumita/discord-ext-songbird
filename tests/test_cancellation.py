@@ -14,7 +14,7 @@ async def test_anext_cancellation_never_loses_chunks(connected_vc: HarnessClient
     vc = connected_vc
     iterations = 1_000 if FAKE else 10_000
     rng = random.Random(1234)
-    stream = vc.listen_mixed(songbird.GPT_LIVE, max_queue_ms=60_000)
+    stream = vc.listen_mixed(songbird.PCM16_24K, max_queue_ms=60_000)
     seen: list[int] = []
     injected = 0
     for _ in range(iterations):
@@ -35,7 +35,7 @@ async def test_anext_cancellation_never_loses_chunks(connected_vc: HarnessClient
 
 async def test_cancelled_write_writes_nothing(connected_vc: HarnessClient) -> None:
     vc = connected_vc
-    pb = vc.open_playback(songbird.GPT_LIVE, max_buffer_ms=100, max_gap_ms=40)
+    pb = vc.open_playback(songbird.PCM16_24K, max_buffer_ms=100, max_gap_ms=40)
     pb.write_nowait(tone(100, rate=24_000, channels=1))  # full
     rng = random.Random(99)
     for _ in range(50):

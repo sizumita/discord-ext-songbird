@@ -24,7 +24,7 @@ use sbcore::tracks::{PlayOpts, TrackEndReason, TrackKind, TrackRef};
 use sbcore::tx::encoded::{ENCODED_WORKERS, EncodedSpec};
 use sbcore::tx::memory::MemPcm;
 use sbcore::tx::opus_stream::OpusStreamSpec;
-use sbcore::tx::queue::{ClearOpts, DisconnectPolicy, PlaybackSpec, WriteData, WriteMeta};
+use sbcore::tx::queue::{ClearOpts, DisconnectPolicy, PlaybackSpec, WriteMeta};
 use sbcore::tx::source::{EncodedFactory, SourceSpec};
 use sbcore::tx::{CloseMode, LiveSource};
 
@@ -171,7 +171,7 @@ fn playback_spec(format: Format) -> PlaybackSpec {
 }
 
 fn pcm_write(q: &sbcore::tx::queue::PcmQueue, data: &[u8]) {
-    q.write(WriteData::Pcm(data), WriteMeta::default()).unwrap();
+    q.write(data, WriteMeta::default()).unwrap();
 }
 
 fn pull(mh: &MixerHarness, ticks: usize) -> Vec<f32> {
@@ -666,7 +666,7 @@ fn playback_is_pulled_exactly_at_48k_and_resampled_from_24k() {
     drop(mh);
     r.conn.close(CloseReason::Requested);
     assert!(matches!(
-        q.write(WriteData::Pcm(&data), WriteMeta::default()),
+        q.write(&data, WriteMeta::default()),
         Err(CoreError::StreamClosed(CloseReason::ConnectionClosed))
     ));
 }
@@ -1115,10 +1115,7 @@ fn close_during_activity_releases_everything() {
                 Err(CoreError::StreamClosed(CloseReason::ConnectionClosed))
             )
         };
-        assert!(closed(
-            pb.write(WriteData::Pcm(&[0; 4]), WriteMeta::default())
-                .map(|_| ())
-        ));
+        assert!(closed(pb.write(&[0; 4], WriteMeta::default()).map(|_| ())));
         assert!(closed(enc.write(&[0; 4])));
         assert!(closed(opus.send(&packets[0])));
         for t in [
@@ -1177,7 +1174,7 @@ fn closing_while_writers_and_the_mixer_are_busy_never_hangs() {
             std::thread::spawn(move || {
                 let chunk = sine_mono(24_000, 20, 440.0, 0.2);
                 for _ in 0..2_000 {
-                    match pb.write(WriteData::Pcm(&chunk), WriteMeta::default()) {
+                    match pb.write(&chunk, WriteMeta::default()) {
                         Ok(_) | Err(CoreError::PlaybackFull { .. }) => {}
                         Err(CoreError::StreamClosed(_)) => return,
                         Err(e) => panic!("{e:?}"),

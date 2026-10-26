@@ -2,17 +2,24 @@
 
 Receive streams are **continuous**: one chunk per `chunk_ms` of real time from subscription until
 close, whether or not anyone speaks. Silence is synthesised for quiet users, before the first packet,
-during reconnects and when Discord stops sending audio — so a realtime model's uplink stays paced
-like a microphone.
+during reconnects and when Discord stops sending audio — so anything consuming the stream (a file
+writer, an analyser, a network uplink) stays paced like a microphone.
 
 ```python
-from discord.ext.songbird import GPT_LIVE
+from discord.ext.songbird import PCM16_16K
 
-async with vc.listen_mixed(GPT_LIVE, chunk_ms=40) as mic:   # PCM16LE 24 kHz mono, 40 ms chunks
-    mic.skip_to_live()                                       # start fresh (e.g. after a handshake)
+async with vc.listen_mixed() as mic:                         # default: 48 kHz stereo PCM16, 20 ms chunks
     async for chunk in mic:
-        await ws.send(chunk.to_base64())                     # base64 encoded in Rust
+        process(chunk)                                       # buffer protocol: no copy
+
+async with vc.listen_mixed(PCM16_16K, chunk_ms=100) as mic:  # converted in Rust: 16 kHz mono, 100 ms chunks
+    mic.skip_to_live()                                       # start fresh (e.g. once the consumer is ready)
+    async for chunk in mic:
+        await sock.send(bytes(chunk))
 ```
+
+To feed another audio system or a network service, see
+[Streaming to external services](index.md#streaming-to-external-services).
 
 ## Streams
 
@@ -26,11 +33,14 @@ async with vc.listen_mixed(GPT_LIVE, chunk_ms=40) as mic:   # PCM16LE 24 kHz mon
 Common options: `chunk_ms` (10–1000, default 20), `max_queue_ms` (default 2000) and `overflow`.
 
 - **Formats**: 8/16/24/48 kHz, mono or stereo, `pcm16le`, `f32le`, `mulaw`/`alaw` (8 kHz mono).
-  Presets: `GPT_LIVE`, `OPENAI_REALTIME` (24 kHz), `GEMINI_LIVE_INPUT` (16 kHz), `PCM16_48K`, …
+  The default is `PCM16_48K_STEREO`, Discord's native format (no resampling). Presets:
+  `PCM16_8K`, `PCM16_16K`, `PCM16_24K`, `PCM16_48K`, `PCM16_48K_STEREO`, `F32_48K`,
+  `F32_48K_STEREO`, `MULAW_8K`, `ALAW_8K`; strings such as `"pcm16_24k"` work too.
   Each user's Opus is decoded once and resampled once per format, however many streams use it.
 - **Mixing** sums the selected users and runs a limiter (−1 dBFS); it never divides by the number
-  of speakers, so the level does not jump when someone joins. `policy="floor"` lets the first
-  speaker hold the floor until silent for `floor_release_ms` — for single-caller models.
+  of speakers, so the level does not jump when someone joins. `policy="floor"` is a
+  dominant-speaker mix: the first speaker holds the floor until silent for `floor_release_ms`, for
+  consumers that expect one speaker at a time.
   `set_include()` / `set_exclude()` change a mixed stream's selection at the next chunk boundary.
 - **`ignore_bots`** uses the member cache; a bot's first few hundred ms may be mixed before its
   classification arrives.
@@ -58,8 +68,8 @@ Each stream is bounded by `max_queue_ms` (and every stream of a connection toget
 | `"drop_newest"` | discard the incoming chunk |
 | `"error"` | close the stream: the queued chunks are still delivered, then `StreamOverflow` is raised once (also by `async for`) |
 
-A chunk's `dropped_ms` is the audio dropped immediately before it, so a bridge can send
-compensating silence and keep the provider's timeline aligned.
+A chunk's `dropped_ms` is the audio dropped immediately before it, so a consumer can insert
+compensating silence and keep its own timeline aligned.
 
 ## `AudioChunk`
 
@@ -69,7 +79,7 @@ A chunk exposes its payload through the **buffer protocol** without copying:
 memoryview(chunk)                      # format 'h' (pcm16le), 'f' (f32le) or 'B' (G.711), read-only
 np.frombuffer(chunk, "<i2")            # zero-copy
 wave_file.writeframes(chunk)
-bytes(chunk); chunk.to_bytes(); chunk.to_base64()
+bytes(chunk); chunk.to_bytes()          # one copy
 ```
 
 | Attribute | Meaning |
@@ -84,8 +94,8 @@ bytes(chunk); chunk.to_bytes(); chunk.to_base64()
 | `rms_dbfs`, `peak` | levels |
 | `format`, `frames`, `duration_ms`, `user_id` | shape and source (`user_id` is `None` when mixed) |
 
-`timeline_ms − start_ms` is the stream's `origin_timeline_ms`. A GPT-Live bridge that appends every
-chunk can map transcript `start_ms` values back to `chunk.speakers`.
+`timeline_ms − start_ms` is the stream's `origin_timeline_ms`. A consumer that receives every chunk
+can map its own stream offsets (e.g. timestamps in a transcript) back to `chunk.speakers`.
 
 ### Arrow (optional)
 
@@ -131,7 +141,7 @@ Joins are not observable through the voice connection; use discord.py's `on_voic
 `examples/record.py` writes one timeline-aligned WAV per user:
 
 ```python
-async with vc.listen_users(PCM16_48K, chunk_ms=200, max_queue_ms=10_000) as users:
+async with vc.listen_users(PCM16_48K, chunk_ms=200, max_queue_ms=10_000) as users:  # mono WAV files
     async for stream in users:          # one stream per user, as they first speak
         tg.create_task(record_user(stream, out, origin=vc.timeline_ms))
 ```

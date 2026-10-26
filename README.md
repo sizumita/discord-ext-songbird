@@ -5,20 +5,21 @@
 [![PyPI - Version](https://img.shields.io/pypi/v/discord-ext-songbird)](https://pypi.org/project/discord-ext-songbird/)
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/discord-ext-songbird)](https://pypi.org/project/discord-ext-songbird/)
 
-A voice backend for discord.py 2.7, powered by [songbird](https://github.com/serenity-rs/songbird)
-and written in Rust — built for realtime voice AI (GPT-Live, OpenAI Realtime, Gemini Live), music
-and recording bots.
+A general-purpose voice backend for discord.py 2.7, powered by
+[songbird](https://github.com/serenity-rs/songbird) and written in Rust: low-latency audio in and
+out of Discord voice channels for music bots, recorders, voice tools and bridges to other audio
+systems.
 
 ## Highlights
 
 - **`SongbirdClient`**, a `discord.VoiceProtocol`: `await channel.connect(cls=SongbirdClient)`.
 - **Receive** continuous, silence-filled, real-time-paced per-user or mixed streams in the format
-  your model wants (8–48 kHz, mono/stereo, PCM16 / f32 / µ-law / A-law, 10–1000 ms chunks), with
-  speaking events, timestamps and drop accounting. Chunks are zero-copy buffers with
-  `to_base64()` done in Rust.
-- **Send** realtime PCM with backpressure, base64 input, wall-clock gap filling from provider
-  timestamps, and barge-in (`clear()`) that is silent within 40 ms and reports what was heard for
-  truncation.
+  you need (8–48 kHz, mono/stereo, PCM16 / f32 / µ-law / A-law, 10–1000 ms chunks; Discord's
+  native 48 kHz stereo PCM16 by default), with speaking events, timestamps and drop accounting.
+  Chunks are zero-copy buffers (`bytes(chunk)`, `memoryview(chunk)`, NumPy, Arrow).
+- **Send** realtime PCM with backpressure, wall-clock gap filling from source timestamps, and
+  interruption (`clear()`) that is silent within 40 ms and reports how much of each tagged segment
+  was actually played.
 - Files, raw PCM and Opus packets with a sequential queue; push-based encoded and Opus streams.
 - **Leak-free and bounded by construction**: Rust never holds a Python object, no Rust thread ever
   enters the interpreter, and every buffer has a validated cap.
@@ -54,8 +55,8 @@ async def on_ready() -> None:
     # Play a file…
     vc.play(await songbird.load_audio_file("hello.mp3"))
 
-    # …and echo the channel back, 20 ms at a time.
-    async with vc.listen_mixed(songbird.GPT_LIVE) as mic, vc.open_playback(songbird.GPT_LIVE) as out:
+    # …and echo the channel back, 20 ms at a time (48 kHz stereo PCM16 by default).
+    async with vc.listen_mixed() as mic, vc.open_playback() as out:
         async for chunk in mic:
             if chunk.speaking:
                 out.write_nowait(chunk)
@@ -64,7 +65,10 @@ async def on_ready() -> None:
 client.run(os.environ["DISCORD_BOT_TOKEN"])
 ```
 
-A complete GPT-Live bridge is about 20 lines of user code; see [`examples/gpt_live.py`](examples/gpt_live.py).
+Streaming to an external service (a speech recogniser, a realtime speech service, another voice
+system) uses the same two calls with the format and chunk size that service expects; see
+[Streaming to external services](docs/index.md#streaming-to-external-services) and
+[`examples/websocket_bridge.py`](examples/websocket_bridge.py).
 
 ## Documentation
 
@@ -77,13 +81,12 @@ A complete GPT-Live bridge is about 20 lines of user code; see [`examples/gpt_li
 
 | File | What it shows |
 |---|---|
-| [`examples/gpt_live.py`](examples/gpt_live.py) | GPT-Live bridge: floor-policy uplink, gap-filled playback, local barge-in |
-| [`examples/openai_realtime.py`](examples/openai_realtime.py) | OpenAI Realtime bridge: item tags, `clear()` + exact truncation |
-| [`examples/gemini_live.py`](examples/gemini_live.py) | Gemini Live bridge: 16 kHz in / 24 kHz out, `interrupted`, `goAway` reconnects |
+| [`examples/echo.py`](examples/echo.py) | Receive + playback streaming: a member's voice played back with a delay |
+| [`examples/websocket_bridge.py`](examples/websocket_bridge.py) | Generic bridge: raw PCM chunks out as binary WebSocket frames, replies played back, `"clear"` interrupts |
 | [`examples/record.py`](examples/record.py) | One timeline-aligned WAV per user plus a speaking-event log |
 | [`examples/music.py`](examples/music.py) | Music bot on the track queue, including queued HTTP streams |
 
-Set `DISCORD_BOT_TOKEN` (and the provider's API key) and run e.g. `python examples/record.py`.
+Set `DISCORD_BOT_TOKEN` (plus `BRIDGE_URL` for the bridge) and run e.g. `python examples/record.py`.
 
 ## Development
 

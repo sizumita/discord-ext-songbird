@@ -14,8 +14,6 @@ does this unless ``SONGBIRD_TEST_NATIVE=real``).
 from __future__ import annotations
 
 import array
-import base64
-import binascii
 import dataclasses
 import math
 import os
@@ -284,16 +282,6 @@ class AudioFormat:
             return f"audio/pcm;rate={self._rate}{ch}"
         return f"audio/x-f32le;rate={self._rate}{ch}"
 
-    @property
-    def openai_format(self) -> dict[str, object]:
-        if self._encoding == "pcm16le" and self._rate in (16_000, 24_000) and self._channels == 1:
-            return {"type": "audio/pcm", "rate": self._rate}
-        if self._encoding == "mulaw":
-            return {"type": "audio/pcmu"}
-        if self._encoding == "alaw":
-            return {"type": "audio/pcma"}
-        raise _invalid("OpenAI formats are mono pcm16le at 16000/24000 Hz, mulaw or alaw")
-
     def bytes_for(self, ms: int) -> int:
         _check_int("ms", ms, 0, 2**32 - 1)
         return ms * self.bytes_per_ms
@@ -308,9 +296,6 @@ class AudioFormat:
     def silence(self, ms: int) -> bytes:
         _check_int("ms", ms, 0, 600_000)
         return bytes([self._silence_byte()]) * (ms * self.bytes_per_ms)
-
-    def silence_base64(self, ms: int) -> str:
-        return base64.b64encode(self.silence(ms)).decode("ascii")
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, AudioFormat):
@@ -368,10 +353,6 @@ _PRESETS = {
     "MULAW_8K": AudioFormat(8_000, 1, "mulaw"),
     "ALAW_8K": AudioFormat(8_000, 1, "alaw"),
 }
-_PRESETS["GPT_LIVE"] = _PRESETS["PCM16_24K"]
-_PRESETS["OPENAI_REALTIME"] = _PRESETS["PCM16_24K"]
-_PRESETS["GEMINI_LIVE_INPUT"] = _PRESETS["PCM16_16K"]
-_PRESETS["GEMINI_LIVE_OUTPUT"] = _PRESETS["PCM16_24K"]
 
 
 def _as_format(fmt: Any) -> AudioFormat:
@@ -440,13 +421,6 @@ def _buffer_bytes(data: Any, encoding: str | None) -> bytes:
         if not allowed:
             raise _invalid(f"buffer format {code!r} does not match the stream encoding {encoding}")
         return mv.tobytes()
-
-
-def _b64decode(data: str | bytes) -> bytes:
-    try:
-        return base64.b64decode(data, validate=True)
-    except (binascii.Error, ValueError) as e:
-        raise _invalid(f"invalid base64: {e}") from None
 
 
 # ── Opus TOC (RFC 6716 §3.1) ──────────────────────────────────────────────────────────────────────
@@ -1063,7 +1037,7 @@ class RawPcm:
         _ensure_not_forked()
         fmt = _as_format(format)
         if isinstance(data, str):
-            raise _invalid("RawPcm takes bytes-like data, not str")
+            raise TypeError("audio must be a bytes-like object, not str")
         raw = _buffer_bytes(data, fmt.encoding)
         _check_int("source_bytes", len(raw), 0, 1 << 30)
         frames = len(raw) // fmt.frame_bytes
@@ -1253,9 +1227,6 @@ class AudioChunk:
 
     def to_bytes(self) -> bytes:
         return bytes(self._data)
-
-    def to_base64(self) -> str:
-        return base64.b64encode(self._data).decode("ascii")
 
     def __arrow_c_array__(self, requested_schema: object | None = None) -> tuple[object, object]:
         import pyarrow as pa
@@ -1761,7 +1732,10 @@ class _PcmQueue:
 
     # ── write ────────────────────────────────────────────────────────────────────────────────────
 
-    def write(self, data: Any, tag: str | None, at_ms: int | None, b64: bool) -> None:
+    def write(self, data: Any, tag: str | None, at_ms: int | None) -> None:
+        if isinstance(data, str):
+            raise TypeError("audio must be a bytes-like object, not str")
+        payload = _buffer_bytes(data, self.fmt.encoding)
         if self.closed is not None:
             raise _errors().StreamClosed(self.end_reason or "closed")
         if self.conn.closing:
@@ -1771,18 +1745,8 @@ class _PcmQueue:
         if at_ms is not None:
             _check_int("at_ms", at_ms, -(2**63), 2**63 - 1)
         cap_bytes = self.cap * self.fmt.frame_bytes
-        if b64 or isinstance(data, str):
-            if isinstance(data, str):
-                raw_len = len(data)
-            else:
-                raw_len = len(_buffer_bytes(data, None))
-            if raw_len * 3 // 4 > cap_bytes:
-                raise _limit("write_bytes", raw_len * 3 // 4, 0, cap_bytes)
-            payload = _b64decode(data if isinstance(data, str) else _buffer_bytes(data, None))
-        else:
-            payload = _buffer_bytes(data, self.fmt.encoding)
-            if len(payload) > cap_bytes:
-                raise _limit("write_bytes", len(payload), 0, cap_bytes)
+        if len(payload) > cap_bytes:
+            raise _limit("write_bytes", len(payload), 0, cap_bytes)
         fb = self.fmt.frame_bytes
         with self.wlock:
             if self.carry_gen != self.generation:
@@ -2017,10 +1981,7 @@ class Playback:
         self._q = q
 
     def write(self, data: Any, tag: str | None = None, at_ms: int | None = None) -> None:
-        self._q.write(data, tag, at_ms, b64=False)
-
-    def write_base64(self, data: Any, tag: str | None = None, at_ms: int | None = None) -> None:
-        self._q.write(data, tag, at_ms, b64=True)
+        self._q.write(data, tag, at_ms)
 
     def arm_space(self, nbytes: int) -> bool:
         q = self._q

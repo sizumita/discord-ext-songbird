@@ -2,8 +2,8 @@
 
 Writes are all-or-nothing. ``*_nowait`` methods are synchronous, safe from any thread and never
 block the mixer; the ``async`` variants only wait for space (a cancelled ``write()`` has written
-nothing). In a task that reads a provider WebSocket, use the ``*_nowait`` methods and treat
-:class:`PlaybackFull` as an overrun (§9.10 rule 3).
+nothing). In a task that reads audio from a network connection, use the ``*_nowait`` methods and
+treat :class:`PlaybackFull` as an overrun (§9.10 rule 3).
 """
 
 from __future__ import annotations
@@ -44,10 +44,8 @@ async def _yield_before_retry(spins: int) -> None:
     await asyncio.sleep(0 if spins <= 1 else _RETRY_S)
 
 
-def _nbytes(data: Buffer | str) -> int:
-    """Decoded byte length of a write (base64 strings decode to ~3/4 of their length)."""
-    if isinstance(data, str):
-        return len(data) * 3 // 4
+def _nbytes(data: Buffer) -> int:
+    """Byte length of a write (0 for objects that are not buffers; the write then raises)."""
     try:
         return memoryview(data).nbytes
     except TypeError:
@@ -55,7 +53,7 @@ def _nbytes(data: Buffer | str) -> int:
 
 
 class PlaybackStream:
-    """Realtime PCM output (AI speech), created by ``SongbirdClient.open_playback``.
+    """Realtime PCM output, created by ``SongbirdClient.open_playback``.
 
     Starts paused (nothing is sent until the first write). Underrun plays silence; the track
     auto-pauses after ``idle_ms`` (the speaking indicator turns off) and resumes on the next write.
@@ -118,7 +116,7 @@ class PlaybackStream:
 
     @property
     def is_idle(self) -> bool:
-        """Whether the stream is idle (no turn in progress)."""
+        """Whether playback is idle: nothing queued and no audio for ``idle_ms``."""
         return self._pb.is_idle
 
     @property
@@ -138,57 +136,46 @@ class PlaybackStream:
 
     async def write(
         self,
-        data: Buffer | str,
+        data: Buffer,
         *,
         tag: str | None = None,
         at_ms: int | None = None,
         timeout: float | None = None,
     ) -> None:
-        """Append audio in :attr:`format`, waiting only while the buffer is full.
+        """Append raw audio in :attr:`format`, waiting only while the buffer is full.
 
         Parameters
         ----------
-        data : bytes-like or str
-            Any size (a partial frame is carried to the next write). A ``str`` is base64. Typed
-            buffers must match the encoding (``'h'`` for pcm16le, ``'f'`` for f32le) or be raw bytes.
+        data : bytes-like
+            Any size (a partial frame is carried to the next write). Typed buffers must match the
+            encoding (``'h'`` for pcm16le, ``'f'`` for f32le) or be raw bytes; ``AudioChunk`` works
+            directly. A ``str`` raises ``TypeError``.
         tag : str or None
-            Provider item id (OpenAI Realtime ``item_id``) for :meth:`clear` / :meth:`item`.
+            Application-defined segment tag (at most 128 bytes) for :meth:`clear`, :meth:`item`
+            and :meth:`end_item`, e.g. the id of the message or segment the audio belongs to.
         at_ms : int or None
-            Provider timestamp (GPT-Live ``start_ms``) for wall-clock gap filling.
+            Source-timeline timestamp in ms. A gap since the previous timed write is filled with
+            silence (up to ``max_gap_ms``), so audio stays aligned with the source's clock.
         timeout : float or None
             Seconds to wait for space (``TimeoutError``); a timed-out write wrote nothing.
 
         Raises
         ------
+        TypeError
+            ``data`` is a ``str`` or not a buffer.
         StreamClosed
             The stream or connection is closed.
         InvalidAudio
-            Invalid base64, a mismatched buffer format, or a tag longer than 128 bytes.
+            A mismatched buffer format, or a tag longer than 128 bytes.
         LimitExceeded
             The write can never fit the buffer.
         """
         await self._write(lambda: self._pb.write(data, tag, at_ms), _nbytes(data), timeout)
 
-    def write_nowait(self, data: Buffer | str, *, tag: str | None = None, at_ms: int | None = None) -> None:
+    def write_nowait(self, data: Buffer, *, tag: str | None = None, at_ms: int | None = None) -> None:
         """Like :meth:`write`, but raises :class:`PlaybackFull` (nothing consumed) instead of waiting.
         Safe from any thread."""
         self._pb.write(data, tag, at_ms)
-
-    async def write_base64(
-        self,
-        data: str | bytes,
-        *,
-        tag: str | None = None,
-        at_ms: int | None = None,
-        timeout: float | None = None,
-    ) -> None:
-        """:meth:`write` of base64 text (``str`` or ASCII ``bytes``), decoded in Rust."""
-        n = len(data) * 3 // 4
-        await self._write(lambda: self._pb.write_base64(data, tag, at_ms), n, timeout)
-
-    def write_base64_nowait(self, data: str | bytes, *, tag: str | None = None, at_ms: int | None = None) -> None:
-        """:meth:`write_nowait` of base64 text, decoded in Rust. Safe from any thread."""
-        self._pb.write_base64(data, tag, at_ms)
 
     async def _write(self, attempt: Callable[[], None], nbytes: int, timeout: float | None) -> None:
         async with asyncio.timeout(timeout):
@@ -210,38 +197,39 @@ class PlaybackStream:
                     raise StreamClosed("connection_closed")
                 await self._pump.wait(self._pb.wake_id)
 
-    # ── barge-in and items ───────────────────────────────────────────────────────────────────────
+    # ── interruption and tagged segments ─────────────────────────────────────────────────────────
 
     def clear(
         self, *, reject_late: bool = True, hold_ms: int = 0, reject_until_gap_ms: int | None = None
     ) -> native.ClearResult:
-        """Barge-in: discard all queued audio now (silent within ≤ 40 ms). Any thread.
+        """Interrupt: discard all queued audio now (silent within ≤ 40 ms). Any thread.
 
         Parameters
         ----------
         reject_late : bool, default True
-            Drop later writes for every open or interrupted tag (OpenAI Realtime item ids).
+            Drop later writes for every open or interrupted tag (audio of a segment that was cut
+            off and is still arriving).
         hold_ms : int, default 0
             Fallback for untimed writes: drop **all** writes for this long.
         reject_until_gap_ms : int or None
-            Drop later *timed* writes contiguous with the cleared audio until one starts at least
-            this many ms after it (GPT-Live ``start_ms``).
+            Drop later *timed* writes (``at_ms``) contiguous with the cleared audio until one starts
+            at least this many ms after it.
 
         Returns
         -------
         ClearResult
-            What was discarded, and per-item progress for truncation (``items``).
+            What was discarded, and per-tag progress (``items``): how much of each tagged segment
+            was actually played before the interruption.
         """
         return self._pb.clear(reject_late=reject_late, hold_ms=hold_ms, reject_until_gap_ms=reject_until_gap_ms)
 
     def end_item(self, tag: str) -> None:
-        """The provider finished sending this item's audio (e.g. ``response.output_audio.done``):
-        closes the tag and releases the prebuffer gate; ``ItemProgress.complete`` becomes ``True``
-        once it has played."""
+        """Mark the tagged segment ``tag`` as fully written: closes the tag and releases the
+        prebuffer gate; ``ItemProgress.complete`` becomes ``True`` once it has played."""
         self._pb.end_item(tag)
 
     def item(self, tag: str) -> native.ItemProgress | None:
-        """Progress of item ``tag``, if it is known."""
+        """Progress of the tagged segment ``tag``, if it is known."""
         return self._pb.item(tag)
 
     def played_ms_of(self, tag: str) -> int:
@@ -274,8 +262,9 @@ class PlaybackStream:
             return False
 
     async def wait_idle(self) -> None:
-        """Wait until the stream is idle: the end of the current AI turn (GPT-Live has no
-        output-done event). Returns at once if nothing is playing."""
+        """Wait until playback is idle: everything written has played and no new audio arrived for
+        ``idle_ms``. Useful when the source has no explicit end-of-segment signal. Returns at once
+        if nothing is playing."""
         while not self._pb.closed and not self._pb.arm_idle():
             if self._pump.is_closed:
                 return

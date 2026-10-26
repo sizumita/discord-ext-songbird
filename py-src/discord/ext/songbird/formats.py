@@ -4,6 +4,9 @@
 ``sample_rate`` ∈ {8000, 16000, 24000, 48000}, ``channels`` ∈ {1, 2}, ``"mulaw"``/``"alaw"`` require
 8000 Hz mono). Anywhere a format is expected, a string accepted by :meth:`AudioFormat.parse` works
 too (``"pcm16_24k"``, ``"pcm16_48k_stereo"``, ``"f32_48k"``, ``"mulaw"``, ``"pcm16le/24000/1"``).
+
+:data:`PCM16_48K_STEREO` is Discord's native format and the default of every ``listen*`` stream and
+of ``open_playback``: audio in that format passes through without resampling or channel conversion.
 """
 
 from __future__ import annotations
@@ -25,10 +28,6 @@ __all__ = [
     "F32_48K_STEREO",
     "MULAW_8K",
     "ALAW_8K",
-    "GPT_LIVE",
-    "OPENAI_REALTIME",
-    "GEMINI_LIVE_INPUT",
-    "GEMINI_LIVE_OUTPUT",
     "as_format",
 ]
 
@@ -43,19 +42,11 @@ PCM16_16K: Final[AudioFormat] = AudioFormat(16_000, 1, "pcm16le")
 PCM16_24K: Final[AudioFormat] = AudioFormat(24_000, 1, "pcm16le")
 PCM16_48K: Final[AudioFormat] = AudioFormat(48_000, 1, "pcm16le")
 PCM16_48K_STEREO: Final[AudioFormat] = AudioFormat(48_000, 2, "pcm16le")
+"""Discord's native format (48 kHz stereo PCM16LE): the default of receive streams and playback."""
 F32_48K: Final[AudioFormat] = AudioFormat(48_000, 1, "f32le")
 F32_48K_STEREO: Final[AudioFormat] = AudioFormat(48_000, 2, "f32le")
 MULAW_8K: Final[AudioFormat] = AudioFormat(8_000, 1, "mulaw")
 ALAW_8K: Final[AudioFormat] = AudioFormat(8_000, 1, "alaw")
-
-GPT_LIVE: Final[AudioFormat] = PCM16_24K
-"""``gpt-live-1`` default: PCM16LE 24 kHz mono, one format for input and output."""
-OPENAI_REALTIME: Final[AudioFormat] = PCM16_24K
-"""OpenAI Realtime (``audio/pcm`` at 24 kHz)."""
-GEMINI_LIVE_INPUT: Final[AudioFormat] = PCM16_16K
-"""Gemini Live input: PCM16LE 16 kHz mono."""
-GEMINI_LIVE_OUTPUT: Final[AudioFormat] = PCM16_24K
-"""Gemini Live output: PCM16LE 24 kHz mono."""
 
 
 def as_format(fmt: FormatLike) -> AudioFormat:

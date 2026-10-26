@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import array
 import asyncio
-import base64
 import faulthandler
 import gc
 import json
@@ -66,7 +65,7 @@ def test_gil_state_after_import() -> None:
 
 async def test_concurrent_read_nowait_delivers_each_chunk_once(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
-    stream = vc.listen_mixed(songbird.GPT_LIVE, max_queue_ms=60_000)
+    stream = vc.listen_mixed(songbird.PCM16_24K, max_queue_ms=60_000)
     for _ in range(400):
         testing.inject_tick(vc._conn, [], [])
         vc.harness.step(20)
@@ -90,7 +89,7 @@ async def test_concurrent_read_nowait_delivers_each_chunk_once(connected_vc: Har
 
 async def test_writers_and_clear_race_the_mixer(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
-    pb = vc.open_playback(songbird.GPT_LIVE, max_buffer_ms=2_000, max_gap_ms=1_000)
+    pb = vc.open_playback(songbird.PCM16_24K, max_buffer_ms=2_000, max_gap_ms=1_000)
     mh = testing.MixerHarness(pb._pb)
     data = tone(20, rate=24_000, channels=1)
     stop = threading.Event()
@@ -143,7 +142,7 @@ async def test_loop_jitter_while_decoding(connected_vc: HarnessClient, testing: 
     packets = testing.encode_opus(tone(20))
     for i in range(20):
         testing.inject_map(vc._conn, 500 + i, 60_000 + i)
-    stream = vc.listen_mixed(songbird.GPT_LIVE, max_queue_ms=60_000)
+    stream = vc.listen_mixed(songbird.PCM16_24K, max_queue_ms=60_000)
     stop = threading.Event()
 
     def feeder() -> None:
@@ -214,16 +213,16 @@ async def test_cross_thread_load_and_a_foreign_close_never_deadlock(connected_vc
     speaker = 7_000_000_000_000_001
     packet = testing.encode_opus(tone(20))[0]
     testing.inject_map(conn, SSRC, speaker)
-    mixed = vc.listen_mixed(songbird.GPT_LIVE, max_queue_ms=2_000)
+    mixed = vc.listen_mixed(songbird.PCM16_24K, max_queue_ms=2_000)
     user = vc.listen_user(speaker, songbird.PCM16_16K, max_queue_ms=2_000)
     events = vc.events()
-    pb = vc.open_playback(songbird.GPT_LIVE, max_buffer_ms=2_000, max_gap_ms=1_000)
+    pb = vc.open_playback(songbird.PCM16_24K, max_buffer_ms=2_000, max_gap_ms=1_000)
     mixer = testing.MixerHarness(pb._pb)
     encoded = vc.open_encoded_stream(max_buffer_bytes=64 << 10)
     opus = vc.open_opus_stream(max_packets=50)
     track = vc.play(songbird.RawPcm(tone(1_000, rate=24_000, channels=1), songbird.PCM16_24K), loops=None)
     pcm = tone(20, rate=24_000, channels=1)
-    pcm_b64 = base64.b64encode(pcm).decode()
+    pcm_copy = bytearray(pcm)  # a non-bytes buffer: copied before the write
     big_pcm = tone(12_000, rate=48_000, channels=1)  # > 1 MiB: parsed detached (§5.2)
     floats = array.array("f", [0.25] * 44_100 * 2)
 
@@ -261,7 +260,7 @@ async def test_cross_thread_load_and_a_foreign_close_never_deadlock(connected_vc
     def writer(i: int) -> Callable[[], None]:
         def body() -> None:
             if i % 2:
-                pb.write_nowait(pcm_b64, tag=f"w{i}")
+                pb.write_nowait(pcm_copy, tag=f"w{i}")
             else:
                 pb.write_nowait(pcm, tag=f"w{i}")
             if i == 0:

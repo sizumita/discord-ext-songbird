@@ -1,7 +1,7 @@
 //! Python → Rust audio input conversion (§7.3, I8). The only module that touches buffers.
 //!
-//! * `bytes` is borrowed as `&[u8]` (zero copies) and `str` as `&str` (base64): plain borrows of
-//!   immutable objects, released by a decref after the sbcore call returns.
+//! * `bytes` is borrowed as `&[u8]` (zero copies): a plain borrow of an immutable object, released
+//!   by a decref after the sbcore call returns. `str` is never audio (`TypeError`).
 //! * Any other buffer-protocol object must be C-contiguous and its format code must match the stream
 //!   encoding. It is copied once into an owned `Vec<u8>` (`try_reserve` → `MemoryError`), and the
 //!   buffer is released **before** returning, so no `PyBuffer` ever overlaps a Rust lock.
@@ -18,26 +18,20 @@ use sbcore::{Encoding, LimitError, LimitNum};
 
 use crate::errors::{CoreResultExt, Exc, limit_exc, msg_exc};
 
-/// Audio handed to sbcore: borrowed bytes, base64 text, or an owned copy of a buffer.
+/// Audio handed to sbcore: borrowed bytes or an owned copy of a buffer.
 #[derive(Debug)]
 pub enum AudioData<'a> {
     Bytes(&'a [u8]),
-    Base64(&'a str),
     Owned(Vec<u8>),
 }
 
 impl AudioData<'_> {
-    /// The raw bytes (`is_base64` tells how to interpret them).
+    /// The raw bytes.
     pub fn bytes(&self) -> &[u8] {
         match self {
             AudioData::Bytes(b) => b,
-            AudioData::Base64(s) => s.as_bytes(),
             AudioData::Owned(v) => v,
         }
-    }
-
-    pub fn is_base64(&self) -> bool {
-        matches!(self, AudioData::Base64(_))
     }
 }
 
@@ -71,9 +65,8 @@ pub fn copy_buffer(
     obj: &Bound<'_, PyAny>,
     encoding: Option<Encoding>,
 ) -> PyResult<Vec<u8>> {
-    let buf = PyUntypedBuffer::get(obj).map_err(|_| {
-        PyTypeError::new_err("expected bytes, str (base64) or a buffer-protocol object")
-    })?;
+    let buf = PyUntypedBuffer::get(obj)
+        .map_err(|_| PyTypeError::new_err("expected bytes or a buffer-protocol object"))?;
     let result = (|| {
         let fmt = format_str(buf.format());
         if !format_allowed(&fmt, encoding) {
@@ -108,14 +101,16 @@ pub fn copy_buffer(
     result
 }
 
-/// Extracts audio for a stream with `encoding`: `bytes` (borrowed), `str` (base64, borrowed) or any
-/// other C-contiguous buffer whose format matches (copied).
+/// Extracts audio for a stream with `encoding`: `bytes` (borrowed) or any other C-contiguous buffer
+/// whose format matches (copied). `str` raises `TypeError`.
 pub fn extract_audio<'a>(obj: &'a Bound<'_, PyAny>, encoding: Encoding) -> PyResult<AudioData<'a>> {
     if let Ok(b) = obj.cast::<PyBytes>() {
         return Ok(AudioData::Bytes(b.as_bytes()));
     }
-    if let Ok(s) = obj.cast::<PyString>() {
-        return Ok(AudioData::Base64(s.to_str()?));
+    if obj.is_instance_of::<PyString>() {
+        return Err(PyTypeError::new_err(
+            "audio must be a bytes-like object, not str",
+        ));
     }
     copy_buffer(obj.py(), obj, Some(encoding)).map(AudioData::Owned)
 }

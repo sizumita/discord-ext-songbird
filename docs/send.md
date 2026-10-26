@@ -5,7 +5,7 @@ once; songbird mixes them.
 
 | You have | Use |
 |---|---|
-| AI speech / any realtime PCM (bytes or base64) | `vc.open_playback(fmt)` → `PlaybackStream` |
+| Realtime PCM arriving over time (generated, streamed, received from another system) | `vc.open_playback(fmt)` → `PlaybackStream` |
 | An encoded stream arriving over time (mp3/ogg/wav/…) | `vc.open_encoded_stream()` → `EncodedStream`, or `vc.queue.enqueue_stream(reader)` |
 | 20 ms Opus packets arriving over time | `vc.open_opus_stream()` → `OpusPacketStream` |
 | A file or bytes in memory | `AudioFile`, `RawPcm`, `OpusPackets` with `vc.play()` / `vc.enqueue()` |
@@ -13,54 +13,63 @@ once; songbird mixes them.
 ## `PlaybackStream`: realtime PCM
 
 ```python
-from discord.ext.songbird import GPT_LIVE, PlaybackFull
+from discord.ext.songbird import PCM16_24K, PlaybackFull
 
-async with vc.open_playback(GPT_LIVE) as speaker:      # PCM16LE 24 kHz mono
+async with vc.open_playback() as speaker:              # default: 48 kHz stereo PCM16, Discord's native format
     speaker.write_nowait(pcm_bytes)                    # any size; partial frames are carried
-    speaker.write_base64_nowait(b64_delta, tag=item_id, at_ms=start_ms)
     await speaker.write(more_pcm)                      # waits only while the buffer is full
     await speaker.drain(timeout=5)                     # flush: wait until everything has played
+
+async with vc.open_playback(PCM16_24K) as speaker:     # any other format is converted on the mixer side
+    speaker.write_nowait(segment_pcm, tag=segment_id, at_ms=source_ms)
 ```
 
 - **Starts paused.** Nothing is sent (no RTP, no speaking indicator) until the first accepted write;
   the track resumes within one 20 ms tick. After `idle_ms` (250) without audio the stream goes idle,
   emits `PlaybackIdle`, and auto-pauses again.
-- **Formats.** `write*` take data in the stream's format. `str` is base64. Typed buffers must match
-  the encoding (`'h'` arrays for pcm16le, `'f'` for f32le, or raw bytes): writing a float32 numpy
-  array to a pcm16le stream raises `InvalidAudio` instead of playing noise.
+- **Formats.** The default format is `PCM16_48K_STEREO` (Discord's native format; no conversion).
+  `write*` take raw audio in the stream's format: `bytes`, `bytearray`, `memoryview`, an
+  `AudioChunk`, or any C-contiguous buffer. Typed buffers must match the encoding (`'h'` arrays for
+  pcm16le, `'f'` for f32le, or raw bytes): writing a float32 numpy array to a pcm16le stream raises
+  `InvalidAudio` instead of playing noise. A `str` raises `TypeError`; decode text-encoded audio
+  first (see [Streaming to external services](index.md#streaming-to-external-services)).
 - **Backpressure.** The buffer holds `max_buffer_ms` (60 s). `write_nowait` raises
   `PlaybackFull(needed_ms, free_ms)` with nothing consumed; `await write()` waits for space.
-  In a task that reads a provider socket, always use the `*_nowait` variants.
+  In a task that reads a network connection, always use `write_nowait`.
 - **Underrun** plays silence; positions keep counting.
 
-### Provider timestamps: gap filling
+### Source timestamps: gap filling
 
-Pass the provider's timestamp of each delta (GPT-Live `start_ms`) as `at_ms`. The first timed write
-anchors the provider timeline to the wall clock; a later delta that starts after a gap gets that
-much silence inserted (up to `max_gap_ms`, default `min(2000, max_buffer_ms // 2)`), so the model's
-own pauses are preserved. Late or overlapping deltas are appended immediately — speech is never
-trimmed — and a gap longer than `max_gap_ms` is treated as a discontinuity. The anchor is wall-clock
-based, so a track that was idle-paused does not accumulate stale silence.
+If the audio comes with a source timeline (each piece of audio says at which millisecond of the
+source it starts), pass that timestamp as `at_ms`. The first timed write anchors the source
+timeline to the wall clock; a later write that starts after a gap gets that much silence inserted
+(up to `max_gap_ms`, default `min(2000, max_buffer_ms // 2)`), so pauses in the source are
+preserved. Late or overlapping writes are appended immediately — audio is never trimmed — and a gap
+longer than `max_gap_ms` is treated as a discontinuity. The anchor is wall-clock based, so a track
+that was idle-paused does not accumulate stale silence.
 
-### Barge-in: `clear()`
+### Interruption: `clear()`
 
 ```python
 result = speaker.clear()                 # discard everything queued, now; any thread
-for item in result.items:                # open items and items heard in the last output_latency_ms
-    truncate(item.tag, item.heard_ms)    # ≤ written_ms by construction
+for item in result.items:                # open segments and segments heard in the last output_latency_ms
+    report_heard(item.tag, item.heard_ms)  # ≤ written_ms by construction
 ```
 
 - Capacity is released immediately; the cut is audible at the next pull (≤ 40 ms plus network).
-- **`reject_late=True`** (default) drops later writes for every open or interrupted tag: late
-  deltas of a cancelled OpenAI Realtime item never play.
-- **`reject_until_gap_ms=N`** (timed providers without item ids, e.g. GPT-Live): later *timed*
-  writes contiguous with the cleared audio are dropped until one starts at least `N` ms after it.
-- **`hold_ms`** drops *all* writes for a while — a fallback for untimed writes only.
+- **`reject_late=True`** (default) drops later writes for every open or interrupted tag: audio of
+  a cut-off segment that is still arriving never plays.
+- **`reject_until_gap_ms=N`** (timed writes without tags): later *timed* writes contiguous with
+  the cleared audio are dropped until one starts at least `N` ms after it.
+- **`hold_ms`** drops *all* writes for a while — a fallback for untimed, untagged writes only.
 
-Items (`tag=`) are open from their first write until `end_item(tag)` (call it on the provider's
-"audio done" event), `clear()`, or the end of the turn (idle). `item(tag)` returns an
-`ItemProgress(tag, written_ms, played_ms, heard_ms, complete)`; `complete` becomes true once
-`end_item` was called and everything written has played.
+### Tagged segments
+
+A tag (`tag=`, at most 128 bytes) is an application-defined segment id: a sentence, a message, a
+reply — whatever unit you need positions for. A tag is open from its first write until
+`end_item(tag)` (call it once the segment is fully written), `clear()`, or the next idle period.
+`item(tag)` returns an `ItemProgress(tag, written_ms, played_ms, heard_ms, complete)`; `complete`
+becomes true once `end_item` was called and everything written has played.
 
 ### Positions
 
@@ -78,9 +87,11 @@ Items (`tag=`) are open from their first write until `end_item(tag)` (call it on
 
 ### Other controls
 
-- `prebuffer_ms`: hold the start of each turn until this much is buffered (or the same time has
-  passed), smoothing bursty providers. `drain()`, `end_item()` and `aclose(drain=True)` release it.
-- `await wait_idle()`: the end of the current AI turn (GPT-Live has no output-done event).
+- `prebuffer_ms`: after an idle period or `clear()`, hold playback until this much is buffered (or
+  the same time has passed), smoothing bursty sources. `drain()`, `end_item()` and
+  `aclose(drain=True)` release it.
+- `await wait_idle()`: wait until playback goes idle (everything played and nothing new for
+  `idle_ms`), for sources without an explicit end-of-segment signal.
 - `pause()`/`resume()`, `volume` (0.0–4.0, 5 ms ramp), `close()`, `await aclose(drain=True)`.
 - `when_disconnected="discard"` drops buffered audio while the voice link is down instead of
   playing it after reconnect.
@@ -155,4 +166,4 @@ packets, so an idle stream sends no RTP.
 (`LimitExceeded`).
 
 Note that an open live source keeps songbird's mixer live even while auto-paused: open a playback
-per AI session, not per bot.
+for as long as audio is expected (a session, a conversation), not for the bot's whole lifetime.

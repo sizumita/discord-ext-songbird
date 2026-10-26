@@ -215,13 +215,14 @@ class AudioStream(AsyncIterator[AudioChunk]):
         return self._sub.read_nowait()
 
     def skip_to_live(self, *, reset_clock: bool = True) -> int:
-        """Drop everything queued (e.g. after an AI handshake) and return the milliseconds dropped.
+        """Drop everything queued (e.g. after connecting to a downstream consumer) and return the
+        milliseconds dropped.
 
         Parameters
         ----------
         reset_clock : bool, default True
-            The next chunk has ``start_ms == 0`` and ``seq == 0``, aligned with a provider session
-            that starts at the first appended audio.
+            The next chunk has ``start_ms == 0`` and ``seq == 0``, so the stream clock starts at the
+            first audio the consumer receives.
         """
         return self._sub.skip_to_live(reset_clock)
 

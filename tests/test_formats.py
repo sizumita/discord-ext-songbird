@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import base64
+import inspect
 from typing import Any
 
 import pytest
 from discord.ext import songbird
-from discord.ext.songbird import AudioFormat, InvalidAudio, LimitExceeded
+from discord.ext.songbird import AudioFormat, InvalidAudio, LimitExceeded, SongbirdClient
 from discord.ext.songbird.formats import as_format
 
 PRESETS = {
@@ -32,11 +32,17 @@ def test_presets(name: str, spec: tuple[int, int, Any]) -> None:
     assert AudioFormat.parse(fmt.mime_type) == fmt
 
 
-def test_provider_presets() -> None:
-    assert songbird.GPT_LIVE == songbird.PCM16_24K
-    assert songbird.OPENAI_REALTIME == songbird.PCM16_24K
-    assert songbird.GEMINI_LIVE_INPUT == songbird.PCM16_16K
-    assert songbird.GEMINI_LIVE_OUTPUT == songbird.PCM16_24K
+def test_only_neutral_presets_are_exported() -> None:
+    exported = {name for name in songbird.__all__ if isinstance(getattr(songbird, name), AudioFormat)}
+    assert exported == set(PRESETS)
+    assert set(songbird.formats.__all__) >= set(PRESETS)
+
+
+@pytest.mark.parametrize("method", ["listen", "listen_user", "listen_mixed", "listen_users", "open_playback"])
+def test_default_format_is_discord_native(method: str) -> None:
+    default = inspect.signature(getattr(SongbirdClient, method)).parameters["format"].default
+    assert default == songbird.PCM16_48K_STEREO
+    assert (default.sample_rate, default.channels, default.encoding) == (48_000, 2, "pcm16le")
 
 
 @pytest.mark.parametrize(
@@ -126,13 +132,13 @@ def test_silence_limits(ms: int) -> None:
 
 @pytest.mark.parametrize("fmt", [songbird.PCM16_24K, songbird.MULAW_8K, songbird.ALAW_8K, songbird.F32_48K_STEREO])
 @pytest.mark.parametrize("ms", [0, 1, 7, 40])
-def test_silence_base64(fmt: AudioFormat, ms: int) -> None:
-    assert fmt.silence_base64(ms) == base64.b64encode(fmt.silence(ms)).decode()
+def test_silence_length(fmt: AudioFormat, ms: int) -> None:
+    assert len(fmt.silence(ms)) == fmt.bytes_for(ms)
 
 
-def test_silence_base64_limit() -> None:
+def test_silence_stereo_limit() -> None:
     with pytest.raises(LimitExceeded):
-        songbird.F32_48K_STEREO.silence_base64(10**10)
+        songbird.F32_48K_STEREO.silence(10**10)
 
 
 def test_mime_type() -> None:
@@ -140,17 +146,9 @@ def test_mime_type() -> None:
     assert songbird.MULAW_8K.mime_type == "audio/pcmu"
     assert songbird.ALAW_8K.mime_type == "audio/pcma"
     assert songbird.F32_48K.mime_type == "audio/x-f32le;rate=48000"
-    assert songbird.GEMINI_LIVE_INPUT.mime_type == "audio/pcm;rate=16000"
-
-
-def test_openai_format() -> None:
-    assert songbird.GPT_LIVE.openai_format == {"type": "audio/pcm", "rate": 24_000}
-    assert songbird.PCM16_16K.openai_format == {"type": "audio/pcm", "rate": 16_000}
-    assert songbird.MULAW_8K.openai_format == {"type": "audio/pcmu"}
-    assert songbird.ALAW_8K.openai_format == {"type": "audio/pcma"}
-    for fmt in (songbird.F32_48K, songbird.PCM16_48K, songbird.PCM16_48K_STEREO):
-        with pytest.raises(InvalidAudio):
-            _ = fmt.openai_format
+    assert songbird.PCM16_16K.mime_type == "audio/pcm;rate=16000"
+    assert songbird.PCM16_48K_STEREO.mime_type == "audio/pcm;rate=48000;channels=2"
+    assert AudioFormat.parse("audio/pcm;rate=48000;channels=2") == songbird.PCM16_48K_STEREO
 
 
 def test_eq_hash_immutable() -> None:
@@ -158,7 +156,7 @@ def test_eq_hash_immutable() -> None:
     assert a == songbird.PCM16_24K
     assert hash(a) == hash(songbird.PCM16_24K)
     assert a != songbird.PCM16_16K
-    assert {a: 1}[songbird.GPT_LIVE] == 1
+    assert {a: 1}[songbird.PCM16_24K] == 1
     with pytest.raises(AttributeError):
         a.sample_rate = 8_000  # type: ignore
     assert "24000" in repr(a)

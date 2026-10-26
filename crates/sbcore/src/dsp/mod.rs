@@ -1,9 +1,8 @@
-//! DSP building blocks: tick/stream resampling, limiting, G.711, mixing, levels, base64.
+//! DSP building blocks: tick/stream resampling, limiting, G.711, mixing, levels.
 //!
 //! Everything used on the mixer thread (`TickResampler::process_tick`, `mix::*`, g711 tables) is
 //! allocation-free and never logs.
 
-pub mod b64;
 pub mod g711;
 pub mod level;
 pub mod limiter;

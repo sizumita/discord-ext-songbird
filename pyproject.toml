@@ -15,7 +15,7 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio",
     "Typing :: Typed",
 ]
-keywords = ["discord", "discord.py", "voice", "songbird", "realtime", "ai"]
+keywords = ["discord", "discord.py", "voice", "audio", "songbird", "realtime", "streaming"]
 readme = "README.md"
 dynamic = ["version", "description", "authors", "license"]
 

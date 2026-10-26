@@ -7,9 +7,9 @@ Quick start
 -----------
 >>> from discord.ext import songbird
 >>> vc = await songbird.connect(member.voice.channel, config=songbird.VoiceConfig.low_latency())  # doctest: +SKIP
->>> async with vc.listen_mixed(songbird.GPT_LIVE) as mic, vc.open_playback(songbird.GPT_LIVE) as out:  # doctest: +SKIP
+>>> async with vc.listen_mixed() as mic, vc.open_playback() as out:  # 48 kHz stereo PCM16  # doctest: +SKIP
 ...     async for chunk in mic:
-...         out.write_nowait(bytes(chunk))
+...         out.write_nowait(chunk)
 """
 
 from __future__ import annotations
@@ -43,11 +43,7 @@ from .formats import (
     ALAW_8K,
     F32_48K,
     F32_48K_STEREO,
-    GEMINI_LIVE_INPUT,
-    GEMINI_LIVE_OUTPUT,
-    GPT_LIVE,
     MULAW_8K,
-    OPENAI_REALTIME,
     PCM16_8K,
     PCM16_16K,
     PCM16_24K,
@@ -117,10 +113,6 @@ __all__ = [
     "F32_48K_STEREO",
     "MULAW_8K",
     "ALAW_8K",
-    "GPT_LIVE",
-    "OPENAI_REALTIME",
-    "GEMINI_LIVE_INPUT",
-    "GEMINI_LIVE_OUTPUT",
     "AudioChunk",
     "AudioStream",
     "UserStreams",

@@ -1,6 +1,8 @@
 # Repository Guidelines
 
-This repository hosts a hybrid Rust/Python voice backend for `discord.py`, built with PyO3 and `maturin`.
+This repository hosts a hybrid Rust/Python, general-purpose voice backend for `discord.py` (audio in and
+out of voice channels), built with PyO3 and `maturin`. It stays provider-neutral: no service-specific
+APIs, presets, defaults, examples or tests.
 The design contract is `docs/design.md`; deviations are recorded in `docs/deviations/*.md`.
 
 ## Project Structure & Module Organization
@@ -17,8 +19,7 @@ The design contract is `docs/design.md`; deviations are recorded in `docs/deviat
   `just stubs`/`just dev`); do not edit manually.
 - `tests/`: pytest suite (`tests/conftest.py`, `tests/fakes/native_fake.py` — a pure-Python fake of
   the native module).
-- `examples/`: runnable bots (`gpt_live.py`, `openai_realtime.py`, `gemini_live.py`, `record.py`,
-  `music.py`).
+- `examples/`: runnable bots (`echo.py`, `websocket_bridge.py`, `record.py`, `music.py`).
 - `scripts/`: `check_invariants.py` (structural invariants), `smoke.py` (release smoke test).
 - Build metadata: `Cargo.toml` (workspace), `crates/sbcore/Cargo.toml`, `pyproject.toml`, `build.rs`,
   `justfile`. Build outputs go to `target/` and should not be committed.
@@ -34,8 +35,8 @@ The design contract is `docs/design.md`; deviations are recorded in `docs/deviat
 - `just check`: rustfmt check, `cargo clippy` (all features and `codec-minimal`, `-D warnings`),
   `scripts/check_invariants.py`, `ruff check`, `ruff format --diff`, `ty check`.
 - `just stub-drift`: regenerate stubs from scratch and fail on any change or untracked file.
-- `python examples/record.py`: run a sample bot after setting `DISCORD_BOT_TOKEN` (the AI bridges also
-  need the provider key, e.g. `OPENAI_API_KEY`; quick starts read `CHANNEL_ID`).
+- `python examples/record.py`: run a sample bot after setting `DISCORD_BOT_TOKEN` (the WebSocket bridge
+  also needs `BRIDGE_URL`; quick starts read `CHANNEL_ID`).
 
 ## Coding Style & Naming Conventions
 - Rust: `rustfmt` defaults via `cargo fmt`; `clippy` with `-D warnings`. sbcore denies `unwrap`, `expect`,
@@ -69,6 +70,6 @@ Git history shows short, descriptive subjects and often an emoji prefix followed
 
 ## Security & Configuration Tips
 Keep tokens out of code and use environment variables (e.g., `DISCORD_BOT_TOKEN`, `CHANNEL_ID`,
-`OPENAI_API_KEY`, `GEMINI_API_KEY`). Do not commit built artifacts like
+`BRIDGE_URL`). Do not commit built artifacts like
 `discord_ext_songbird_native*.so` / `native.*.so` or anything in `target/`. Release wheels never
 enable `test-hooks`.

@@ -16,7 +16,7 @@ from conftest import HarnessClient, pump_settle, tone
 from discord.ext import songbird
 from discord.ext.songbird import InvalidAudio, LimitExceeded, PlaybackFull, PlaybackStream, StreamClosed, VoiceEvent
 
-FMT = songbird.GPT_LIVE  # PCM16LE 24 kHz mono: 48 bytes per ms
+FMT = songbird.PCM16_24K  # PCM16LE 24 kHz mono: 48 bytes per ms
 
 
 def pcm(ms: int) -> bytes:
@@ -62,6 +62,20 @@ async def test_unwritten_playback_is_paused_and_first_write_resumes(connected_vc
     pb.close()
 
 
+async def test_default_format_is_discord_native(connected_vc: HarnessClient, testing: Any) -> None:
+    vc = connected_vc
+    pb = vc.open_playback()
+    assert pb.format == songbird.PCM16_48K_STEREO
+    mh = mixer(testing, pb)
+    assert mh.channels == 2
+    pb.write_nowait(tone(40, rate=48_000, channels=2))
+    assert pb.written_ms == 40
+    out = mh.pull(1)
+    assert any(floats(out))
+    assert pb.played_ms == 20
+    pb.close()
+
+
 async def test_write_variants_and_partial_frames(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
     pb = vc.open_playback(FMT)
@@ -70,16 +84,16 @@ async def test_write_variants_and_partial_frames(connected_vc: HarnessClient, te
     pb.write_nowait(data[3:5])
     pb.write_nowait(data[5:])
     assert pb.written_ms == 20
-    b64 = __import__("base64").b64encode(pcm(20)).decode()
-    pb.write_base64_nowait(b64)
-    pb.write_nowait(b64)  # str is base64 too
-    pb.write_base64_nowait(b64.encode())
+    pb.write_nowait(bytearray(pcm(20)))
+    pb.write_nowait(memoryview(pcm(20)))
     await pb.write(pcm(20))
-    await pb.write_base64(b64)
-    assert pb.written_ms == 120
-    with pytest.raises(InvalidAudio):
-        pb.write_base64_nowait("@@not base64@@")
-    assert pb.written_ms == 120  # nothing consumed
+    assert pb.written_ms == 80
+    for text in ("AAAAAAAA", pcm(20).decode("latin-1")):
+        with pytest.raises(TypeError):
+            pb.write_nowait(text)
+        with pytest.raises(TypeError):
+            await pb.write(text)
+    assert pb.written_ms == 80  # nothing consumed
     pb.close()
 
 
@@ -474,7 +488,7 @@ class _StubbornSink:
         if self.calls <= self.rejections:
             raise PlaybackFull(20, 20)
 
-    write = send = write_base64 = _attempt
+    write = send = _attempt
 
     def arm_space(self, *_args: Any) -> bool:
         return True

@@ -151,10 +151,6 @@ class AudioChunk:
         r"""
         One copy of the payload.
         """
-    def to_base64(self) -> builtins.str:
-        r"""
-        Base64 of the payload, encoded in Rust.
-        """
     def __arrow_c_array__(self, requested_schema: object | None = None) -> tuple[object, object]:
         r"""
         ``[arrow]`` Zero-copy Arrow export (``Int16Array`` / ``Float32Array`` / ``UInt8Array``).
@@ -278,22 +274,6 @@ class AudioFormat:
         MIME type: ``'audio/pcm;rate=24000'``, ``'audio/pcmu'``, ``'audio/pcma'`` or
         ``'audio/x-f32le;rate=48000'`` (stereo formats append ``';channels=2'``).
         """
-    @property
-    def openai_format(self) -> dict[str, object]:
-        r"""
-        OpenAI session format object.
-        
-        Returns
-        -------
-        dict[str, object]
-            ``{'type': 'audio/pcm', 'rate': R}`` (mono PCM16 at 16/24 kHz), ``{'type': 'audio/pcmu'}``
-            or ``{'type': 'audio/pcma'}``.
-        
-        Raises
-        ------
-        InvalidAudio
-            For any other format.
-        """
     def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
     def __hash__(self) -> builtins.int: ...
     def __new__(cls, sample_rate: builtins.int = 24000, channels: builtins.int = 1, encoding: typing.Literal['pcm16le', 'f32le', 'mulaw', 'alaw'] = "pcm16le") -> AudioFormat: ...
@@ -306,8 +286,8 @@ class AudioFormat:
         ----------
         spec : str
             ``'pcm16_24k'``, ``'pcm16_48k_stereo'``, ``'f32_48k'``, ``'mulaw'``, ``'alaw'``,
-            ``'pcm16le/24000/1'``, a preset name such as ``'GPT_LIVE'``, or a MIME type as returned
-            by :attr:`mime_type`.
+            ``'pcm16le/24000/1'``, a preset name such as ``'PCM16_48K_STEREO'``, or a MIME type as
+            returned by :attr:`mime_type`.
         
         Returns
         -------
@@ -367,20 +347,6 @@ class AudioFormat:
             If ``ms`` is out of range.
         MemoryError
             If the allocation fails.
-        """
-    def silence_base64(self, ms: builtins.int) -> builtins.str:
-        r"""
-        Base64 of :meth:`silence`, encoded in Rust. Same limit.
-        
-        Parameters
-        ----------
-        ms : int
-            ``0 <= ms <= 600_000``.
-        
-        Returns
-        -------
-        str
-            Standard padded base64.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -806,7 +772,7 @@ class EventSubscription:
 @typing.final
 class ItemProgress:
     r"""
-    Progress of one provider item (§7.7).
+    Playback progress of one tagged segment (§7.7).
     """
     @property
     def tag(self) -> builtins.str: ...
@@ -988,22 +954,30 @@ class Playback:
     def playback_id(self) -> builtins.int: ...
     @property
     def track(self) -> NativeTrack: ...
-    def write(self, data: collections.abc.Buffer | str, tag: typing.Optional[builtins.str] = None, at_ms: typing.Optional[builtins.int] = None) -> None:
+    def write(self, data: collections.abc.Buffer, tag: typing.Optional[builtins.str] = None, at_ms: typing.Optional[builtins.int] = None) -> None:
         r"""
-        Appends audio in the stream format (any size; partial frames are carried; ``str`` = base64).
+        Appends raw audio in the stream format (any size; partial frames are carried).
+        
+        Parameters
+        ----------
+        data : collections.abc.Buffer
+            ``bytes`` or any C-contiguous buffer whose format matches the stream encoding.
+        tag : str or None, default None
+            Application-defined segment tag (at most 128 bytes) used by ``item()`` / ``end_item()``.
+        at_ms : int or None, default None
+            Source-timeline timestamp in ms; a gap since the previous timed write is filled with
+            silence (up to ``max_gap_ms``).
         
         Raises
         ------
+        TypeError
+            ``data`` is a ``str`` or not a buffer.
         PlaybackFull
             Not enough space (nothing consumed).
         InvalidAudio
-            A typed buffer whose format does not match the encoding, invalid base64, a bad tag.
+            A typed buffer whose format does not match the encoding, or a bad tag.
         StreamClosed
             The playback or connection is closed.
-        """
-    def write_base64(self, data: str | bytes, tag: typing.Optional[builtins.str] = None, at_ms: typing.Optional[builtins.int] = None) -> None:
-        r"""
-        Appends base64-encoded audio (decoded in Rust).
         """
     def arm_space(self, nbytes: builtins.int) -> builtins.bool:
         r"""
@@ -1023,7 +997,7 @@ class Playback:
         """
     def clear(self, *, reject_late: builtins.bool = True, hold_ms: builtins.int = 0, reject_until_gap_ms: typing.Optional[builtins.int] = None) -> ClearResult:
         r"""
-        Barge-in: discards all queued audio now (any thread).
+        Interruption: discards all queued audio now (any thread).
         
         Parameters
         ----------
@@ -1036,7 +1010,8 @@ class Playback:
         """
     def end_item(self, tag: builtins.str) -> None:
         r"""
-        The provider finished this item: closes the tag and releases the prebuffer gate.
+        The application finished writing this tagged segment: closes the tag and releases the
+        prebuffer gate.
         """
     def item(self, tag: builtins.str) -> typing.Optional[ItemProgress]:
         r"""

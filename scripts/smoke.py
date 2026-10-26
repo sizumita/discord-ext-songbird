@@ -41,7 +41,8 @@ def check_gil() -> None:
 
 def main() -> None:
     f = sb.AudioFormat.parse("pcm16_24k")
-    assert f.bytes_per_ms == 48 and sb.GPT_LIVE == f
+    assert f.bytes_per_ms == 48 and sb.PCM16_24K == f
+    assert sb.AudioFormat.parse("pcm16_48k_stereo") == sb.PCM16_48K_STEREO
     assert sb.__version__ == sb.native.VERSION
     sb.RawPcm(bytes(960), sb.PCM16_24K)
     sb.OpusPackets([b"\xf8\xff\xfe"])

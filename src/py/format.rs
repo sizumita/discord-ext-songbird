@@ -1,9 +1,8 @@
 //! `native.AudioFormat` (§9.2): the native part of the Python `AudioFormat`.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyType};
+use pyo3::types::{PyBytes, PyType};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
-use sbcore::dsp::b64;
 use sbcore::limits::{SILENCE_MS, check};
 use sbcore::{CoreError, Encoding, Format};
 
@@ -90,8 +89,8 @@ impl PyAudioFormat {
     /// ----------
     /// spec : str
     ///     ``'pcm16_24k'``, ``'pcm16_48k_stereo'``, ``'f32_48k'``, ``'mulaw'``, ``'alaw'``,
-    ///     ``'pcm16le/24000/1'``, a preset name such as ``'GPT_LIVE'``, or a MIME type as returned
-    ///     by :attr:`mime_type`.
+    ///     ``'pcm16le/24000/1'``, a preset name such as ``'PCM16_48K_STEREO'``, or a MIME type as
+    ///     returned by :attr:`mime_type`.
     ///
     /// Returns
     /// -------
@@ -150,35 +149,6 @@ impl PyAudioFormat {
     #[getter]
     fn mime_type(&self) -> String {
         self.fmt.mime_type().into_owned()
-    }
-
-    /// OpenAI session format object.
-    ///
-    /// Returns
-    /// -------
-    /// dict[str, object]
-    ///     ``{'type': 'audio/pcm', 'rate': R}`` (mono PCM16 at 16/24 kHz), ``{'type': 'audio/pcmu'}``
-    ///     or ``{'type': 'audio/pcma'}``.
-    ///
-    /// Raises
-    /// ------
-    /// InvalidAudio
-    ///     For any other format.
-    #[getter]
-    #[gen_stub(override_return_type(type_repr = "dict[str, object]"))]
-    fn openai_format<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let (ty, rate) = self.fmt.openai_format().ok_or_else(|| {
-            invalid(
-                py,
-                "OpenAI formats are mono pcm16le at 16000/24000 Hz, mulaw or alaw",
-            )
-        })?;
-        let d = PyDict::new(py);
-        d.set_item("type", ty)?;
-        if let Some(r) = rate {
-            d.set_item("rate", r)?;
-        }
-        Ok(d)
     }
 
     /// Exact byte length of ``ms`` milliseconds.
@@ -241,22 +211,6 @@ impl PyAudioFormat {
         })
     }
 
-    /// Base64 of :meth:`silence`, encoded in Rust. Same limit.
-    ///
-    /// Parameters
-    /// ----------
-    /// ms : int
-    ///     ``0 <= ms <= 600_000``.
-    ///
-    /// Returns
-    /// -------
-    /// str
-    ///     Standard padded base64.
-    fn silence_base64(&self, py: Python<'_>, ms: i64) -> PyResult<String> {
-        let n = silence_len(self.fmt, ms).py(py)?;
-        silence_base64(self.fmt.silence_byte(), n).py(py)
-    }
-
     fn __repr__(&self) -> String {
         format!(
             "AudioFormat(sample_rate={}, channels={}, encoding='{}')",
@@ -280,35 +234,9 @@ fn silence_len(fmt: Format, ms: i64) -> Result<usize, CoreError> {
     usize::try_from(n).map_err(|_| CoreError::Alloc)
 }
 
-/// Base64 of `n` copies of `byte` without materialising the raw bytes: every 3 identical input bytes
-/// encode to the same 4 characters.
-fn silence_base64(byte: u8, n: usize) -> Result<String, CoreError> {
-    let len = b64::encoded_len(n).ok_or(CoreError::Alloc)?;
-    let mut out = String::new();
-    out.try_reserve_exact(len)?;
-    let mut group = String::new();
-    b64::encode_into(&[byte; 3], &mut group);
-    for _ in 0..n / 3 {
-        out.push_str(&group);
-    }
-    b64::encode_into(&[byte, byte][..n % 3], &mut out);
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn silence_base64_matches_direct_encoding() {
-        for byte in [0x00u8, 0xFF, 0xD5] {
-            for n in 0..40usize {
-                let mut direct = String::new();
-                b64::encode_into(&vec![byte; n], &mut direct);
-                assert_eq!(silence_base64(byte, n).unwrap(), direct, "{byte:#x} {n}");
-            }
-        }
-    }
 
     #[test]
     fn silence_len_limits() {

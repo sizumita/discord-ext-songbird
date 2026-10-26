@@ -163,8 +163,8 @@ class ReceiveDisabled(SongbirdError):
 
 
 class InvalidAudio(SongbirdError, ValueError):
-    """Invalid audio data or format: bad format combination, invalid base64, a buffer whose format
-    code does not match the stream encoding, a wrong Opus frame size, a bad tag, …"""
+    """Invalid audio data or format: bad format combination, a buffer whose format code does not
+    match the stream encoding, a wrong Opus frame size, a bad tag, …"""
 
 
 class LimitExceeded(SongbirdError, ValueError):

@@ -4,7 +4,7 @@
 |---|---|
 | Status | **Accepted.** This document is the implementation contract for branch `redesign/core`. |
 | Supersedes | The 0.5.0 architecture (`SongbirdImpl`, sinks, `Track` builder). |
-| Basis | Design A ("lifecycle-first"). Python pulls data and Rust holds no Python objects. Grafts from B (pyo3-free core crate, realtime-AI ergonomics), C (wall-clock gap filling, separate receive runtime, connect atomicity, `reconnect()`) and D (`OwnedDriver`, drop-fired completion, `TrackControl`). Every blocking review finding on the candidate designs is resolved, and so is every second-round finding on this document; see §15.3, §15.4 and the "Decision" notes. |
+| Basis | Design A ("lifecycle-first"). Python pulls data and Rust holds no Python objects. Grafts from B (pyo3-free core crate, streaming ergonomics), C (wall-clock gap filling, separate receive runtime, connect atomicity, `reconnect()`) and D (`OwnedDriver`, drop-fired completion, `TrackControl`). Every blocking review finding on the candidate designs is resolved, and so is every second-round finding on this document; see §15.3, §15.4 and the "Decision" notes. |
 | Verified against | songbird 0.6.1 (incl. `driver/scheduler/{idle,live,task}.rs`, `driver/tasks/{mod,disposal,events}.rs`, `mixer/mod.rs`, `udp_rx/playout_buffer.rs`, `id.rs`, `input/{audiostream,live_input}.rs`), symphonia-core 0.5.5 (`probe.rs`, `formats.rs`, `io/media_source_stream.rs`), smallvec 1.16.4, rubato 0.16.2, pyo3 0.29.3, pyo3-arrow 0.19.0, arrow-buffer 59.3.1, tokio 1.54.1 (sources in `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`) and discord.py `abc.py` / `state.py` / `voice_client.py` / `guild.py` at 2.7.0a5363 (the git-main build cached by uv, which precedes the 2.7.1 PyPI release; re-check in phase 0, §12.7). |
 
 Notation:
@@ -14,6 +14,18 @@ Notation:
 - **W*n*** refers to an implementation workstream in §12.
 - **"mixer thread"** means songbird's shared live-mixer `std::thread`, which serves up to 16 calls.
 - **"tick"** means 20 ms.
+
+**Decision (2026-10-27): general-purpose and provider-neutral.** Per user direction, the library is a
+general-purpose Discord voice I/O library. The goal was only that it be *easy to connect* to realtime
+speech services, not that it be built for them. Compatibility with such services therefore comes from
+generic capabilities alone: format conversion, chunked async receive streams, and low-latency playback
+with `clear()`, tags and positions. There are no provider-specific APIs, format presets, defaults,
+helpers, examples or tests. Concretely, this revision removed the provider format presets and the
+provider session-format helper, removed every base64 helper (users encode audio themselves when a
+protocol needs text; `AudioChunk` supports the buffer protocol), made Discord's native format
+(`PCM16_48K_STEREO`, 48 kHz stereo PCM16LE) the default of every receive stream and of
+`open_playback`, and replaced the provider bridge examples with a generic echo bot and a generic raw-PCM
+WebSocket bridge (§9.11–§9.13). Earlier text in `docs/deviations/` is kept as history.
 
 ---
 
@@ -27,8 +39,8 @@ Notation:
 | G2 | **No Rust-created thread ever attaches to the interpreter.** That covers tokio workers, songbird mixer/UDP/WS/events threads, the disposal thread and decode threads. Only threads that Python created call into Rust while attached. Rust signals Python with a 1-byte doorbell on a socket. Log records are pulled by a Python daemon thread. | `check_invariants.py` forbids `Python::attach`, `try_attach`, `with_gil`. sbcore cannot call pyo3 at all. |
 | G3 | **Provably bounded memory.** Every queue has a validated, capped, lazily grown bound. Each connection has a receive budget. No user number directly sizes an allocation. | §10. Bounds tests run in a subprocess and assert the exit code is never 134. A one-hour soak runs without a consumer. |
 | G4 | **No blocking where it hurts.** The asyncio loop never waits on a lock that is held across I/O or Python. The mixer thread uses atomics and `try_lock` only: no allocation on the PCM path, no syscalls, no `Notify`, no flume/`TrackHandle` sends, no logging. | Lock inventory (§5.3). CI greps. A counting-allocator test on the mixer pull path. Debug `Role` assertions. |
-| G5 | **Realtime voice-AI I/O.** **Receive:** continuous, silence-filled, real-time-paced per-user and mixed streams. Formats: 8/16/24/48 kHz, mono or stereo, PCM16LE / f32LE / µ-law / A-law. Chunks of 10–1000 ms. Timestamps, speaking events and drop accounting. **Send:** writes of any size (including odd byte counts and base64), bounded buffering with backpressure, underrun plays as silence, `clear()` takes effect within ≤ 40 ms, per-item played/heard positions for truncation, wall-clock gap filling from provider `start_ms`, an idle signal at turn end. | Rust pipeline unit tests. pytest through test hooks, with no Discord connection. |
-| G6 | **Shortest obvious bridge.** GPT-Live / OpenAI Realtime / Gemini Live take about 20 lines of user code. Format presets (`GPT_LIVE`, …), `AudioFormat.openai_format`, base64 encoded and decoded in Rust, async iterators, no callbacks. | `examples/gpt_live.py` (§9.11) and `examples/openai_realtime.py` (§9.13) are executed in CI against a local fake WebSocket server (their bridge functions take `url=` and `api_key=`). `examples/gemini_live.py` is written on raw `websockets` with a configurable `url=` (no SDK dependency), and is imported and type-checked. Every example is imported in CI (§13.3). |
+| G5 | **Generic realtime audio streaming.** **Receive:** continuous, silence-filled, real-time-paced per-user, mixed and per-user-router streams with rate, channel and encoding conversion. Formats: 8/16/24/48 kHz, mono or stereo, PCM16LE / f32LE / µ-law / A-law; the default is Discord's native 48 kHz stereo PCM16LE (no conversion). Chunks of 10–1000 ms. Timestamps, speaking events and drop accounting. **Send:** raw writes of any size (including odd byte counts), bounded buffering with backpressure, underrun plays as silence, `clear()` takes effect within ≤ 40 ms, per-tag (application-defined segment) played/heard positions, wall-clock gap filling from source-timeline timestamps (`at_ms`), an idle signal, optional prebuffering. | Rust pipeline unit tests. pytest through test hooks, with no Discord connection. |
+| G6 | **Easy to connect to external audio services, without service-specific code.** Bridging Discord voice to a realtime speech service, a recogniser or any other audio system takes a few lines of user code built only from generic pieces: choose the format and `chunk_ms` the service expects, forward `bytes(chunk)` (or the buffer itself), write returned audio with `write_nowait`, call `clear()` on interruption, and use tags + `item()` to learn how much was played. Async iterators, no callbacks. The library ships no provider presets, protocol helpers or text encodings. | `examples/websocket_bridge.py` (§9.12, a generic raw-PCM WebSocket bridge) runs in CI against a local fake binary echo WebSocket server (its bridge function takes `url`), and `examples/echo.py` (§9.11) runs against a detached connection. Every example is imported in CI (§13.3). |
 | G7 | Identical behaviour on CPython 3.14 and 3.14t (`gil_used = false`). | CI matrix. `sys._is_gil_enabled()` stays `False` after import. |
 | G8 | **Correct discord.py 2.7 `VoiceProtocol` behaviour.** One op 4 per intent, carrying the right flags. Connect failure of any kind, including cancellation, leaves nothing registered. A timeout raises a `TimeoutError` subclass. `move_to` awaits completion. | Fake-gateway tests (§13.3). |
 | G9 | Everything except the UDP/WS transport is testable without Discord. | The `test-hooks` cargo feature and pyo3-free `cargo test -p sbcore`. |
@@ -37,12 +49,12 @@ Notation:
 ### 1.2 Non-goals
 
 - Video, Go Live, Stage moderation, DM/group calls. Only guild voice is supported.
-- Shipping AI provider clients. Bridges live in `examples/`, because provider protocols change monthly.
+- Shipping clients, presets or helpers for particular external services (speech recognisers, realtime speech services, …). Protocol adapters belong in user code; `examples/websocket_bridge.py` shows a generic one.
 - A drop-in `discord.VoiceClient`. There is no `play(discord.AudioSource, after=)`, and no `latency` property (songbird exposes no heartbeat RTT).
 - Thread-blocking receive APIs. Receive is asyncio-based. `read_nowait()` lets any thread poll.
 - Compensating for network and listener jitter. `played_ms` means "handed to the Discord encoder". `heard_ms` is an estimate based on `output_latency_ms`.
 - Echo cancellation, ML VAD, diarization. Speaking state comes from packet activity plus a hangover, with an optional RMS threshold.
-- Stream sample rates other than 8/16/24/48 kHz. Files at any rate still play through songbird's decoder, and in-memory PCM at any rate from 8 to 192 kHz is accepted by `RawPcm.from_samples`, which resamples it once at construction (§7.9). 12 kHz is dropped for streams because no target service uses it.
+- Stream sample rates other than 8/16/24/48 kHz. Files at any rate still play through songbird's decoder, and in-memory PCM at any rate from 8 to 192 kHz is accepted by `RawPcm.from_samples`, which resamples it once at construction (§7.9). 12 kHz is dropped for streams because it is rarely used.
 - `os.fork()` after import. The child gets a disabled library (`os.register_at_fork`).
 - songbird's `Call`, `Songbird` manager, `Shard`, `builtin-queue`, serenity/twilight. Patching songbird, including opting out of DAVE.
 - abi3/abi3t wheels and PyPy.
@@ -72,7 +84,6 @@ src/                       binding crate: #[pymodule] native, pyclasses, convers
 | `tokio` | `=1.54.1` | `["rt-multi-thread", "sync", "time", "macros"]` | The two owned runtimes (§5.1), `mpsc`, `Notify`, timers. |
 | `parking_lot` | `=0.12.5` | — | Leaf locks with `try_lock`, no poisoning. Already in songbird's graph. |
 | `bytes` | `=1.12.1` | — | `RtpData.packet: bytes::Bytes`. Cloning is a refcount bump, with no copy. |
-| `base64` | `=0.22.1` | — | `to_base64` and the `write_base64*` paths (`engine::general_purpose::STANDARD`). Already in the graph. |
 | `bytemuck` | `=1.25.2` | — | Casts between `[i16]`/`[f32]` and `[u8]` on borrowed slices only. **Never** `cast_slice_box` across alignments (§7.4). |
 | `async-trait` | `=0.1.92` | — | songbird's `EventHandler` is `#[async_trait]`. |
 | `log` | `=0.4.34` | `std` | Logging facade. songbird logs through `tracing` with its `log` feature, so records reach our `log::Log` when no tracing subscriber is installed. |
@@ -138,7 +149,7 @@ test-hooks    = ["sbcore/test-hooks"]      # exposes native._testing; never in r
 | extra `arrow` | `pyarrow` | `>=26.0.0` | Optional consumer of the capsules. |
 | extra `arro3` | `arro3-core` | `>=0.9.1` | Optional consumer. |
 | build backend | `maturin` | `>=1.15.0,<2` | hatchling is removed. The dev pin moves from the installed 1.10.2 to `==1.15.0`. |
-| dev | `ruff` 0.17.2, `ty` 0.0.92, `pytest` 9.1.1, `pytest-asyncio` 1.4.1, `numpy` 2.5.4, `pyarrow` 26.0.0, `arro3-core` 0.9.1, `websockets` 17.3 | exact pins in `uv.lock` | `asyncio_mode = "auto"`. |
+| dev | `ruff` 0.17.2, `ty` 0.0.92, `pytest` 9.1.1, `pytest-asyncio` 1.4.1, `numpy` 2.5.4, `pyarrow` 26.0.0, `arro3-core` 0.9.1, `websockets` 17.3, `maturin` 1.15.0 | exact pins in `uv.lock` | `asyncio_mode = "auto"`. `websockets` is used only by `examples/websocket_bridge.py` and its test (a local fake binary echo server, §13.3). |
 
 Removed from runtime dependencies: `ty`, `pyarrow`, `arro3-*`, `audioop-lts`, `typing-extensions`. The PyPy classifier is removed.
 
@@ -199,7 +210,7 @@ Removed from runtime dependencies: `ty`, `pyarrow`, `arro3-*`, `audioop-lts`, `t
 
 ### 3.3 Data flow and latency budget
 
-**Receive (Discord user → AI):**
+**Receive (Discord user → consumer):**
 
 1. songbird's UDP-rx task decrypts, then DAVE-decrypts, then passes packets through the jitter buffer. That buffer is `playout_buffer_ms`: 60 ms by default, 40 ms with `VoiceConfig.low_latency()`.
 2. A `VoiceTick` fires every 20 ms (`udp_rx/mod.rs:86-111`).
@@ -215,18 +226,18 @@ Removed from runtime dependencies: `ty`, `pyarrow`, `arro3-*`, `audioop-lts`, `t
    8. push the shared `Arc<ChunkData>` into each subscriber's `SubQueue`.
 5. `WakeHub::notify` writes one byte per tick at most.
 6. `_Pump` wakes and resolves the futures waiting on it.
-7. `AudioStream.__anext__` pops the chunk synchronously. An `AudioChunk` exposes its PCM through the buffer protocol without copying, and `to_base64()` encodes in Rust.
+7. `AudioStream.__anext__` pops the chunk synchronously. An `AudioChunk` exposes its PCM through the buffer protocol without copying.
 
 **Typical one-way latency:** 40–60 ms jitter buffer, plus ≤ 20 ms tick phase, plus ≤ 4.3 ms resampler, plus (`chunk_ms` − 20), plus about 0.2 ms wake-up.
 
-**Send (AI → Discord):**
+**Send (producer → Discord):**
 
-1. `PlaybackStream.write_base64_nowait(delta)` runs on the loop thread. **Outside every lock** it decodes the base64 in Rust and parses PCM at the **input rate** into an owned buffer. It then takes L6w only to splice the ≤ 7-byte partial-frame carry, and L6 to apply wall-clock gap filling, tag the samples and append one segment: both are O(1) critical sections (§7.3).
+1. `PlaybackStream.write_nowait(data)` runs on the loop thread (or any thread). **Outside every lock** it parses PCM at the **input rate** into an owned buffer. It then takes L6w only to splice the ≤ 7-byte partial-frame carry, and L6 to apply wall-clock gap filling, tag the samples and append one segment: both are O(1) critical sections (§7.3).
 2. Every tick the mixer thread calls `LiveReader::next_packet()`, which only checks atomics and returns an empty 960-frame-duration packet with no allocation.
 3. songbird then calls `PcmDecoder::decode()`. That function takes `try_lock`, pops `rate/50` frames (zero-filling on underrun or contention), runs our `TickResampler` to exactly 960 frames at 48 kHz f32, applies gain, and fills a preallocated `AudioBuffer<f32>`.
 4. songbird takes its no-resample `mix_over_ref` path, then Opus-encodes, DAVE-encrypts and sends.
 
-**Added latency:** 0–20 ms waiting for the next pull, plus about 1.4 ms of resampling, plus ≤ 20 ms until send. **Barge-in:** `clear()` empties the queue immediately. Audio is silent after at most one already-pulled tick plus one in-flight packet, i.e. ≤ 40 ms.
+**Added latency:** 0–20 ms waiting for the next pull, plus about 1.4 ms of resampling, plus ≤ 20 ms until send. **Interruption:** `clear()` empties the queue immediately. Audio is silent after at most one already-pulled tick plus one in-flight packet, i.e. ≤ 40 ms.
 
 **Control:**
 
@@ -551,7 +562,7 @@ pub static DISPOSER: LazyLock<songbird::driver::DisposalThread>; // DisposalThre
 | Thread | Runs | Allowed | Forbidden |
 |---|---|---|---|
 | **asyncio loop thread** | discord.py, `_Pump`, wrappers, every native method (each synchronous and O(1) or O(input)) | Leaf parking_lot `lock()` with µs critical sections. Allocation. Creating Python objects **outside** sbcore calls. | Waiting on a condvar, channel, tokio task or the mixer. `blocking_lock`/`blocking_recv`/`block_on`. Holding a buffer across an sbcore call (I8). Blocking file I/O (`AudioFile.from_path` is documented for `asyncio.to_thread`). |
-| **other Python threads** (3.14t; also GIL builds) | `read_nowait`, `write_nowait`, `write_base64_nowait`, `clear`, `close`, properties, source constructors | As above, plus CPU-heavy work (`RawPcm` conversion, `AudioFile` probe/read) inside `py.detach(...)` after the input has been copied | Awaiting pump futures. They are bound to the connection's loop; other loops raise `RuntimeError`. |
+| **other Python threads** (3.14t; also GIL builds) | `read_nowait`, `write_nowait`, `clear`, `close`, properties, source constructors | As above, plus CPU-heavy work (`RawPcm` conversion, `AudioFile` probe/read) inside `py.detach(...)` after the input has been copied | Awaiting pump futures. They are bound to the connection's loop; other loops raise `RuntimeError`. |
 | **Python `songbird-log` daemon thread** | `native._log_wait()`: parks **detached**, then drains while attached; emits `logging` records | `py.detach(\|\| thread::park_timeout(250 ms))` | — |
 | **NET workers** (`songbird-net-*`) | songbird core/events/WS/UDP-rx/Idle tasks; `Dispatch::act` | Atomics, `try_send`, O(1) `apply()` (L2 step, then actions), `EventHub::emit` | Attaching (impossible: sbcore). `.await` inside `Dispatch::act`. Unwinding out of `act`: it is wrapped in `catch_unwind`, because a panic there would kill the events task and trigger `RebuildInterconnect`, which drops all global handlers (`message/mod.rs:36-54`). Per-tick logging. |
 | **RX workers** (`songbird-rx-*`) | ConnWorker loops (receive DSP, housekeeping, deadlines, watchdog), connect futures, op futures | CPU work bounded per tick. `lock()` on leaf locks. Doorbell writes (after unlocking). `TrackHandle::pause/play/stop` (flume sends). `OwnedDriver` calls under L1. | Attaching. Sleeping. Blocking I/O. Holding a lock across `.await`. Unwinding out of a tick (the per-tick body runs inside `catch_unwind`). |
@@ -577,7 +588,7 @@ All locks are `parking_lot`. None is held across `.await`, a Python call or a sy
 | L3 | `WorkerShared.cmds: Mutex<Vec<WorkerCmd>>` | pending subscribe/filter/source commands | Python (push), ConnWorker (swap) | Vec push/swap | leaf |
 | L4 | `SubQueue.inner` | chunk deque, armed flag, counters | ConnWorker (push), Python (pop) | O(chunks dropped by policy). Freed chunks are dropped **after** unlock. | leaf |
 | L5h → L5q | `EventHub.queues` → `EventQueue.inner` | registry → event deque | NET (Dispatch), RX (worker), Python | O(#queues) | **L5h → L5q** only |
-| L6w → L6 | `PcmQueue.writer: Mutex<Carry>` → `PcmQueue.inner: Mutex<QueueInner>` | partial-frame carry (≤ 7 bytes + generation) → segments, anchor, tags, gates, positions | Writers: Python threads and the encoded decode thread (L6w → L6). Housekeeper, `clear()`, `close()`, T5 (**L6 only, never L6w**). **Mixer: `try_lock` on L6 only.** | L6w: splice ≤ 7 bytes (base64 decoding and parsing happen before any lock, §7.3). L6: O(1) push, O(tags) for `clear`, which swaps the deque out. | **L6w → L6** only |
+| L6w → L6 | `PcmQueue.writer: Mutex<Carry>` → `PcmQueue.inner: Mutex<QueueInner>` | partial-frame carry (≤ 7 bytes + generation) → segments, anchor, tags, gates, positions | Writers: Python threads and the encoded decode thread (L6w → L6). Housekeeper, `clear()`, `close()`, T5 (**L6 only, never L6w**). **Mixer: `try_lock` on L6 only.** | L6w: splice ≤ 7 bytes (parsing happens before any lock, §7.3). L6: O(1) push, O(tags) for `clear`, which swaps the deque out. | **L6w → L6** only |
 | L7 | `OpusQueue.inner` | packet deque | Python (push), mixer (`try_lock`), Housekeeper | O(1) | leaf |
 | L8 | `ByteRing.inner` + `Condvar` | encoded bytes | Python (push), decode thread (wait) | memcpy | leaf |
 | L9 | `LOG_RING` | log records | **any thread: `try_lock` only** (drop and count on contention); log drainer: `lock` | VecDeque push/pop | leaf |
@@ -914,7 +925,7 @@ struct QueueInner {
     segs: VecDeque<Seg>,                  // capacity grows lazily (starts at 16)
     queued_frames: u64,                   // incl. non-materialised silence
     anchor: Option<Anchor>,               // wall-clock gap-fill anchor { remote_ms: i64, wall: Instant }
-    timed_end_ms: Option<i64>,            // max(at_ms + duration) over accepted timed writes (provider timeline)
+    timed_end_ms: Option<i64>,            // max(at_ms + duration) over accepted timed writes (source timeline)
     gap_reject: Option<GapReject>,        // clear(reject_until_gap_ms=…): { cut_end_ms: i64, gap_ms: u32 } (§7.7)
     tags: TagTable,                       // ≤ 256 tags {name: Arc<str>, written, played, last_pull: u64 (pull index),
                                           //   last_write: u64, open: bool, ended: bool}; eviction rule in §7.7
@@ -944,18 +955,17 @@ struct QueueAtomics {
 | Input type | Handling |
 |---|---|
 | `bytes` | Borrowed as `&[u8]`, zero copies. |
-| `str` | Treated as **base64**. Borrowed via `PyString::to_str`, then `WriteData::Base64`. |
+| `str` | Rejected with `TypeError` (`str` is never audio; decode text-encoded audio in user code first). |
 | any other buffer-protocol object (`bytearray`, `memoryview`, numpy, `array`) | Must be C-contiguous. The **format code is checked against the stream encoding**: `'B'`, `'b'` and `'c'` (raw bytes) are accepted for every encoding; `'h'`/`'<h'` (or `'='`-prefixed) only for `pcm16le`; `'f'`/`'<f'` only for `f32le`. Anything else raises `InvalidAudio`, for example a float32 array written to a `pcm16le` stream, a big-endian `'>i2'` buffer or an `'i'` array. Copied once into an owned `Vec<u8>` (`try_reserve` → `MemoryError`), and the `PyUntypedBuffer` is released **before** calling sbcore. |
 | Arrow arrays (`__arrow_c_array__`, `arrow` feature) | Primitive arrays without nulls whose type matches the encoding (Int16 ↔ pcm16le, Float32 ↔ f32le, UInt8 ↔ any) are copied. The import is dropped while still attached, because pyarrow's release callback needs the interpreter. |
 
-**`PcmQueue::write(data, WriteMeta{tag, at_ms}, now)`** (sbcore). It is all-or-nothing.
+**`PcmQueue::write(data: &[u8], WriteMeta{tag, at_ms}, now)`** (sbcore). It is all-or-nothing.
 
-1. **Pre-checks and decoding, no lock:**
+1. **Pre-checks and parsing, no lock:**
    - closed (`st.end_flags`) → `StreamClosed(reason)`;
    - tag longer than 128 bytes → `InvalidAudio`;
    - connection closed → `StreamClosed("connection_closed")`;
-   - **size cap before any decoding.** For base64, `len·3/4` (for raw bytes, `len`) is compared with the cap in bytes (`cap_frames·frame_bytes`). A larger write raises `LimitExceeded` before a byte is decoded.
-   - **Decode** base64 into a **per-call** buffer (`STANDARD` engine, `try_reserve`; invalid input → `InvalidAudio`, nothing consumed). The buffer is freed when the call returns, so the T2 staging memory in §10 really is transient.
+   - **size cap before any allocation.** `len` is compared with the cap in bytes (`cap_frames·frame_bytes`). A larger write raises `LimitExceeded` before anything is allocated or parsed.
    - **Parse** using a snapshot `c = st.carry_len`: skip `k = (frame_bytes − c) % frame_bytes` head bytes (they complete the carried frame), and convert the whole frames of `src[k..]` into an exactly sized `Box<[i16]>`. Conversions: pcm16le is an LE copy, f32le is clamp + round, and µ-law/A-law use the `ULAW_DECODE`/`ALAW_DECODE` tables, bit-exact with Sun g711.c. Keep any trailing partial frame as the **tentative** new carry. **Odd byte counts never raise.**
 2. **Lock L6w (O(1)).**
    - Drop the stored carry if its `gen` ≠ `st.generation`: a `clear()` happened, and pre-clear bytes must never prefix post-clear audio.
@@ -966,7 +976,7 @@ struct QueueAtomics {
    - b. **Gap** (§7.6): compute `gap_frames` from `at_ms` with checked arithmetic. If `gap + frames > cap`, the write is treated as a **discontinuity**: re-anchor, `gap = 0`.
    - c. **Capacity.** If `queued + gap + frames > cap`: set `space_wanted = min(gap + frames, cap)`, restore the carry, unlock, raise `PlaybackFull(needed_ms, free_ms)`. **Nothing is consumed.**
    - d. Push `Seg::Silence{gap}` if `gap > 0` (not materialised; counted in `gap_filled`; **excluded** from tag accounting). Push `Seg::Pcm{data, tag}`. Update `tags[tag].written` and `last_write` (opening the tag if needed, §7.7), `timed_end_ms`, `written` and `queued`, and commit the carry with the current generation.
-   - e. **Start.** If the write finds `queued == 0` at a turn start (never written, idle since the last real pull, or cleared since the last write) and `lim.prebuffer_frames > 0`, arm the prebuffer gate with `ticks_left = prebuffer_ticks` (§7.4). If `paused_idle`: call `track.play()` (a flume send) and clear the flag. **Every live source starts with `paused_idle = true`** (§4.9), so this is also how the first write starts playback, within ≤ 1 tick. Both happen under L6, ordered with the housekeeper's `pause()`.
+   - e. **Start.** If the write finds `queued == 0` at a segment start (never written, idle since the last real pull, or cleared since the last write) and `lim.prebuffer_frames > 0`, arm the prebuffer gate with `ticks_left = prebuffer_ticks` (§7.4). If `paused_idle`: call `track.play()` (a flume send) and clear the flag. **Every live source starts with `paused_idle = true`** (§4.9), so this is also how the first write starts playback, within ≤ 1 tick. Both happen under L6, ordered with the housekeeper's `pause()`.
 4. **Unlock L6 and L6w. Return.**
 
 `clear()`, `close()` and T5 never take L6w. `close()` sets `st.end_flags` before taking L6, so a writer that is parsing aborts at its next check (step 2 or 3) instead of the closer waiting for it.
@@ -998,7 +1008,7 @@ PcmDecoder::decode(_pkt):
   buf.clear(); buf.render_reserved(Some(960)); write planes; Ok(buf.as_audio_buffer_ref())
 ```
 
-- **Prebuffer gate.** It is armed by the first accepted write at a turn start (§7.3e). It opens when **any** of these holds: `queued ≥ prebuffer_frames`; `prebuffer_ticks = ⌈prebuffer_ms/20⌉` gated pulls have passed since it was armed, so a reply shorter than `prebuffer_ms` still plays after at most `prebuffer_ms`; or `drain()`, `aclose(drain=True)` or `end_item()` is called, each of which clears `gate.armed` under L6. `PlaybackSpec::validate` requires `prebuffer_ms ≤ max_buffer_ms/2`, so the size condition is always reachable.
+- **Prebuffer gate.** It is armed by the first accepted write at a segment start (§7.3e). It opens when **any** of these holds: `queued ≥ prebuffer_frames`; `prebuffer_ticks = ⌈prebuffer_ms/20⌉` gated pulls have passed since it was armed, so a reply shorter than `prebuffer_ms` still plays after at most `prebuffer_ms`; or `drain()`, `aclose(drain=True)` or `end_item()` is called, each of which clears `gate.armed` under L6. `PlaybackSpec::validate` requires `prebuffer_ms ≤ max_buffer_ms/2`, so the size condition is always reachable.
 - **No `Notify`, doorbell, flume or `TrackHandle` call happens here.** Wake-ups, events and auto-pause belong to the housekeeper (§7.5).
 - **`LiveReader::drop` and `PcmDecoder::drop`** store `reader_gone = true` and drop the `DoneGuard` (atomic stores only). This runs inline on the mixer or Idle task for `SetTrack(None)`, or on the DisposalThread for natural ends.
 
@@ -1009,7 +1019,7 @@ The housekeeper runs on the ConnWorker (RX runtime), once per tick while live so
 - **Space.** If `space_wanted > 0` and free frames ≥ `space_wanted`: clear it and ring `wake`. Writers re-try.
 - **Drain.** If `drain_waiting` and `queued == 0` and a pull has happened since: ring.
 - **Pull epoch.** If `st.pulls` advanced since the last housekeeping tick, set `pull_epoch = (pulls, now)` under L6. The wall time of any earlier pull index `p` is then `epoch.1 − 20 ms·(epoch.0 − p)`, and that estimate stays correct while the track is paused or parked (§7.7 `heard_ms`). The mixer never reads a clock.
-- **Idle.** If `queued == 0` for `idle_ms` (default 250) after real audio: mark inactive, **close every open tag** (the turn is over, §7.7), `emit(PlaybackIdle{playback_id, played_ms})`, and ring if `idle_waiting`.
+- **Idle.** If `queued == 0` for `idle_ms` (default 250) after real audio: mark inactive, **close every open tag** (playback went idle, §7.7), `emit(PlaybackIdle{playback_id, played_ms})`, and ring if `idle_waiting`.
   - If `auto_pause`, lock L6. If the queue is still empty, set `paused_idle = true` and call `track.pause()`. songbird then sends 5 Opus silence frames and stops RTP, so the speaking ring turns off. Resuming on the next write costs ≤ 1 tick.
   - **Never-written sources** need no housekeeping to stay silent: they are created paused (`paused_idle = true`, §4.9), so an opened but unwritten playback produces no pulls and no RTP.
 - **Started.** Real audio pulled after idle → `emit(PlaybackStarted{playback_id})`.
@@ -1019,9 +1029,9 @@ The housekeeper runs on the ConnWorker (RX runtime), once per tick while live so
 
 The housekeeper also polls `TrackRegistry` for dropped or ended tracks, finalises them (§7.10) and rings `WAKE_TRACKS`. Mixer and disposal threads cannot notify, so polling is how completion is observed.
 
-### 7.6 Gap filling from provider timestamps (`at_ms`)
+### 7.6 Gap filling from source timestamps (`at_ms`)
 
-**Decision (graft C, resolving a must-fix).** The anchor is **wall-clock based**. songbird does not pull a paused or parked track (`mixer/mod.rs:830`), so a frame-based playhead freezes during idle-pause or a disconnect. That frozen playhead would insert stale silence for time that has already passed, adding up to `max_gap_ms` of latency per turn.
+**Decision (graft C, resolving a must-fix).** The anchor is **wall-clock based**. songbird does not pull a paused or parked track (`mixer/mod.rs:830`), so a frame-based playhead freezes during idle-pause or a disconnect. That frozen playhead would insert stale silence for time that has already passed, adding up to `max_gap_ms` of latency after every idle period.
 
 ```text
 earliest(now) = now + queued_frames / rate        // when the next written sample would start playing
@@ -1039,25 +1049,25 @@ write without at_ms                → append; anchor untouched
 clear() / link-down with "discard" → anchor = None
 ```
 
-`at_ms` is any Python `int` that fits in `i64` (larger → `OverflowError` at extraction). No provider value can overflow the anchor arithmetic or panic `Instant` arithmetic. `PlaybackSpec::validate` requires `max_gap_ms ≤ max_buffer_ms/2`, so an inserted gap plus at least half a buffer of audio always fits an empty queue.
+`at_ms` is any Python `int` that fits in `i64` (larger → `OverflowError` at extraction). No caller-supplied value can overflow the anchor arithmetic or panic `Instant` arithmetic. `PlaybackSpec::validate` requires `max_gap_ms ≤ max_buffer_ms/2`, so an inserted gap plus at least half a buffer of audio always fits an empty queue.
 
 **Required test (§13.3):**
 
-1. A 1000 ms delta at `at_ms = 0` is played out.
+1. A 1000 ms write at `at_ms = 0` is played out.
 2. 250 ms of idle follows, and the track is auto-paused.
-3. The next delta has `at_ms = 2500` and arrives at wall time `t0 + 2500 ms`.
+3. The next write has `at_ms = 2500` and arrives at wall time `t0 + 2500 ms`.
 
-Expected: **≤ one tick** of silence is inserted. If that same delta instead arrives early, at `t0 + 1100 ms`, about 1400 ms of silence is inserted, so it starts on time.
+Expected: **≤ one tick** of silence is inserted. If that same write instead arrives early, at `t0 + 1100 ms`, about 1400 ms of silence is inserted, so it starts on time.
 
-### 7.7 `clear()` (barge-in), tags and positions
+### 7.7 `clear()` (interruption), tags and positions
 
-**Tags.** A tag (the provider's item id) is **open** from its first accepted write until one of these happens:
+**Tags.** A tag is an application-defined segment id (a sentence, a message, a reply: whatever unit the application needs positions for). It is **open** from its first accepted write until one of these happens:
 
-- `end_item(tag)`, called on the provider's "audio done" event (OpenAI `response.output_audio.done`). It closes the tag, sets `ended`, and releases the prebuffer gate (§7.4).
+- `end_item(tag)`, called once the application has written the whole segment. It closes the tag, sets `ended`, and releases the prebuffer gate (§7.4).
 - `clear()`.
-- The stream's next Active → Idle transition (§7.5): the turn is over.
+- The stream's next Active → Idle transition (§7.5).
 
-An open tag stays open across underruns shorter than `idle_ms`, so an item that is still streaming but momentarily has nothing queued is still "in play". Apps that never call `end_item` still get bounded open sets, because tags close at turn end.
+An open tag stays open across underruns shorter than `idle_ms`, so a segment that is still streaming but momentarily has nothing queued is still "in play". Apps that never call `end_item` still get bounded open sets, because tags close when playback goes idle.
 
 **Tag-table overflow** (`MAX_TAGS = 256`). A write with a new tag while 256 are live evicts one entry, chosen in this order:
 
@@ -1071,15 +1081,15 @@ The eviction is counted in `stats().tags_evicted`, and a later write with an evi
 1. Lock L6.
 2. Build `items`: **every open tag, plus every tag pulled within the last `output_latency_ms`** (wall time via `pull_epoch`). Each item is `ItemProgress{tag, written_ms, played_ms = min(played, written), heard_ms, complete}`, where `complete = ended && played == written`.
 3. Set `discarded += queued_real`. **Swap `segs` out** (freed after unlock). Set `queued = 0`, `space_wanted = 0`, `anchor = None`, `gate.armed = false`. Increment `generation`, which also invalidates the writer's partial-frame carry (§7.3 step 2). Close every open tag.
-   - Capacity is released **immediately**, even while the mixer is parked or idle-paused. The next response's `write_nowait` can never hit `PlaybackFull` because of audio that was discarded.
+   - Capacity is released **immediately**, even while the mixer is parked or idle-paused. The next segment's `write_nowait` can never hit `PlaybackFull` because of audio that was discarded.
 4. **Late-write rejection.** Three options, which can be combined:
-   - **`reject_late`** (default `True`). Add **every open tag** and every item tag to `rejected` (FIFO, 256). Late deltas of a cancelled OpenAI Realtime item are then dropped, even if the item had nothing queued at the moment of the clear.
-   - **`reject_until_gap_ms=N`**, for timed providers without item ids, such as GPT-Live. If `timed_end_ms` is known, set `gap_reject = {cut_end_ms: timed_end_ms, gap_ms: N}`.
-     - A later timed write with `at_ms < cut_end_ms + N` continues or repeats the interrupted utterance. It is rejected, and `cut_end_ms` grows to `max(cut_end_ms, at_ms + duration)`.
-     - The first timed write with `at_ms ≥ cut_end_ms + N` is accepted and ends the window. GPT-Live encodes model silence as gaps between `start_ms`/`end_ms` ranges, so a new reply always starts after a gap.
-     - `N` must exceed the provider's mid-utterance pauses; the example uses 250 ms. A longer pause inside the interrupted utterance ends the window early.
+   - **`reject_late`** (default `True`). Add **every open tag** and every item tag to `rejected` (FIFO, 256). Late writes of an interrupted segment are then dropped, even if the segment had nothing queued at the moment of the clear.
+   - **`reject_until_gap_ms=N`**, for timed sources (`at_ms`) without tags. If `timed_end_ms` is known, set `gap_reject = {cut_end_ms: timed_end_ms, gap_ms: N}`.
+     - A later timed write with `at_ms < cut_end_ms + N` continues or repeats the interrupted audio. It is rejected, and `cut_end_ms` grows to `max(cut_end_ms, at_ms + duration)`.
+     - The first timed write with `at_ms ≥ cut_end_ms + N` is accepted and ends the window. This suits sources whose timeline leaves a gap before each new segment.
+     - `N` must exceed the source's pauses inside one segment (e.g. 250 ms). A longer pause inside the interrupted segment ends the window early.
      - Untimed writes are unaffected.
-   - **`hold_ms`**, a fallback for untimed writes. It drops **all** writes until `now + hold_ms`. This is a wall-clock guess: too short and the tail resumes mid-sentence (the anchor was reset, so it plays at once); too long and it eats the start of the next reply. Prefer `reject_late` or `reject_until_gap_ms` whenever the provider supplies ids or timestamps.
+   - **`hold_ms`**, a fallback for untimed writes. It drops **all** writes until `now + hold_ms`. This is a wall-clock guess: too short and the tail resumes mid-sentence (the anchor was reset, so it plays at once); too long and it eats the start of the next segment. Prefer `reject_late` or `reject_until_gap_ms` whenever the source supplies segment ids or timestamps.
 5. Unlock, drop the old segments, and ring `wake` if a writer was waiting for space.
 
 The cut becomes audible at the next pull. Audio already pulled (≤ 1 tick) and the packet in flight (≤ 1 tick) still play, so expect **≤ 40 ms** plus network.
@@ -1094,7 +1104,7 @@ The cut becomes audible at the next pull. Audio already pulled (≤ 1 tick) and 
 | `position_ms` | Playhead including silence, advancing per pull while the mixer is live. |
 | `buffered_ms` | Queued, including inserted gap silence. |
 | `underrun_ms`, `gap_filled_ms`, `rejected_ms`, `discarded_ms`, `contended_ticks`, `tags_evicted` | Counters. |
-| `item(tag)` | `ItemProgress`, with `played_ms` clamped to `written_ms` (avoiding the openai-agents PR #4122 bug). Per-item `heard_ms = played − clamp(output_latency_ms − since(tag.last_pull), 0, played)`, so latency compensation applies only to audio pulled within the last `output_latency_ms` of wall time. `complete` is true once `end_item(tag)` was called and everything written has been played. |
+| `item(tag)` | `ItemProgress`, with `played_ms` clamped to `written_ms` (a consumer never learns that more was played than written). Per-item `heard_ms = played − clamp(output_latency_ms − since(tag.last_pull), 0, played)`, so latency compensation applies only to audio pulled within the last `output_latency_ms` of wall time. `complete` is true once `end_item(tag)` was called and everything written has been played. |
 
 `played_ms` means "handed to the Discord encoder". Network and listener jitter-buffer delay (about 40–100 ms) lie downstream and cannot be observed. The documentation says so.
 
@@ -1104,7 +1114,7 @@ The cut becomes audible at the next pull. Audio already pulled (≤ 1 tick) and 
   - It releases the prebuffer gate (§7.4), arms `drain_waiting` and waits until `queued == 0` and a pull has followed.
   - It returns `False` on timeout or when the stream or connection closes.
   - While the link is down, or while self-muted, it keeps waiting, because the buffered audio plays after reconnect or unmute.
-- **`await wait_idle()`** resolves at the next Active → Idle transition. This is the turn-end signal for GPT-Live, which has no output-done event.
+- **`await wait_idle()`** resolves at the next Active → Idle transition: the end-of-playback signal for sources that have no explicit end-of-segment event.
 - **`close()`** is synchronous and idempotent.
   - It sets `closed = Abort` and the end flag, frees the segments now, and calls `track.stop()` (flume; songbird fires `TrackEvent::End`).
   - The reader returns EOF at its next pull, or the track is dropped at teardown if parked.
@@ -1112,14 +1122,14 @@ The cut becomes audible at the next pull. Audio already pulled (≤ 1 tick) and 
   - With `drain=True`: release the prebuffer gate, set `closed = Drain` (the reader returns EOF once empty), then await `reader_gone` with deadline `timeout or buffered_ms + 2 s`. On timeout it escalates to Abort.
   - `__aexit__` is `aclose(drain=False)`.
 - **`pause()`/`resume()`** set `paused_user` under L6. While set, the gate emits silence without consuming. They also call `track.pause()`/`track.play()`, so RTP stops while paused.
-- **Self-mute.** songbird still pulls every track while muted and only afterwards zeroes the mix (`if self.muted { mix_len = MixedPcm(0) }` follows `mix_tracks`, `mixer/mod.rs:529-539`). Left alone, a `PlaybackStream` would be consumed and counted as played and heard without being sent; `drain()` would complete; and an OpenAI truncate would report unheard audio as heard. So `set_self_flags` mirrors the send-mute flag into a per-connection `send_muted: Arc<AtomicBool>` that every live PCM and Opus source reads. While it is set, the decoder emits silence **without consuming**: the same gate as a user pause, checked before `try_lock`. `played_ms`/`heard_ms` hold, and the audio plays after unmute. Use `clear()` to discard it instead. Memory and file tracks (`play()`) keep advancing silently, as songbird mixes them and then discards the mix; this is documented.
+- **Self-mute.** songbird still pulls every track while muted and only afterwards zeroes the mix (`if self.muted { mix_len = MixedPcm(0) }` follows `mix_tracks`, `mixer/mod.rs:529-539`). Left alone, a `PlaybackStream` would be consumed and counted as played and heard without being sent; `drain()` would complete; and `heard_ms` would report unheard audio as heard. So `set_self_flags` mirrors the send-mute flag into a per-connection `send_muted: Arc<AtomicBool>` that every live PCM and Opus source reads. While it is set, the decoder emits silence **without consuming**: the same gate as a user pause, checked before `try_lock`. `played_ms`/`heard_ms` hold, and the audio plays after unmute. Use `clear()` to discard it instead. Memory and file tracks (`play()`) keep advancing silently, as songbird mixes them and then discards the mix; this is documented.
 - **`volume`** is in the range 0.0–4.0. It is an atomic `f32` applied in our decoder with a 5 ms ramp, so it works while parked. songbird's `TrackHandle::set_volume` only reaches live mixers.
 
 ### 7.9 Other inputs
 
 | Python API | sbcore type | songbird input | Mixer work | Seek/loop | Notes |
 |---|---|---|---|---|---|
-| `vc.open_playback(fmt, …)` → `PlaybackStream` | `PcmQueue` + `LiveReader` + `PcmDecoder` | Parsed, `supports_backseek: false` | `try_lock` + memcpy + resample | no (`TrackError`) | AI output (§7.2–7.8). Starts paused until the first accepted write (§4.9). |
+| `vc.open_playback(fmt, …)` → `PlaybackStream` | `PcmQueue` + `LiveReader` + `PcmDecoder` | Parsed, `supports_backseek: false` | `try_lock` + memcpy + resample | no (`TrackError`) | Realtime PCM written as it arrives (§7.2–7.8). Starts paused until the first accepted write (§4.9). |
 | `vc.open_encoded_stream(max_buffer_bytes=1 MiB)` → `EncodedStream`; `vc.queue.enqueue_stream(feed)` (lazy, §7.10) | `ByteRing` (L8) → `songbird-decode-N` thread → internal `PcmQueue` (48 kHz stereo, fixed 1 s cap) → `LiveReader` | Parsed | as above | no | Replaces `StreamInput`. The decode thread runs `MediaSourceStream::new(Box::new(ByteRingSource), Default::default())`, probes via `get_probe()`, decodes via `get_codec_registry()`, and resamples any rate (e.g. 44.1 kHz) to 48 kHz with `dsp::StreamResampler` (rubato `SincFixedIn`, arbitrary ratio, off-mixer). There is no `hint` parameter: symphonia-core 0.5.5 `Probe::format` ignores its hint (`_hint`, `probe.rs:312-314`), and so does songbird (`live_input.rs:57`). The track **starts paused** and is resumed by the first decoded frame's write (§7.3e). Pushing blocks on the queue's space condvar, which the housekeeper notifies and `close()` wakes. `ByteRingSource::read` blocks on L8's condvar and returns `Ok(0)` only after `finish()` and drain. **At most 16 decode threads per process** (`ENCODED_WORKERS: AtomicUsize`; exceeding the limit raises `LimitExceeded`), and ≤ 16 live sources per connection. Decode errors close the stream with `"decode_error"`, giving `TrackEnded(reason="error")`. `feed_from(reader)` is a Python helper. |
 | `vc.open_opus_stream(max_packets=250)` → `OpusPacketStream` | `OpusQueue` (L7) + `OpusStreamReader` + the registry Opus decoder (`get_codec_registry().make(&params, &DecoderOptions::default())`) | Parsed, `CODEC_TYPE_OPUS`, 48 kHz | `try_lock`. Pops a packet and **moves** its `Box<[u8]>` into `Packet::new_from_boxed_slice`. On underrun, contention or self-mute it uses a pre-allocated `SILENT_FRAME` box from a 64-entry reserve that the housekeeper refills (it allocates 3 bytes only if the reserve is empty). | no | **Starts paused**; the first `send` resumes it, and the housekeeper pauses it again after `idle_ms` without packets (§7.5), so an unfed stream sends no RTP. Passthrough when it is the only playing track at volume 1.0 (`mix_logic.rs:69-94`). `send_nowait` validates 1–1275 bytes and `opus::packet::get_nb_samples(p, 48000) == 960`. EOF only after close and drain. |
 | `AudioFile(data)`, `AudioFile.from_path(path, *, max_bytes=256 MiB)`, `await AudioFile.load(path, …)`, `AudioFile.from_arrow(array)` | `EncodedBytes{data: Arc<[u8]>, info}`; copied once (`try_reserve` → `MemoryError`); **eagerly probed** inside `py.detach` (raises `SourceError`; exposes `codec`, `sample_rate`, `channels`, `duration_ms` from the probe result) | `Input::Live(LiveInput::Raw(AudioStream{input: Box::new(DoneSource::new(Cursor::new(ArcBytes(data)), done))}), None)`. `AudioStream` has only an `input` field in 0.6.1 (`input/audiostream.rs:2-8`). Probed on songbird's BlockyTaskPool from memory. | songbird decodes from memory (no disk I/O on the mixer) | yes | `from_path` reads the file **inside `py.detach`**. `load()` wraps it in `asyncio.to_thread`. `from_arrow` accepts a UInt8 primitive array, or a single-value Binary/LargeBinary array, without nulls (pyarrow arrays do not implement the buffer protocol); it is copied once and released while attached (§8.12). No `hint` parameter (see the EncodedStream row). Reusable: each play gets a fresh cursor over the same `Arc`. |
@@ -1274,8 +1284,8 @@ Every access uses `get`/`checked_*`, as sbcore's `deny(clippy::indexing_slicing)
 
 - **`RxSource::User(u64)`** is the user frame: zeros while the user is absent, silent or gone. A per-user stream never ends on its own.
 - **`RxSource::Mixed(MixFilter)`.** `MixFilter{include: Option<BTreeSet<u64>>, exclude: BTreeSet<u64>, ignore_bots: bool, policy}`. Each distinct filter gets one `MixBus`, shared by every lane with an equal filter.
-  - **`policy="mix"`:** the f32 sum of the selected users, plus `unmapped` only when `include is None`. Then a feed-forward `Limiter`: −1 dBFS threshold, instant attack, 80 ms release, no look-ahead. **Never divide by N**, because the level would jump as speakers join and confuse server VAD.
-  - **`policy="floor"`** (graft B; meant for single-caller models such as `gpt-live-1`): the first voiced user holds the floor (ties go to the higher RMS) until they have been silent for `floor_release_ms` (default 600). Only the holder is mixed, and `chunk.speakers == {holder}`.
+  - **`policy="mix"`:** the f32 sum of the selected users, plus `unmapped` only when `include is None`. Then a feed-forward `Limiter`: −1 dBFS threshold, instant attack, 80 ms release, no look-ahead. **Never divide by N**, because the level would jump as speakers join and confuse downstream voice-activity detection.
+  - **`policy="floor"`** (graft B; a dominant-speaker mix for consumers that expect one speaker at a time): the first voiced user holds the floor (ties go to the higher RMS) until they have been silent for `floor_release_ms` (default 600). Only the holder is mixed, and `chunk.speakers == {holder}`.
   - **`ignore_bots`** uses the flags set from Python. A bot's first few hundred ms can be mixed before its classification arrives; this is documented.
 
 ### 8.7 Conversion, lanes and fan-out (one decode, shared conversion)
@@ -1313,7 +1323,7 @@ Every access uses `get`/`checked_*`, as sbcore's `deny(clippy::indexing_slicing)
 - **Synthesis.** While receive is enabled and at least one subscription or router exists, whenever `tick_index < expected(now) − 5`, the worker synthesises silent ticks up to `expected(now) − 2`. That is a 100 ms trigger with 40 ms of slack.
   - This covers time **before the first real tick**, link-down, reconnects, rejoins and a dead UDP-rx task.
   - Synthetic ticks are marked, and chunks report them in `gap_ms`.
-  - Streams therefore emit one chunk per `chunk_ms` of real time from subscription until close, which keeps the GPT-Live uplink real-time paced.
+  - Streams therefore emit one chunk per `chunk_ms` of real time from subscription until close, which keeps any consumer (a file writer, a network uplink) real-time paced.
   - With no subscribers, synthesis is lazy: `tick_index` fast-forwards on the next tick or subscribe, so idle connections cost no wake-ups.
 - **Debt.** When real ticks come back in a burst (songbird never skips ticks, `udp_rx/mod.rs:86-111`) and `tick_index − expected(now) > 5`:
   - a real tick that is **fully silent** (no voiced packet for any user) is dropped and counted in `ticks_skipped`;
@@ -1342,7 +1352,7 @@ Every access uses `get`/`checked_*`, as sbcore's `deny(clippy::indexing_slicing)
   pub struct Delivered { pub chunk: Arc<ChunkData>, pub seq: u64, pub start_ms: u64, pub dropped_ms: u64 }
   ```
 
-  - **Stream clock.** `start_ms = chunk.timeline_ms − origin`, where the origin is the `timeline_ms` of the first delivered chunk (or of the first chunk after `skip_to_live(reset_clock=True)`). `seq = start_ms / chunk_ms`, so `seq` jumps over dropped chunks. `AudioStream.origin_timeline_ms` exposes the current origin, and `chunk.timeline_ms − chunk.start_ms` gives it for any chunk. For a bridge that sends every chunk and compensates every `dropped_ms` with silence, and that has not called `skip_to_live` since the provider session started, `chunk.start_ms` equals the provider's input timeline (GPT-Live transcript `start_ms`/`end_ms`). §9.11 keeps its own sent-ms counter, so attribution stays correct even after it skips.
+  - **Stream clock.** `start_ms = chunk.timeline_ms − origin`, where the origin is the `timeline_ms` of the first delivered chunk (or of the first chunk after `skip_to_live(reset_clock=True)`). `seq = start_ms / chunk_ms`, so `seq` jumps over dropped chunks. `AudioStream.origin_timeline_ms` exposes the current origin, and `chunk.timeline_ms − chunk.start_ms` gives it for any chunk. For a consumer that receives every chunk and compensates every `dropped_ms` with silence, and that has not called `skip_to_live` since it started, `chunk.start_ms` equals the consumer's input timeline (for example offsets in a transcript), so those offsets can be mapped back to `chunk.speakers`. A consumer that skips keeps its own sent-ms counter instead.
   - **Overflow policies:**
 
     | Policy | Behaviour |
@@ -1351,9 +1361,9 @@ Every access uses `get`/`checked_*`, as sbcore's `deny(clippy::indexing_slicing)
     | `drop_newest` | Discard the incoming chunk and add its duration to `pending_drop`. That is attached to the next accepted chunk's `dropped_ms`. |
     | `error` | Close with `Overflow`. Reading delivers the queued chunks, then **raises `StreamOverflow` once** (also from `async for`, which does not stop silently), then `StopAsyncIteration`/`StreamClosed`. So `error` is distinguishable from an ordinary close. |
 
-    In every case, **a chunk's `dropped_ms` is the audio dropped immediately before it**, so a bridge can send compensating silence.
+    In every case, **a chunk's `dropped_ms` is the audio dropped immediately before it**, so a consumer can insert compensating silence.
   - **Counters:** `delivered`, `dropped_chunks`, `dropped_ms`, `queued_ms`.
-  - **`skip_to_live(*, reset_clock=True) -> int`** drops everything queued and returns the milliseconds dropped (not reported as `dropped_ms`). With `reset_clock=True` it also resets the stream clock: the next delivered chunk has `start_ms == 0` and `seq == 0`, which aligns it with a provider session that starts at the first appended audio. The pending drop counter is cleared too.
+  - **`skip_to_live(*, reset_clock=True) -> int`** drops everything queued and returns the milliseconds dropped (not reported as `dropped_ms`). With `reset_clock=True` it also resets the stream clock: the next delivered chunk has `start_ms == 0` and `seq == 0`, so the stream clock starts at the first audio a downstream consumer receives. The pending drop counter is cleared too.
 - **Router (`listen_users`):**
   - `RouterSpec{format, chunk_ms, max_queue_ms, overflow, include, ignore_bots, close_on_leave}`.
   - On a user's first voiced tick that passes the filters, the worker creates a per-user subscription (budget-checked) and pushes it into the router queue. The queue holds 64 entries; drop-oldest closes the dropped stream and counts it.
@@ -1369,10 +1379,9 @@ Every access uses `get`/`checked_*`, as sbcore's `deny(clippy::indexing_slicing)
   - `itemsize` 2/4/1;
   - `view.obj = self`.
 
-  Format strings are native-endian; a `compile_error!` on big-endian targets makes that equal little-endian. `memoryview(chunk).tolist()` works because the format is `"h"`, not `"<h"`. `np.frombuffer(chunk, "<i2")`, `wave.writeframes(chunk)` and websocket sends read it without copying.
+  Format strings are native-endian; a `compile_error!` on big-endian targets makes that equal little-endian. `memoryview(chunk).tolist()` works because the format is `"h"`, not `"<h"`. `np.frombuffer(chunk, "<i2")`, `wave.writeframes(chunk)` and `PlaybackStream.write(chunk)` read it without an intermediate copy.
 - **Other methods:**
   - `to_bytes()` makes one copy (`PyBytes::new`);
-  - `to_base64()` encodes in Rust into a `PyString` (graft B);
   - `rms_dbfs` and `peak` come from `ChunkMeta.level`.
 - **`captured_at`** maps `Instant` to `time.monotonic()` through a `(Instant, time.monotonic())` pair captured at module init.
 
@@ -1431,8 +1440,8 @@ type Source    = AudioFile | RawPcm | OpusPackets
 __all__ = [
     "SongbirdClient", "connect", "VoiceConfig", "ConnectionStatus", "configure_runtime", "set_log_levels",
     "supported_codecs", "AudioFormat", "PCM16_8K", "PCM16_16K", "PCM16_24K", "PCM16_48K", "PCM16_48K_STEREO",
-    "F32_48K", "F32_48K_STEREO", "MULAW_8K", "ALAW_8K", "GPT_LIVE", "OPENAI_REALTIME", "GEMINI_LIVE_INPUT",
-    "GEMINI_LIVE_OUTPUT", "AudioChunk", "AudioStream", "UserStreams", "StreamStats", "ChunkBatch", "VoiceEvent",
+    "F32_48K", "F32_48K_STEREO", "MULAW_8K", "ALAW_8K", "AudioChunk", "AudioStream", "UserStreams", "StreamStats",
+    "ChunkBatch", "VoiceEvent",
     "EventStream", "PlaybackStream", "PlaybackStats", "ClearResult", "ItemProgress", "EncodedStream",
     "OpusPacketStream", "AudioFile", "RawPcm", "OpusPackets", "Source", "TrackHandle", "TrackQueue", "TrackInfo",
     "TrackEnd", "SongbirdError", "NotConnected", "ConnectFailed", "ConnectTimeout", "ConnectionClosed",
@@ -1468,26 +1477,22 @@ class AudioFormat:                                  # native: frozen, eq, hash
     def bytes_per_ms(self) -> int: """Exact bytes per millisecond (48 for PCM16 24 kHz mono)."""
     @property
     def mime_type(self) -> str: """'audio/pcm;rate=24000', 'audio/pcmu', 'audio/pcma', 'audio/x-f32le;rate=48000'."""
-    @property
-    def openai_format(self) -> dict[str, object]:
-        """OpenAI session format object: {'type': 'audio/pcm', 'rate': R} (mono PCM16 at 16/24 kHz),
-        {'type': 'audio/pcmu'} or {'type': 'audio/pcma'}. Raises InvalidAudio for other formats."""
     def bytes_for(self, ms: int) -> int: """Exact byte length of `ms` milliseconds."""
     def ms_for(self, nbytes: int) -> float: """Duration of `nbytes` bytes."""
     def silence(self, ms: int) -> bytes:
         """`ms` of digital silence (0x00; µ-law 0xFF; A-law 0xD5). 0 <= ms <= 600_000, checked before any
         arithmetic (LimitExceeded); allocated with try_reserve (MemoryError)."""
-    def silence_base64(self, ms: int) -> str: """Base64 of silence(ms), encoded in Rust. Same limit."""
 
 PCM16_8K: Final[AudioFormat];  PCM16_16K: Final[AudioFormat];  PCM16_24K: Final[AudioFormat]
 PCM16_48K: Final[AudioFormat]; PCM16_48K_STEREO: Final[AudioFormat]
 F32_48K: Final[AudioFormat];   F32_48K_STEREO: Final[AudioFormat]
 MULAW_8K: Final[AudioFormat];  ALAW_8K: Final[AudioFormat]
-GPT_LIVE: Final[AudioFormat]           # PCM16_24K: gpt-live-1 default, one format for input and output
-OPENAI_REALTIME: Final[AudioFormat]    # PCM16_24K
-GEMINI_LIVE_INPUT: Final[AudioFormat]  # PCM16_16K
-GEMINI_LIVE_OUTPUT: Final[AudioFormat] # PCM16_24K
 ```
+
+Only these neutral presets exist (plus any string accepted by `parse`). **`PCM16_48K_STEREO` is Discord's native
+format and the default of every `listen*` method and of `open_playback`** (§9.4), so audio passes through without
+resampling or channel conversion unless the caller asks for another format. There are no service-specific
+presets and no service-specific format helpers (Decision 2026-10-27).
 
 ### 9.3 Configuration, runtime and module functions
 
@@ -1514,7 +1519,7 @@ class VoiceConfig:
 
     @classmethod
     def low_latency(cls, **overrides: Any) -> VoiceConfig:
-        """Preset for realtime voice AI: playout_buffer_ms=40, mix_mode="mono"."""
+        """Preset for interactive, low-latency audio: playout_buffer_ms=40, mix_mode="mono"."""
     def replace(self, **changes: Any) -> VoiceConfig: """dataclasses.replace with validation."""
 
 def supported_codecs() -> list[str]:
@@ -1598,28 +1603,31 @@ class SongbirdClient(discord.VoiceProtocol):
         log_dropped, …"""
 
     # ---- receive (valid in every state except 'closed'; NotConnected before connect()) ----
-    def listen(self, format: FormatLike = GPT_LIVE, *, user: UserLike | None = None, **options: Any) -> AudioStream:
+    # Every format defaults to PCM16_48K_STEREO: Discord's native 48 kHz stereo PCM16LE (no conversion).
+    def listen(self, format: FormatLike = PCM16_48K_STEREO, *, user: UserLike | None = None,
+               **options: Any) -> AudioStream:
         """listen_user(user, ...) if user is given, else listen_mixed(...)."""
-    def listen_user(self, user: UserLike, format: FormatLike = GPT_LIVE, *, chunk_ms: int = 20,
+    def listen_user(self, user: UserLike, format: FormatLike = PCM16_48K_STEREO, *, chunk_ms: int = 20,
                     max_queue_ms: int = 2_000, overflow: Overflow = "drop_oldest") -> AudioStream:
         """Continuous stream of one user: silence while they are quiet or absent."""
-    def listen_mixed(self, format: FormatLike = GPT_LIVE, *, chunk_ms: int = 20, max_queue_ms: int = 2_000,
+    def listen_mixed(self, format: FormatLike = PCM16_48K_STEREO, *, chunk_ms: int = 20, max_queue_ms: int = 2_000,
                      overflow: Overflow = "drop_oldest", include: Iterable[UserLike] | None = None,
                      exclude: Iterable[UserLike] = (), ignore_bots: bool = True,
                      policy: MixPolicy = "mix", floor_release_ms: int = 600) -> AudioStream:
-        """Continuous, silence-filled mix of the channel; one chunk every chunk_ms (10..=1000)."""
-    def listen_users(self, format: FormatLike = PCM16_48K, *, chunk_ms: int = 20, max_queue_ms: int = 2_000,
+        """Continuous, silence-filled mix of the channel; one chunk every chunk_ms (10..=1000).
+        policy="floor": dominant-speaker mix for consumers that expect one speaker at a time."""
+    def listen_users(self, format: FormatLike = PCM16_48K_STEREO, *, chunk_ms: int = 20, max_queue_ms: int = 2_000,
                      overflow: Overflow = "drop_oldest", include: Iterable[UserLike] | None = None,
                      ignore_bots: bool = True, close_on_leave: bool = True) -> UserStreams:
         """Router yielding one AudioStream per user when they first speak."""
     def events(self, *, max_queue: int = 256, kinds: Iterable[type[VoiceEvent]] | None = None) -> EventStream: ...
 
     # ---- send ----
-    def open_playback(self, format: FormatLike = GPT_LIVE, *, max_buffer_ms: int = 60_000, prebuffer_ms: int = 0,
+    def open_playback(self, format: FormatLike = PCM16_48K_STEREO, *, max_buffer_ms: int = 60_000, prebuffer_ms: int = 0,
                       idle_ms: int = 250, auto_pause: bool = True, max_gap_ms: int = 2_000,
                       output_latency_ms: int = 40, volume: float = 1.0,
                       when_disconnected: Literal["buffer", "discard"] = "buffer") -> PlaybackStream:
-        """Realtime PCM output (AI speech). Several may be open at once; songbird mixes them. Starts paused
+        """Realtime PCM output fed by write(). Several may be open at once; songbird mixes them. Starts paused
         (nothing is sent until the first write). prebuffer_ms and max_gap_ms must be <= max_buffer_ms / 2."""
     def open_encoded_stream(self, *, max_buffer_bytes: int = 1 << 20, volume: float = 1.0) -> EncodedStream:
         """Push-based encoded input (mp3/ogg/…); starts when the first decoded audio is ready."""
@@ -1662,7 +1670,6 @@ class AudioChunk(Buffer):                   # native, frozen; read-only buffer (
     def __buffer__(self, flags: int, /) -> memoryview: ...
     def __len__(self) -> int: """Payload length in bytes."""
     def to_bytes(self) -> bytes: """One copy."""
-    def to_base64(self) -> str: """Base64 of the payload, encoded in Rust (OpenAI / ElevenLabs JSON)."""
     def __arrow_c_array__(self, requested_schema: object | None = None) -> tuple[object, object]: """[arrow] zero-copy."""
 
 @final
@@ -1694,8 +1701,8 @@ class AudioStream(AsyncIterator[AudioChunk]):
         """Next chunk; StreamClosed when finished; StreamOverflow (once) under overflow='error'; TimeoutError."""
     def read_nowait(self) -> AudioChunk | None: """Any thread. None if empty; StreamClosed when finished."""
     def skip_to_live(self, *, reset_clock: bool = True) -> int:
-        """Drop everything queued (e.g. after an AI handshake); returns ms dropped. reset_clock: the next chunk
-        has start_ms == 0 and seq == 0 (aligned with a provider session that starts at the first appended audio)."""
+        """Drop everything queued (e.g. once a downstream consumer is ready); returns ms dropped. reset_clock:
+        the next chunk has start_ms == 0 and seq == 0 (the stream clock starts at the first audio the consumer gets)."""
     def set_include(self, users: Iterable[UserLike] | None) -> None:
         """Mixed streams only (ValueError otherwise). None = everyone. Applied at the next chunk boundary, no gap."""
     def set_exclude(self, users: Iterable[UserLike]) -> None: """Mixed streams only."""
@@ -1797,29 +1804,28 @@ class PlaybackStream:
     @property
     def closed(self) -> bool: ...
     volume: float                                     # settable, 0.0..=4.0, 5 ms ramp
-    async def write(self, data: Buffer | str, *, tag: str | None = None, at_ms: int | None = None,
+    async def write(self, data: Buffer, *, tag: str | None = None, at_ms: int | None = None,
                     timeout: float | None = None) -> None:
-        """Append audio in self.format (any size; partial frames are carried; str = base64).
-        Waits only while the buffer is full. at_ms = provider timestamp (gap filling)."""
-    def write_nowait(self, data: Buffer | str, *, tag: str | None = None, at_ms: int | None = None) -> None:
-        """Like write(); raises PlaybackFull (nothing consumed) instead of waiting. Use this in provider-reader tasks.
-        Typed buffers must match the encoding ('h' for pcm16le, 'f' for f32le, or raw bytes), else InvalidAudio."""
-    async def write_base64(self, data: str | bytes, *, tag: str | None = None, at_ms: int | None = None,
-                           timeout: float | None = None) -> None: ...
-    def write_base64_nowait(self, data: str | bytes, *, tag: str | None = None, at_ms: int | None = None) -> None: ...
+        """Append raw audio in self.format (any size; partial frames are carried). Waits only while the buffer
+        is full. tag = application-defined segment tag; at_ms = source-timeline timestamp in ms (gap filling).
+        A str raises TypeError (decode text-encoded audio first)."""
+    def write_nowait(self, data: Buffer, *, tag: str | None = None, at_ms: int | None = None) -> None:
+        """Like write(); raises PlaybackFull (nothing consumed) instead of waiting. Use this in tasks that read
+        audio from a network connection. Typed buffers must match the encoding ('h' for pcm16le, 'f' for f32le,
+        or raw bytes), else InvalidAudio."""
     def clear(self, *, reject_late: bool = True, hold_ms: int = 0,
               reject_until_gap_ms: int | None = None) -> ClearResult:
-        """Barge-in: discard all queued audio now (silent within ≤40 ms). Any thread.
-        reject_late drops later writes for every open/interrupted tag (OpenAI Realtime item ids).
+        """Interruption: discard all queued audio now (silent within ≤40 ms). Any thread.
+        reject_late drops later writes for every open/interrupted tag (segments still arriving after the cut).
         reject_until_gap_ms drops later TIMED writes contiguous with the cleared audio until one starts at least
-        that many ms after it (GPT-Live start_ms; §7.7). hold_ms (fallback for untimed writes) drops ALL writes."""
+        that many ms after it (§7.7). hold_ms (fallback for untimed writes) drops ALL writes."""
     def end_item(self, tag: str) -> None:
-        """The provider finished sending this item's audio (e.g. response.output_audio.done): closes the tag,
-        releases the prebuffer gate, and lets ItemProgress.complete become True once it has played."""
+        """The tagged segment is fully written: closes the tag, releases the prebuffer gate, and lets
+        ItemProgress.complete become True once it has played."""
     def item(self, tag: str) -> ItemProgress | None: ...
     def played_ms_of(self, tag: str) -> int: """item(tag).played_ms or 0 (clamped to written)."""
     async def drain(self, timeout: float | None = None) -> bool: """Flush: wait until everything written was played."""
-    async def wait_idle(self) -> None: """Wait for the next Active→Idle transition (end of an AI turn)."""
+    async def wait_idle(self) -> None: """Wait for the next Active→Idle transition (playback finished)."""
     def pause(self) -> None: ...
     def resume(self) -> None: ...
     def stats(self) -> PlaybackStats: ...
@@ -1982,140 +1988,229 @@ class TrackError(SongbirdError): ...
 ### 9.10 asyncio usage rules (documented)
 
 1. **Context managers.** Every stream, playback and event stream is an async context manager. Every `close()` is synchronous, idempotent and safe from any thread. Dropping an unclosed object closes it.
-2. **Loop binding.** Awaiting is bound to the event loop that ran `connect()`; awaiting from another loop raises `RuntimeError`. The synchronous methods (`read_nowait`, `write_nowait`, `write_base64_nowait`, `clear`, `close`, properties) work from any thread.
-3. **Writing from a provider reader task.** In the task that reads a provider WebSocket, use `write_*_nowait` and treat `PlaybackFull` as an overrun. Never `await write()` there, or backpressure would delay handling of `interrupted` / `speech_started`.
-4. **After a handshake.** Call `skip_to_live()` (which resets the stream clock to 0 by default) right after starting a provider session, and again after a provider reconnect. Discord streams can stay open while the AI session reconnects (Gemini `goAway`, GPT-Live `expired`).
+2. **Loop binding.** Awaiting is bound to the event loop that ran `connect()`; awaiting from another loop raises `RuntimeError`. The synchronous methods (`read_nowait`, `write_nowait`, `clear`, `close`, properties) work from any thread.
+3. **Writing from a network reader task.** In a task that reads audio from a network connection, use `write_nowait` and treat `PlaybackFull` as an overrun. Never `await write()` there, or backpressure would delay handling of interruption messages.
+4. **When a consumer becomes ready.** Call `skip_to_live()` (which resets the stream clock to 0 by default) right after a downstream consumer becomes ready, and again after it reconnects. Discord streams can stay open while the consumer reconnects.
 5. **Cancellation.** Iterators wait while empty and end only on close or disconnect, or with one `StreamOverflow` under `overflow="error"`. Cancelling a pending `__anext__` or `write()` never loses or duplicates audio.
-6. **Examples are importable.** Every example guards `bot.run(...)` with `if __name__ == "__main__":`, and its bridge function takes `url=` and `api_key=`, so tests can import it and point it at a fake server.
+6. **Examples are importable.** Every example guards `bot.run(...)` with `if __name__ == "__main__":`, and the bridge function takes its `url` as an argument, so tests can import it and point it at a local fake server.
 
-### 9.11 Example A: GPT-Live (`gpt-live-1`) WebSocket bridge (`examples/gpt_live.py`)
+### 9.11 Example A: echo bot (`examples/echo.py`)
 
-Protocol names follow the OpenAI GPT-Live primary-WebSocket reference as of 2026-10-26. That protocol has no handshake acknowledgement: the client sends `session.start` and then streams `session.input_audio.append` continuously. So the uplink starts immediately, and only the first server message, whatever it is, is subject to a timeout. `start_ms` on output deltas is treated as optional; gap filling and gap-based barge-in apply only when it is present.
+Receive and playback streaming in one loop: one member's voice is played back `DELAY_MS` later. Only voiced chunks
+are written, so the playback goes idle (and stops sending RTP) between utterances, and `prebuffer_ms` holds the
+start of each utterance back by the delay. Both streams use the default format, Discord's native 48 kHz stereo
+PCM16, so nothing is resampled.
 
 ```python
-import asyncio, collections, json, logging, os
+import asyncio
+import os
+from typing import Any
+
 import discord
-import websockets
-from websockets.asyncio.client import connect as ws_connect
 from discord.ext import songbird
-from discord.ext.songbird import GPT_LIVE, PlaybackFull, VoiceConfig, VoiceEvent
+from discord.ext.songbird import PCM16_48K_STEREO, PlaybackFull
 
-log = logging.getLogger("gpt_live")
-LIVE_URL = "wss://api.openai.com/v1/live/sessions"
-MAX_FILL_MS = 2_000                    # longest gap we cover with silence; beyond it we skip to live
+FMT = PCM16_48K_STEREO  # the default of listen_*() and open_playback(); spelled out for clarity
+DELAY_MS = 500  # 0..=1000
 
-async def gpt_live_bridge(vc: songbird.SongbirdClient, focus: int | None, *,
-                          url: str = LIVE_URL, api_key: str | None = None) -> str:
-    headers = {"Authorization": f"Bearer {api_key or os.environ['OPENAI_API_KEY']}"}
+
+async def echo(vc: songbird.SongbirdClient, user: Any, stop: asyncio.Event, *, delay_ms: int = DELAY_MS) -> int:
+    """Play ``user``'s voice back ``delay_ms`` late until ``stop`` is set or the connection closes.
+
+    Returns the milliseconds of audio echoed.
+    """
     async with (
-        ws_connect(url, additional_headers=headers, max_size=None) as ws,
-        # single-caller model: mix only the focused member, else the first speaker holds the floor
-        vc.listen_mixed(GPT_LIVE, chunk_ms=40, max_queue_ms=1_000,
-                        include={focus} if focus else None, policy="floor") as mic,
-        vc.open_playback(GPT_LIVE, max_buffer_ms=60_000) as speaker,   # starts paused: sends nothing until a delta
-        vc.events(kinds=[VoiceEvent.SpeakingStarted]) as events,
+        vc.listen_user(user, FMT, chunk_ms=20) as mic,
+        vc.open_playback(FMT, prebuffer_ms=delay_ms, max_buffer_ms=max(2_000, 4 * delay_ms)) as speaker,
     ):
-        await ws.send(json.dumps({"type": "session.start", "session": {
-            "model": "gpt-live-1",
-            "instructions": "You are a concise, friendly voice assistant in a Discord voice channel.",
-            "audio": {"format": GPT_LIVE.openai_format},
-        }}))
-        mic.skip_to_live()                                   # session time 0 == the next chunk (start_ms == 0)
-        sent_ms = 0                                          # the provider's input timeline: what we appended
-        spoken: collections.deque[tuple[int, int, frozenset[int]]] = collections.deque(maxlen=1_500)  # 60 s
-        fill = GPT_LIVE.silence_base64(40)                   # one chunk of silence, encoded once
 
-        async def append(b64: str, ms: int) -> None:
-            nonlocal sent_ms
-            await ws.send(json.dumps({"type": "session.input_audio.append", "audio": b64}))
-            sent_ms += ms
-
-        async def uplink() -> None:                          # continuous, silence-filled, real-time paced; no acks
-            try:
-                async for chunk in mic:
-                    if chunk.dropped_ms > MAX_FILL_MS:       # long uplink stall: catch up, accept the discontinuity
-                        mic.skip_to_live(reset_clock=False)
-                    else:                                    # keep the session timeline aligned, chunk by chunk
-                        for _ in range(chunk.dropped_ms // 40):
-                            await append(fill, 40)
-                    spoken.append((sent_ms, sent_ms + 40, chunk.speakers))
-                    await append(chunk.to_base64(), 40)
-            except websockets.ConnectionClosed:
-                return                                       # downlink reports why the session ended
-
-        async def local_barge_in() -> None:                  # optional: the model is full duplex and yields itself
-            async for ev in events:
-                match ev:
-                    case VoiceEvent.SpeakingStarted(user_id=uid) if focus in (None, uid) and speaker.buffered_ms > 400:
-                        # Drop the rest of the interrupted utterance (deltas contiguous on the session timeline);
-                        # the next reply starts after a gap and plays normally.
-                        speaker.clear(reject_until_gap_ms=250)
-
-        def who(ms: int) -> list[int]:                       # transcript start_ms → Discord speaker(s)
-            return sorted(next((s for a, b, s in reversed(spoken) if a <= ms < b), frozenset()))
-
-        def handle(ev: dict) -> str | None:
-            match ev["type"]:
-                case "session.output_audio.delta":
-                    try:                                     # never await in the reader task
-                        speaker.write_base64_nowait(ev["delta"], at_ms=ev.get("start_ms"))
-                    except PlaybackFull:
-                        log.warning("playback overrun; delta dropped")
-                case "session.input_transcript.delta":
-                    log.info("caller %s: %s", who(ev.get("start_ms", sent_ms)), ev.get("delta"))
-                case "session.output_transcript.delta":
-                    log.info("assistant: %s", ev.get("delta"))
-                case "session.closed":
-                    return ev.get("reason", "closed")
-                case "error":
-                    raise RuntimeError(f"gpt-live error: {ev}")   # fatal: the session is unusable
-            return None
-
-        async def downlink() -> str:
-            try:
-                async with asyncio.timeout(10):              # the only handshake check: any first server message
-                    first = json.loads(await ws.recv())
-                if (reason := handle(first)) is not None:
-                    return reason
-                async for raw in ws:
-                    if (reason := handle(json.loads(raw))) is not None:
-                        return reason
-            except websockets.ConnectionClosed:
-                pass
-            return "websocket_closed"
+        async def stopper() -> None:
+            await stop.wait()
+            mic.close()  # ends the `async for` below once the queued chunks are read
 
         async with asyncio.TaskGroup() as tg:
-            up = tg.create_task(uplink())                    # right after session.start: nothing to wait for
-            bi = tg.create_task(local_barge_in())
-            try:
-                reason = await downlink()
-            finally:
-                up.cancel(); bi.cancel()
-        await speaker.drain(timeout=5)                       # let the last words play out
-        return reason
+            st = tg.create_task(stopper())
+            async for chunk in mic:  # ends on !stop OR when the connection closes
+                if not chunk.speaking:
+                    continue  # silence fill: write nothing, so playback idles between utterances
+                try:
+                    speaker.write_nowait(chunk)  # buffer protocol: no intermediate bytes object
+                except PlaybackFull:
+                    pass  # the buffer is bounded; drop rather than fall further behind
+            st.cancel()
+        await speaker.drain(timeout=delay_ms / 1000 + 1)
+        return speaker.written_ms
+
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = discord.Client(intents=intents)
+sessions: dict[int, asyncio.Event] = {}
+
 
 @bot.event
 async def on_message(msg: discord.Message) -> None:
-    if msg.content != "!live" or not isinstance(msg.author, discord.Member):
+    if msg.guild is None or not isinstance(msg.author, discord.Member):
         return
-    if msg.author.voice is None or msg.author.voice.channel is None:
-        await msg.reply("Join a voice channel first.")
-        return
-    vc = await songbird.connect(msg.author.voice.channel, config=VoiceConfig.low_latency())
-    try:
-        await msg.channel.send(f"session ended: {await gpt_live_bridge(vc, msg.author.id)}")
-    finally:
-        await vc.disconnect()
+    if msg.content == "!echo" and msg.author.voice and msg.author.voice.channel and msg.guild.id not in sessions:
+        vc = await songbird.connect(msg.author.voice.channel)
+        stop = sessions[msg.guild.id] = asyncio.Event()
+        try:
+            echoed = await echo(vc, msg.author, stop)
+            await msg.channel.send(f"Echoed {echoed / 1000:.1f} s of audio.")
+        finally:
+            sessions.pop(msg.guild.id, None)
+            await vc.disconnect()
+    elif msg.content == "!stop" and (ev := sessions.get(msg.guild.id)) is not None:
+        ev.set()
+
 
 if __name__ == "__main__":
     bot.run(os.environ["DISCORD_BOT_TOKEN"])
 ```
 
-### 9.12 Example B: recording bot (`examples/record.py`)
+### 9.12 Example B: generic WebSocket bridge (`examples/websocket_bridge.py`)
+
+The shortest connection to an external audio service, with no service-specific code. The protocol is deliberately
+minimal: the bot sends one **binary frame per received chunk** of raw audio in a configurable `input_format` and
+`chunk_ms`; the service sends **binary frames of raw audio** in `output_format`, which are written to a
+`PlaybackStream` as they arrive; a **text frame `"clear"`** is an interruption (`speaker.clear()`). Adapting it to a
+particular service changes only the framing (wrapping chunks in the service's own messages and unwrapping its
+replies, including any text encoding of the audio, which is done in user code). For services that report how much of
+a reply was heard, write each reply with `tag=` and read `item(tag)` or `clear().items` (§7.7).
+
+```python
+import asyncio
+import logging
+import os
+from typing import Any
+
+import discord
+import websockets
+from discord.ext import songbird
+from discord.ext.songbird import PCM16_48K_STEREO, FormatLike, PlaybackFull, VoiceConfig
+from websockets.asyncio.client import connect as ws_connect
+
+log = logging.getLogger("websocket_bridge")
+
+
+async def bridge(
+    vc: songbird.SongbirdClient,
+    url: str,
+    *,
+    input_format: FormatLike = PCM16_48K_STEREO,
+    output_format: FormatLike | None = None,
+    chunk_ms: int = 20,
+    user: Any | None = None,
+    stop: asyncio.Event | None = None,
+) -> str:
+    """Stream ``vc``'s audio to the WebSocket at ``url`` and play what comes back.
+
+    Parameters
+    ----------
+    vc : SongbirdClient
+        A connected client.
+    url : str
+        The WebSocket to connect to.
+    input_format : AudioFormat or str
+        Format of the audio sent to the service.
+    output_format : AudioFormat or str or None
+        Format of the audio the service sends back (``None``: same as ``input_format``).
+    chunk_ms : int
+        Duration of each binary frame sent.
+    user : user or None
+        Send only this member's voice; ``None`` sends the channel mix.
+    stop : asyncio.Event or None
+        Ends the bridge when set.
+
+    Returns
+    -------
+    str
+        Why it ended: ``"websocket_closed"``, ``"voice_closed"`` or ``"stopped"``.
+    """
+    out_format = input_format if output_format is None else output_format
+    async with (
+        ws_connect(url, max_size=None) as ws,
+        vc.listen(input_format, user=user, chunk_ms=chunk_ms, max_queue_ms=1_000) as mic,
+        vc.open_playback(out_format) as speaker,
+    ):
+        mic.skip_to_live()  # drop what was captured while connecting
+
+        async def uplink() -> str:
+            try:
+                async for chunk in mic:  # continuous: silence while nobody speaks
+                    await ws.send(bytes(chunk))  # one binary frame per chunk
+            except websockets.ConnectionClosed:
+                return "websocket_closed"
+            return "voice_closed"
+
+        async def downlink() -> str:
+            try:
+                async for message in ws:
+                    if isinstance(message, str):
+                        if message == "clear":
+                            speaker.clear()  # interruption: silent within one or two ticks
+                        continue
+                    try:
+                        speaker.write_nowait(message)  # never blocks the reader
+                    except PlaybackFull:
+                        log.warning("playback overrun; %d bytes dropped", len(message))
+            except websockets.ConnectionClosed:
+                pass
+            return "websocket_closed"
+
+        async def stopped() -> str:
+            await (stop or asyncio.Event()).wait()
+            return "stopped"
+
+        tasks = [asyncio.create_task(c) for c in (uplink(), downlink(), stopped())]
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        reason = next(iter(done)).result()
+        if reason == "websocket_closed":
+            await speaker.drain(timeout=5)  # let the last reply finish
+        return reason
+
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = discord.Client(intents=intents)
+sessions: dict[int, asyncio.Event] = {}
+
+
+@bot.event
+async def on_message(msg: discord.Message) -> None:
+    if msg.guild is None or not isinstance(msg.author, discord.Member):
+        return
+    if msg.content == "!bridge" and msg.author.voice and msg.author.voice.channel and msg.guild.id not in sessions:
+        vc = await songbird.connect(msg.author.voice.channel, config=VoiceConfig.low_latency())
+        stop = sessions[msg.guild.id] = asyncio.Event()
+        try:
+            reason = await bridge(
+                vc,
+                os.environ["BRIDGE_URL"],
+                input_format=os.environ.get("BRIDGE_FORMAT", "pcm16_48k_stereo"),
+                chunk_ms=int(os.environ.get("BRIDGE_CHUNK_MS", "20")),
+                stop=stop,
+            )
+            await msg.channel.send(f"bridge ended: {reason}")
+        finally:
+            sessions.pop(msg.guild.id, None)
+            await vc.disconnect()
+    elif msg.content == "!stop" and (ev := sessions.get(msg.guild.id)) is not None:
+        ev.set()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    bot.run(os.environ["DISCORD_BOT_TOKEN"])
+```
+
+### 9.13 Example C: recording bot (`examples/record.py`)
 
 The bot writes one timeline-aligned WAV per user plus a log of speaking events.
 
@@ -2195,50 +2290,13 @@ if __name__ == "__main__":
 
 Memory is bounded per user at 10 s × 96 B/ms = 960 KB, however slowly the disk is written.
 
-### 9.13 Fragments: OpenAI Realtime and Gemini Live
-
-The full files, `examples/openai_realtime.py` and `examples/gemini_live.py`, follow §9.10 rule 6. Both are written on raw `websockets` with `url=`/`api_key=` parameters, so no provider SDK is a dependency.
-
-```python
-# OpenAI Realtime (gpt-realtime family): tags + exact truncation
-case "response.output_audio.delta":
-    speaker.write_base64_nowait(ev["delta"], tag=ev["item_id"])       # late deltas of cleared items are dropped
-case "response.output_audio.done":
-    speaker.end_item(ev["item_id"])                                     # item fully sent; `complete` once played
-case "input_audio_buffer.speech_started":
-    for item in speaker.clear().items:                                  # every open item, even one whose queue is
-        await ws.send(json.dumps({"type": "conversation.item.truncate", #   momentarily empty; capacity freed at once
-                                  "item_id": item.tag, "content_index": 0,
-                                  "audio_end_ms": item.heard_ms}))      # ≤ written by construction
-
-# Gemini Live (BidiGenerateContent WebSocket): 16 kHz in, 24 kHz out, ~100 ms input chunks; flush on `interrupted`.
-# Discord streams survive provider reconnects (goAway): call mic.skip_to_live() after each new `setup`.
-async with ws_connect(url, additional_headers={"x-goog-api-key": api_key}) as ws, \
-           vc.listen_mixed(songbird.GEMINI_LIVE_INPUT, chunk_ms=100) as mic, \
-           vc.open_playback(songbird.GEMINI_LIVE_OUTPUT) as speaker:
-    await ws.send(json.dumps({"setup": {"model": model, "generationConfig": {"responseModalities": ["AUDIO"]}}}))
-    mic.skip_to_live()
-    ...  # uplink task: for each chunk in mic:
-    await ws.send(json.dumps({"realtimeInput": {"audio": {"data": chunk.to_base64(),
-                                                          "mimeType": songbird.GEMINI_LIVE_INPUT.mime_type}}}))
-    ...  # downlink: for each server message `msg`
-    content = msg.get("serverContent") or {}
-    if content.get("interrupted"):
-        speaker.clear()
-    for part in (content.get("modelTurn") or {}).get("parts", []):
-        if (blob := part.get("inlineData")) is not None:
-            speaker.write_base64_nowait(blob["data"])
-```
-
-Gemini field names follow the Live API WebSocket reference and are re-checked in phase 0 (§12.7) together with the GPT-Live names.
-
 ---
 
 ## 10. Memory budget table
 
 Abbreviations: B/ms = bytes per millisecond of audio at the given format; ch = channels; N = concurrently decoded speakers.
 
-**Validation rule.** Every user-supplied duration, count or size is checked against `limits.rs` **before any arithmetic** (`check(...)`, then `checked_mul`). That includes the one-shot helpers `AudioFormat.silence(ms)`/`silence_base64(ms)` (`SILENCE_MS`), `TrackHandle.seek(seconds)` (`SEEK_S`), and the base64 length of a write (§7.3). Violations raise `LimitExceeded`, which is a `ValueError`. `VecDeque` capacities start at `min(bound, 16)` and grow lazily. **Nothing calls `with_capacity(user_value)`**, and no `tokio::sync::broadcast` exists. Large copies use `try_reserve`, so failure raises `MemoryError` instead of aborting.
+**Validation rule.** Every user-supplied duration, count or size is checked against `limits.rs` **before any arithmetic** (`check(...)`, then `checked_mul`). That includes the one-shot helpers `AudioFormat.silence(ms)` (`SILENCE_MS`), `TrackHandle.seek(seconds)` (`SEEK_S`), and the length of a write, checked against the buffer cap before anything is allocated (§7.3). Violations raise `LimitExceeded`, which is a `ValueError`. `VecDeque` capacities start at `min(bound, 16)` and grow lazily. **Nothing calls `with_capacity(user_value)`**, and no `tokio::sync::broadcast` exists. Large copies use `try_reserve`, so failure raises `MemoryError` instead of aborting.
 
 | # | Buffer / queue | Owner (thread) | Bound (formula) | Default size | User control (validated cap) | Freed when |
 |---|---|---|---|---|---|---|
@@ -2254,8 +2312,8 @@ Abbreviations: B/ms = bytes per millisecond of audio at the given format; ch = c
 | R10 | router queue | UserStreams | 64 pending streams | < 8 KB | fixed | router close |
 | R11 | `EventQueue` | EventSubscription | `max_queue` × ~64 B | 256 → 16 KB | 1–4096 (≤ 256 KB); ≤ 16 streams | pop, close, T6 |
 | R12 | `CtrlQueue` (4 slots: moved, classify, rejoin, closed) + `OpRegistry` | ConnShared | 4 × 48 B + 64 × ~64 B | ~4 KB | fixed | consumed; T8 |
-| T1 | `PcmQueue` segments (input rate, i16; gap silence not materialised: 24 B/segment) | Playback + mixer | `max_buffer_ms × rate × ch × 2 B` | 60 s @ 24 kHz mono = 2.88 MB | `max_buffer_ms` 100–120 000 (≤ 23 MB @ 48 kHz stereo); ≤ 16 live sources per connection | pull, `clear()` (immediate, even while parked), close, T5 |
-| T2 | write staging (per-call base64 buffer + parsed `Box<[i16]>`) | caller (transient: freed when the call returns, never retained as scratch) | ≤ one write; the base64 length is checked against the T1 cap **before** decoding | size of the write | via T1 | moved into T1 / dropped |
+| T1 | `PcmQueue` segments (input rate, i16; gap silence not materialised: 24 B/segment) | Playback + mixer | `max_buffer_ms × rate × ch × 2 B` | 60 s @ 48 kHz stereo (the default format) = 11.5 MB; 60 s @ 24 kHz mono = 2.88 MB | `max_buffer_ms` 100–120 000 (≤ 23 MB @ 48 kHz stereo); ≤ 16 live sources per connection | pull, `clear()` (immediate, even while parked), close, T5 |
+| T2 | write staging (parsed `Box<[i16]>`; a copy of a non-`bytes` buffer, §7.3) | caller (transient: freed when the call returns, never retained as scratch) | ≤ one write; the write length is checked against the T1 cap **before** parsing | size of the write | via T1 | moved into T1 / dropped |
 | T3 | tag table + rejected set | PcmQueue | 256 × (≤ 128 B + 56 B) + 256 × ≤ 128 B | ≤ 80 KB | tag ≤ 128 B (`InvalidAudio`); 257th tag evicts (§7.7) | eviction (oldest closed, else least-recently-written open); close |
 | T4 | mixer-side decoder scratch (`in_i16`, `in_f32`, resampler, `AudioBuffer<f32>` 960 × ch) + the reader's 64 KiB `MediaSourceStream` ring from its per-input probe (§7.1 rule 6) | track (mixer) | ≈ 105 KB per live or memory track | 105 KB | ≤ 16 live sources + ≤ 32 playing tracks per connection | track drop (DisposalThread / inline / Poison) |
 | T5 | `ByteRing` (EncodedStream) | EncodedStream + decode thread | `max_buffer_bytes` | 1 MiB | 64 KiB–16 MiB | finish+drain, close, T5 |
@@ -2267,14 +2325,14 @@ Abbreviations: B/ms = bytes per millisecond of audio at the given format; ch = c
 | T11 | `OpusPackets` (`Arc<[u8]>` + `Arc<[u32]>` offsets) | source object | Σ packet bytes + 4 B/packet | — | ≤ 1 000 000 packets (5.5 h), ≤ 1 GiB | last ref |
 | T12 | songbird mixer per Driver (encoder, scratch, packet buffers, `tracks` Vec preallocated to 48), WS/UDP buffers, DAVE state | songbird | fixed by songbird | ~100–300 KB per connection | `mix_mode`, `bitrate` | Poison (T4) |
 | T13 | `TrackQueue` pending entries (`SourceSpec` `Arc` + `PlayOpts` + flags; lazy `Encoded` entries hold no buffer) | ConnShared | 10 000 × ~128 B | ~0 | `MAX_QUEUE_ENTRIES` 10 000 (≤ 1.3 MB, sources shared) | advance, `dequeue`, `clear`, T5/T8 |
-| T14 | `AudioFormat.silence(ms)` / `silence_base64(ms)` results | caller | `ms × B/ms` (base64 × 4/3) | — | `SILENCE_MS` 0–600 000 (≤ 230 MB at 48 kHz stereo f32), `try_reserve` → `MemoryError` | caller drops it |
+| T14 | `AudioFormat.silence(ms)` results | caller | `ms × B/ms` | — | `SILENCE_MS` 0–600 000 (≤ 230 MB at 48 kHz stereo f32), `try_reserve` → `MemoryError` | caller drops it |
 | G1 | `LOG_RING` | process | 1024 records × ≤ 512 B message (truncated) | ≤ 600 KB | `set_log_levels` | drained by the log thread |
 | G2 | doorbell socket buffer | kernel | ≤ 1 byte pending per connection (`pending` flag) | 1 B | — | T9 |
 | G3 | threads | process | NET 2 + RX 1 workers (1–8 each); blocking pools ≤ 16 / ≤ 4; ≤ 16 decode threads; 1 DisposalThread; songbird live workers (1 per 16 live mixers, culled after 60 s idle); 1 Python log thread | — | `configure_runtime` | process exit |
 
-**Scaling of songbird live workers.** A paused track still counts in the mixer's `tracks`, and `demote_and_remove_mixers` parks a mixer only when it has no tracks (and no silence frames left) or no connection (`scheduler/live.rs:410-440`). A connection with an **open** `PlaybackStream`, `EncodedStream` or `OpusPacketStream` therefore keeps its mixer live for as long as the stream is open, even while auto-paused and sending no RTP. Live worker threads scale with *connections that hold open live sources* (1 thread per 16), not with active speech. The documentation says so: open a playback per AI session rather than per bot. Removing an idle `PcmQueue` track from songbird and re-adding it on the next write, so that the mixer can park, is a possible later optimisation; it would need a new `TrackHandle` per resume, so it is not in 0.6.0.
+**Scaling of songbird live workers.** A paused track still counts in the mixer's `tracks`, and `demote_and_remove_mixers` parks a mixer only when it has no tracks (and no silence frames left) or no connection (`scheduler/live.rs:410-440`). A connection with an **open** `PlaybackStream`, `EncodedStream` or `OpusPacketStream` therefore keeps its mixer live for as long as the stream is open, even while auto-paused and sending no RTP. Live worker threads scale with *connections that hold open live sources* (1 thread per 16), not with active speech. The documentation says so: open a playback for as long as audio is expected (a session, a conversation) rather than per bot. Removing an idle `PcmQueue` track from songbird and re-adding it on the next write, so that the mixer can park, is a possible later optimisation; it would need a new `TrackHandle` per resume, so it is not in 0.6.0.
 
-**Typical voice-AI connection** (one mixed 24 kHz subscription, 8 speakers, one playback holding 10 s, one event stream): 96 KB + 8 × 72 KB + ~120 KB + 480 KB + 105 KB + 16 KB + songbird ≈ **1.6 MB**. The worst case per connection at the hard caps is dominated by the user-controlled terms R9 (≤ `max_receive_mb`) and T1 (16 × 23 MB). The documentation flags both.
+**Typical interactive streaming connection** (one mixed 24 kHz mono subscription, 8 speakers, one 24 kHz mono playback holding 10 s, one event stream): 96 KB + 8 × 72 KB + ~120 KB + 480 KB + 105 KB + 16 KB + songbird ≈ **1.6 MB**. The worst case per connection at the hard caps is dominated by the user-controlled terms R9 (≤ `max_receive_mb`) and T1 (16 × 23 MB). The documentation flags both.
 
 ---
 
@@ -2294,8 +2352,8 @@ sbcore returns `CoreError` (thiserror). The binding converts it to Python except
 | Receive overflow under `overflow="error"` | `StreamOverflow` | `StreamOverflow`, raised once after the queued chunks by `read()`, `read_nowait()` **and `__anext__`** (so `async for` does not end silently); afterwards the stream is closed and iteration stops |
 | No space for a `*_nowait` write | `PlaybackFull{needed_ms, free_ms}` | `PlaybackFull` (nothing consumed) |
 | `listen_*` with `receive=False` | `ReceiveDisabled` | `ReceiveDisabled` |
-| Bad format, invalid base64, non-contiguous buffer, buffer format code that does not match the stream encoding (e.g. float32 into pcm16le, big-endian `'>i2'`), wrong Opus frame size, bad tag | `InvalidAudio(msg)` | `InvalidAudio` (also a `ValueError`) |
-| Range or cap violation, including `silence(ms)`, `seek(seconds)` (negative, NaN, infinite, > 86 400 s), a base64 write over the buffer cap, `prebuffer_ms`/`max_gap_ms` > `max_buffer_ms/2`, > 32 playing tracks, > 10 000 queue entries | `Limit(LimitError)` | `LimitExceeded(what, value, minimum, maximum)` (also a `ValueError`; `value`/bounds are `int` or `float`) |
+| Bad format, non-contiguous buffer, buffer format code that does not match the stream encoding (e.g. float32 into pcm16le, big-endian `'>i2'`), wrong Opus frame size, bad tag | `InvalidAudio(msg)` | `InvalidAudio` (also a `ValueError`) |
+| Range or cap violation, including `silence(ms)`, `seek(seconds)` (negative, NaN, infinite, > 86 400 s), a write over the buffer cap, `prebuffer_ms`/`max_gap_ms` > `max_buffer_ms/2`, > 32 playing tracks, > 10 000 queue entries | `Limit(LimitError)` | `LimitExceeded(what, value, minimum, maximum)` (also a `ValueError`; `value`/bounds are `int` or `float`) |
 | `try_reserve` failure | `Alloc` | `MemoryError` |
 | Unrecognised encoded data, missing file | `Source(msg)` | `SourceError`, or `OSError` from `io::Error` for `from_path` |
 | songbird `ControlError`; seek/loops on live sources; `seek`/`info` on a not-yet-started queue entry | `Track(msg)` | `TrackError` |
@@ -2360,11 +2418,11 @@ Ownership is disjoint by file. Each workstream writes Rust unit tests in its own
 
 | WS | Scope | Files |
 |---|---|---|
-| **W1** Foundations | workspace, runtime, wake, logging, limits, errors, formats, DSP, binding glue, stubs, invariant script | `Cargo.toml`, `build.rs`, `.cargo/config.toml`, `crates/sbcore/Cargo.toml`, `crates/sbcore/src/{lib,limits,error,runtime,sync,clock,wake,log,format}.rs`, `crates/sbcore/src/dsp/{mod,resample,stream_resample,limiter,g711,mix,level,b64}.rs`, `src/lib.rs`, `src/errors.rs`, `src/convert.rs`, `src/logging.rs`, `src/py/format.rs`, `src/bin/stub_gen.rs`, `scripts/check_invariants.py` |
+| **W1** Foundations | workspace, runtime, wake, logging, limits, errors, formats, DSP, binding glue, stubs, invariant script | `Cargo.toml`, `build.rs`, `.cargo/config.toml`, `crates/sbcore/Cargo.toml`, `crates/sbcore/src/{lib,limits,error,runtime,sync,clock,wake,log,format}.rs`, `crates/sbcore/src/dsp/{mod,resample,stream_resample,limiter,g711,mix,level}.rs`, `src/lib.rs`, `src/errors.rs`, `src/convert.rs`, `src/logging.rs`, `src/py/format.rs`, `src/bin/stub_gen.rs`, `scripts/check_invariants.py` |
 | **W2** Connection & control | settings, state machine, Driver ownership, Dispatch, ConnWorker loop, ops, events, control queue, tracks and queue | `crates/sbcore/src/{events,ctrl}.rs`, `crates/sbcore/src/conn/{mod,settings,shared,gateway,driver,dispatch,worker,ops,registry}.rs`, `crates/sbcore/src/tracks/{mod,flags,registry,queue}.rs`, `src/py/connection.rs`, `src/py/events.rs`, `src/py/tracks.rs` |
 | **W3** Receive | ingestion, extraction, decoding, speaking, buses, converters, lanes, subscriptions, router, chunks, Arrow export | `crates/sbcore/src/rx/{mod,raw,opus,decoder,speaking,bus,convert,lane,queue,router,chunk,pipeline}.rs`, `src/py/receive.rs`, `src/py/chunk.rs`, `src/py/arrow.rs` |
 | **W4** Send | PcmQueue engine, mixer reader/decoder, housekeeper, encoded/Opus streams, memory sources | `crates/sbcore/src/tx/{mod,queue,writer,anchor,tags,reader,decoder,housekeep,probe,encoded,opus_stream,memory,source}.rs`, `src/py/playback.rs`, `src/py/sources.rs` |
-| **W5** Python layer, tests, CI, docs | package, pump, log thread, test harness, examples, docs, workflows, packaging | `crates/sbcore/src/testing/{mod,harness,rtp,mixer}.rs` (feature `test-hooks`), `src/py/testing.rs`, `py-src/discord/ext/songbird/{__init__,client,_pump,_log,config,formats,streams,playback,tracks,errors}.py`, `tests/**`, `examples/{gpt_live,openai_realtime,gemini_live,record,music}.py`, `docs/{index,send,receive,migration}.md`, `README.md`, `AGENTS.md`, `justfile`, `pyproject.toml`, `.github/workflows/{ci,release}.yml`, `scripts/smoke.py` |
+| **W5** Python layer, tests, CI, docs | package, pump, log thread, test harness, examples, docs, workflows, packaging | `crates/sbcore/src/testing/{mod,harness,rtp,mixer}.rs` (feature `test-hooks`), `src/py/testing.rs`, `py-src/discord/ext/songbird/{__init__,client,_pump,_log,config,formats,streams,playback,tracks,errors}.py`, `tests/**`, `examples/{echo,websocket_bridge,record,music}.py`, `docs/{index,send,receive,migration}.md`, `README.md`, `AGENTS.md`, `justfile`, `pyproject.toml`, `.github/workflows/{ci,release}.yml`, `scripts/smoke.py` |
 
 `py-src/discord/ext/songbird/native/__init__.pyi` is generated by `cargo run --bin stub_gen` and is never edited by hand. stub_gen writes only the flat `native` module.
 
@@ -2541,7 +2599,6 @@ pub mod mix { pub fn i16_to_f32(src: &[i16], dst: &mut [f32]); pub fn f32_to_i16
 #[derive(Clone, Copy, Default, Debug)] pub struct Level { pub rms_dbfs: f32, pub peak: f32 }
 pub fn measure(samples: &[f32]) -> Level;
 pub fn encode_from_f32(fmt: Format, src: &[f32], dst: &mut [u8]);     // dst.len() == src.len() * fmt.sample_width()
-pub mod b64 { pub fn encode_into(src: &[u8], out: &mut String); pub fn decode_into(src: &[u8], out: &mut Vec<u8>) -> Result<(), CoreError>; }
 ```
 
 ### 12.3 W2 contracts (events, ctrl, conn, tracks)
@@ -2890,8 +2947,8 @@ pub trait PcmProvider: Send + Sync + 'static {
 pub struct PlaybackSpec { pub format: Format, pub max_buffer_ms: u32, pub prebuffer_ms: u32, pub idle_ms: u32,
     pub auto_pause: bool, pub max_gap_ms: u32, pub output_latency_ms: u32, pub volume: f32, pub when_disconnected: DisconnectPolicy }
 impl PlaybackSpec { pub fn validate(&self) -> Result<(), CoreError>; }   // ranges + prebuffer_ms, max_gap_ms ≤ max_buffer_ms/2
-pub enum WriteData<'a> { Pcm(&'a [u8]), Base64(&'a [u8]) }
-pub struct WriteMeta<'a> { pub tag: Option<&'a str>, pub at_ms: Option<i64> }
+pub struct WriteMeta<'a> { pub tag: Option<&'a str>, pub at_ms: Option<i64> }   // segment tag, source-timeline ms
+// PcmQueue::write(&self, data: &[u8], meta: WriteMeta) -> Result<WriteOutcome, CoreError>   (raw bytes only)
 pub enum WriteOutcome { Accepted { frames: u64, gap_frames: u64 }, Rejected { frames: u64 } }
 pub struct ClearOpts { pub reject_late: bool, pub hold_ms: u32, pub reject_until_gap_ms: Option<u32> }
 pub struct ItemProgressData { pub tag: Arc<str>, pub written_ms: u64, pub played_ms: u64, pub heard_ms: u64, pub complete: bool }
@@ -2977,14 +3034,14 @@ impl Housekeeper { pub fn new() -> Self; pub fn add(&mut self, s: Weak<dyn LiveS
 |---|---|---|
 | `VERSION`, `WAKE_CONN`, `WAKE_OPS`, `WAKE_CTRL`, `WAKE_TRACKS` | W1 | constants |
 | `supported_codecs()`, `configure_runtime(net_workers, rx_workers)`, `set_log_level(prefix, level)`, `_log_wait(max, timeout_s) -> list[tuple[int, str, str, float]]`, `_log_dropped() -> int`, `_shutdown_all()`, `_disable_after_fork()`, `_debug_live_counts() -> dict[str, int]` | W1 | module functions |
-| `AudioFormat` | W1 | §9.2 (native part: ctor, `parse`, properties, `silence`, `silence_base64`, `openai_format`) |
+| `AudioFormat` | W1 | §9.2 (native part: ctor, `parse`, properties, `mime_type`, `bytes_for`, `ms_for`, `silence`) |
 | `WakeBell(fd: int)` | W1 | adopts the fd; `taken: bool` |
 | `VoiceSettings(**fields)` | W2 | validated settings (`VoiceConfig.to_native()`) |
 | `Connection(bell: WakeBell, guild_id: int, user_id: int, settings: VoiceSettings, reconnect: bool)` | W2 | `request_join(channel_id, self_mute, self_deaf)`, `request_move(channel_id)`, `begin_rejoin()`, `request_leave()`, `on_voice_state(session_id, channel_id \| None)`, `on_voice_server(token, endpoint \| None)`, `set_self_flags(mute, deaf)`, `status() -> ConnectionStatus`, `timeline_ms`, `take_ready() -> list[int]`, `take_controls() -> list[Control]`, `take_unclassified_users() -> list[int]`, `set_users_bot(list[tuple[int, bool]])`, `subscribe_user(uid, fmt, chunk_ms, max_queue_ms, overflow) -> ReceiveSubscription`, `subscribe_mixed(fmt, chunk_ms, max_queue_ms, overflow, include, exclude, ignore_bots, policy, floor_release_ms)`, `subscribe_router(...) -> RouterSubscription`, `subscribe_events(max_queue, kind_mask) -> EventSubscription`, `open_playback(...) -> Playback`, `open_encoded(...) -> EncodedSink`, `open_opus(...) -> OpusSink`, `play(source, volume, loops, paused) -> NativeTrack`, `enqueue(source, volume, loops, paused) -> NativeTrack`, `enqueue_stream(volume, loops, paused, max_buffer_bytes) -> NativeTrack`, `queue_take_stream(track) -> EncodedSink \| None`, `queue_current()`, `queue_snapshot()`, `queue_skip()`, `queue_stop()`, `queue_pause()`, `queue_resume()`, `queue_clear()`, `queue_dequeue(i)`, `queue_len()`, `stop_all()`, `set_bitrate(bps \| None)`, `start_track_info(track, timeout_ms) -> int`, `start_track_seek(track, seconds, timeout_ms) -> int`, `take_op_results() -> list[tuple[int, TrackInfo \| float \| BaseException]]`, `close(reason: str)`, `closed`, `stats() -> dict[str, int]` |
 | `ConnectionStatus`, `Control` (complex enum), `VoiceEvent` (complex enum, `gen_stub_pyclass_complex_enum`), `EventSubscription` (`try_recv`, `read_nowait`, `wake_id`, `dropped`, `close`) | W2 | |
 | `NativeTrack` (`id`, `uuid`, `kind`, `ended`, `end_reason`, `end_error`, `pending`, `pause`, `resume`, `stop`, `set_volume`, `set_loops` (pending entries update their stored `PlayOpts`), `__eq__`, `__hash__`), `TrackInfo` | W2 | |
 | `ReceiveSubscription` (`try_recv`, `read_nowait`, `wake_id`, `skip_to_live(reset_clock)`, `origin_timeline_ms`, `set_filter`, `stats`, `close`, `closed`, `close_reason`, `read_batch`), `RouterSubscription` (`try_next`, `wake_id`, `dropped`, `close(close_streams)`), `AudioChunk`, `StreamStats`, `ChunkBatch` | W3 | |
-| `Playback` (`write(data, tag, at_ms)`, `write_base64(data, tag, at_ms)`, `arm_space(nbytes) -> bool`, `arm_drain()`, `arm_idle()`, `arm_end()`, `clear(reject_late, hold_ms, reject_until_gap_ms)`, `end_item(tag)`, `item(tag)`, `pause()`, `resume()`, `volume`, position properties, `stats()`, `close(drain: bool)`, `closed`, `wake_id`, `playback_id`, `track`), `EncodedSink`, `OpusSink`, `ClearResult`, `ItemProgress`, `PlaybackStats`, `AudioFile` (incl. `from_arrow`), `RawPcm` (incl. `from_arrow`, `from_samples`), `OpusPackets` | W4 | |
+| `Playback` (`write(data, tag, at_ms)` (raw buffer; `str` → `TypeError`), `arm_space(nbytes) -> bool`, `arm_drain()`, `arm_idle()`, `arm_end()`, `clear(reject_late, hold_ms, reject_until_gap_ms)`, `end_item(tag)`, `item(tag)`, `pause()`, `resume()`, `volume`, position properties, `stats()`, `close(drain: bool)`, `closed`, `wake_id`, `playback_id`, `track`), `EncodedSink`, `OpusSink`, `ClearResult`, `ItemProgress`, `PlaybackStats`, `AudioFile` (incl. `from_arrow`), `RawPcm` (incl. `from_arrow`, `from_samples`), `OpusPackets` | W4 | |
 | `_testing` (feature `test-hooks`): `detached_connection(guild_id, user_id, settings) -> (Connection, Harness)`, `Harness.step(advance_ms)`, `inject_tick(conn, voices: list[tuple[int, bytes \| None]], silent: list[int])`, `inject_map(conn, ssrc, user_id)`, `inject_user_left(conn, user_id)`, `inject_driver_event(conn, kind, reason, code)`, `inject_voice_tick_rtp(conn, list[tuple[int, bytes]])` (full RTP path), `encode_opus(pcm48_stereo: bytes) -> list[bytes]`, `rtp_wrap(opus, seq, ssrc, *, extension=False, padding=0, dave_trailer=False) -> bytes`, `MixerHarness(playback).pull(ticks) -> bytes` (owns the detached reader/decoder; reproduces songbird's `next_packet` → `decode` order and asserts 960 frames), `track_log(track) -> list[str]` (the `FakeTrackControl` call log), `alloc_count() -> int` (allocations **on the calling thread** while the counting guard is active) | W5 | |
 
 **Stubs.** pyo3-stub-gen 0.23.1 rules:
@@ -3001,9 +3058,9 @@ impl Housekeeper { pub fn new() -> Self; pub fn add(&mut self, s: Weak<dyn LiveS
 
 | Phase | Work | Exit criterion |
 |---|---|---|
-| **0** (days 1–2) | **W1:** workspace and both `Cargo.toml`s; `limits`, `error`, `runtime`, `sync`, `clock`, `wake`, `log`, `format` **types**; empty `#[pymodule(gil_used = false)]`; `check_invariants.py`; CI skeleton. **W2–W4:** commit every §12.3–12.5 signature with bodies returning `CoreError::Internal("unimplemented")`. `todo!()` is denied. **W5:** verify the §6 discord.py line references against **2.7.1 from PyPI** (`uv pip download discord.py==2.7.1`), pin `discord.py>=2.7.1,<3`, bump maturin to 1.15.0, write the pure-Python fake of the native contract (`tests/fakes/native_fake.py`), and re-check the GPT-Live / OpenAI Realtime / Gemini Live message names used in §9.11–§9.13. **W1:** `git rm -r py-src/discord/ext/songbird/native/{error,model,player,receive}` (stale 0.5 stub subpackages). | `cargo check --workspace` and `maturin develop` pass; contracts frozen. |
-| **1** (weeks 1–2, parallel) | **W1:** doorbell (Unix and Windows), log ring and `_log_wait`, `TickResampler`/`StreamResampler`/`Limiter`/`g711`/`b64`/`PcmParser`, buffer conversion, stub_gen. **W2:** `gateway.rs` (pure, table tests first), then `driver`/`dispatch`/`worker`/`shared`, `events`/`ctrl`, `tracks`. **W3:** `opus`/`decoder`/`speaking`, then `bus`/`convert`/`lane`/`queue`/`router`, then `pipeline`, then pyclasses. **W4:** `queue`/`writer`/`anchor`/`tags` (pure tests), then `reader`/`decoder`/`probe`, then `memory`/`source`/`opus_stream`/`encoded`, then `housekeep`, then pyclasses. **W5:** Python layer against the fake; `_pump`, `_log`, client; fake discord.py objects; examples. | Every module's unit tests are green; `cargo test -p sbcore` needs no libpython. |
-| **2** (week 3) | Integration: W2 wires W3/W4 into `ConnShared`. W5 swaps the fake for the real module built with `--features test-hooks` and runs the full pytest suite on cp314 and cp314t (Linux, macOS; Windows for `test_wake.py`/`test_receive.py`). Live smoke test against a real guild (`DISCORD_BOT_TOKEN`, `CHANNEL_ID`). | All automated tests green; manual GPT-Live and recording runs pass. |
+| **0** (days 1–2) | **W1:** workspace and both `Cargo.toml`s; `limits`, `error`, `runtime`, `sync`, `clock`, `wake`, `log`, `format` **types**; empty `#[pymodule(gil_used = false)]`; `check_invariants.py`; CI skeleton. **W2–W4:** commit every §12.3–12.5 signature with bodies returning `CoreError::Internal("unimplemented")`. `todo!()` is denied. **W5:** verify the §6 discord.py line references against **2.7.1 from PyPI** (`uv pip download discord.py==2.7.1`), pin `discord.py>=2.7.1,<3`, bump maturin to 1.15.0, write the pure-Python fake of the native contract (`tests/fakes/native_fake.py`). **W1:** `git rm -r py-src/discord/ext/songbird/native/{error,model,player,receive}` (stale 0.5 stub subpackages). | `cargo check --workspace` and `maturin develop` pass; contracts frozen. |
+| **1** (weeks 1–2, parallel) | **W1:** doorbell (Unix and Windows), log ring and `_log_wait`, `TickResampler`/`StreamResampler`/`Limiter`/`g711`/`PcmParser`, buffer conversion, stub_gen. **W2:** `gateway.rs` (pure, table tests first), then `driver`/`dispatch`/`worker`/`shared`, `events`/`ctrl`, `tracks`. **W3:** `opus`/`decoder`/`speaking`, then `bus`/`convert`/`lane`/`queue`/`router`, then `pipeline`, then pyclasses. **W4:** `queue`/`writer`/`anchor`/`tags` (pure tests), then `reader`/`decoder`/`probe`, then `memory`/`source`/`opus_stream`/`encoded`, then `housekeep`, then pyclasses. **W5:** Python layer against the fake; `_pump`, `_log`, client; fake discord.py objects; examples. | Every module's unit tests are green; `cargo test -p sbcore` needs no libpython. |
+| **2** (week 3) | Integration: W2 wires W3/W4 into `ConnShared`. W5 swaps the fake for the real module built with `--features test-hooks` and runs the full pytest suite on cp314 and cp314t (Linux, macOS; Windows for `test_wake.py`/`test_receive.py`). Live smoke test against a real guild (`DISCORD_BOT_TOKEN`, `CHANNEL_ID`). | All automated tests green; manual echo, bridge and recording runs pass. |
 | **3** (week 4) | Hardening: one-hour Rust soak, 100× connect/disconnect leak loop with every `_debug_live_counts()` entry (our `LiveCounter`s, including `Dispatch` and the `SongbirdInput` sentinel, plus `songbird_live_tasks`) back at baseline, free-threading stress, `scripts/smoke.py` in release.yml, stub drift check, docs/migration guide, README/AGENTS.md rewrite. | Release candidate 0.6.0. |
 
 ---
@@ -3035,7 +3092,7 @@ These run in `crates/sbcore` with `cargo test -p sbcore --all-features`. There i
 | `conn::gateway` | Table-driven: every row of §4.5, **plus an enumeration of every phase × input pair** asserting that each pair not in the table yields no actions and no phase change. Both update orders; `endpoint=None`; 3 s server fallback; `Move` from Connected, Joining and Connecting; a 4014 `DriverDisconnect` arriving in Joining (old WS after a move) and in Rejoining changes no phase; `VoiceServer` change while Connecting → gen+1; 4014 followed by a move / a kick / grace expiry (with and without reconnect); 4006 rejoin up to the limit; 4016/4017 close without rejoin; `DriverDisconnect{Reconnect}` while Connected; stale `ConnectResult` ignored; `BeginRejoin` and AwaitingRejoin → Rejoining clear `server`, and a `VoiceState` alone in Rejoining issues no `Connect`; Rejoining ignores `VoiceState(None)`; `SetFlags` in every open phase; `Leave` + `VoiceState(None)` → Requested; RxStalled → `ReinstallDispatch` rate-limited, rejoin at 5 s. |
 | `conn::shared` / `driver` (tokio, real Driver, no network) | `ConnShared::new` → play a live track (parked mixer) → `close()`. Then `live_counts()` for `Dispatch` (proves the events task exited on Poison), `SongbirdInput`/`LiveReader`/`DoneGuard` (prove mixer-side track teardown), `ConnWorker` and `PcmQueue` reach 0 within `driver_timeout + 1 s`, and `scheduler().live_tasks()` returns to baseline. `total_tasks()` is **not** asserted (§11.3). `close` is idempotent, safe from 8 threads concurrently and from a non-runtime thread. **T6 is synchronous:** right after `close()` returns, every `SubQueue`/router/`EventQueue` is closed, and `Disconnected{will_retry:false}` is the last event, even while the RX runtime is blocked by a test barrier. **Self-deadlock regression:** a terminal transition triggered inside `Dispatch::act` and inside a Python-thread call completes (5 s watchdog). **Apply ordering:** 3 threads × 10⁴ interleaved `apply()` calls; the `Connect` generations reaching the driver and the `RxLink` values reaching the worker are monotonic and end at the final state. `build_config` never yields `retry_limit: None` and sets `preallocated_tracks(48)`. A heartbeat gap > 3 s triggers one rate-limited `ReinstallDispatch` with `receive=false`. |
 | `tracks` | **Priority resolution:** a `DoneGuard` drop followed within 2 ticks by `End(PlayMode::End)` → `finished`, by `Errored` → `error`, by `End(Stop)` → `stopped`; a drop with no event → `stopped` after the grace period (or `finished` with `EOF_SEEN`, `error` with `DECODE_ERROR`, `disconnected` while closing); T8 resolves leftovers as `disconnected`. The queue passes only the current entry to songbird; index 0 is the first pending entry; `__getitem__`/`dequeue` bounds; pending-entry `PendingChange`s apply when the entry starts; `seek`/`info` on a pending entry → `Track`; `stop()` = clear + skip; the 10 001st entry → `Limit`; a lazy `Encoded` entry spawns no thread until current; the 33rd playing track → `Limit`. |
-| `tx::queue`/`writer`/`anchor`/`tags` (manual clock) | All-or-nothing `PlaybackFull` (carry restored); `space_wanted ≤ cap`. Odd and partial-frame writes. Base64 errors consume nothing; a base64 string whose `len·3/4` exceeds the cap → `Limit` **before** decoding (counting allocator: no allocation). Two threads writing one stream: carry snapshot retry, no torn frame. `clear()` and `close()` complete while another thread is inside a 4 MiB write's parse (they never take L6w). **Gap-fill regression:** 1000 ms played, then 250 ms idle with auto-pause, then a delta at `at_ms = 2500` arriving at wall `t0 + 2500` inserts ≤ 20 ms; the same delta arriving at `t0 + 1100` inserts 1400 ± 20 ms. Late writes append and re-anchor and never trim. Beyond `max_gap` re-anchors; `gap + frames > cap` re-anchors instead of raising; `i64::MIN`/`i64::MAX` `at_ms` never panic. Gap silence excluded from tag `written`. `PlaybackSpec::validate` rejects `prebuffer_ms` or `max_gap_ms` > `max_buffer_ms/2`. **Prebuffer gate:** opens at `prebuffer_frames`; a reply shorter than `prebuffer_ms` plays after `prebuffer_ticks`; `drain()`/`end_item()` open it at once. **`clear()`:** capacity freed immediately with no pull in between (parked); **an underrun mid-item (≥ 1 tick with an empty queue, tag still open) still yields that item in `items`, and its late deltas are rejected**; tags close at Active → Idle, so a later clear does not report them; `end_item` → `complete` once played; `played ≤ written`; `reject_late`; `reject_until_gap_ms` rejects contiguous timed deltas and accepts the first one after the gap; `hold_ms`; generation bump drops the carry. **Tag overflow:** the 257th tag evicts the oldest closed tag, else the least-recently-written open one, counted in `tags_evicted`. **heard_ms:** after the last pull and an idle-pause, `heard_ms` and `item().heard_ms` reach `played_ms` once `output_latency_ms` of wall time has passed. `when_disconnected="discard"`. |
+| `tx::queue`/`writer`/`anchor`/`tags` (manual clock) | All-or-nothing `PlaybackFull` (carry restored); `space_wanted ≤ cap`. Odd and partial-frame writes. A rejected write consumes nothing (the carry is kept); a write longer than the cap → `Limit` **before** parsing (counting allocator: no allocation). Two threads writing one stream: carry snapshot retry, no torn frame. `clear()` and `close()` complete while another thread is inside a 4 MiB write's parse (they never take L6w). **Gap-fill regression:** 1000 ms played, then 250 ms idle with auto-pause, then a write at `at_ms = 2500` arriving at wall `t0 + 2500` inserts ≤ 20 ms; the same write arriving at `t0 + 1100` inserts 1400 ± 20 ms. Late writes append and re-anchor and never trim. Beyond `max_gap` re-anchors; `gap + frames > cap` re-anchors instead of raising; `i64::MIN`/`i64::MAX` `at_ms` never panic. Gap silence excluded from tag `written`. `PlaybackSpec::validate` rejects `prebuffer_ms` or `max_gap_ms` > `max_buffer_ms/2`. **Prebuffer gate:** opens at `prebuffer_frames`; a segment shorter than `prebuffer_ms` plays after `prebuffer_ticks`; `drain()`/`end_item()` open it at once. **`clear()`:** capacity freed immediately with no pull in between (parked); **an underrun mid-segment (≥ 1 tick with an empty queue, tag still open) still yields that tag in `items`, and its late writes are rejected**; tags close at Active → Idle, so a later clear does not report them; `end_item` → `complete` once played; `played ≤ written`; `reject_late`; `reject_until_gap_ms` rejects contiguous timed writes and accepts the first one after the gap; `hold_ms`; generation bump drops the carry. **Tag overflow:** the 257th tag evicts the oldest closed tag, else the least-recently-written open one, counted in `tags_evicted`. **heard_ms:** after the last pull and an idle-pause, `heard_ms` and `item().heard_ms` reach `played_ms` once `output_latency_ms` of wall time has passed. `when_disconnected="discard"`. |
 | `tx::reader`/`decoder` (MixerHarness: `next_packet` → `decode` in songbird's order) | Always 960 frames at 48 kHz for every input rate and channel count; the packet buffer is empty; **zero allocations per pull** (per-thread counting guard); underrun gives zeros and counts; a held L6 gives silence and `contended += 1`; **`send_muted` holds the position** (nothing consumed, `played_ms` unchanged); EOF only after Drain+empty or Abort; prebuffer gate; 2.5 ms declick after clear; 5 ms volume ramp; a panic inside `pull` gives silence then EOF (no unwind); `Drop` sets `reader_gone`; the reader's `into_inner` returns its probe's MSS; `Role` debug assertion fires if `lock_checked` is called on the mixer. |
 | `tx::opus_stream`/`memory`/`encoded`/`source` | Silent-frame reserve used on underrun (no allocation while the reserve is non-empty); an Opus stream idle for `idle_ms` pauses its track; packet validation; seek by index; `MemPcm` seek resets the resampler; `MemPcm::from_any_rate` at 44.1 kHz/22.05 kHz/192 kHz gives the expected 48 kHz length and a 1 kHz tone within 0.2 dB; a WAV pushed in random-sized pieces decodes; the encoded track stays paused until its first decoded frame; the decode thread exits on `close()` mid-stream; the 17th encoded stream gets `LimitExceeded`; `EncodedBytes` probe errors. |
 
@@ -3055,16 +3112,16 @@ These use pytest 9.1.1 with pytest-asyncio 1.4.1 (`asyncio_mode = "auto"`) and r
 | File | Covers |
 |---|---|
 | `tests/conftest.py` | `FakeClient` (`user.id`), `FakeGuild` (`change_voice_state` records every op 4; `get_member`, `get_channel`), `FakeChannel` (`members`, `_get_voice_client_key`). A `connected_vc` fixture drives the voice hooks against a detached connection and injects `DriverConnect`. |
-| `test_formats.py` | Validation, `parse`, presets, `bytes_per_ms`, `silence`, `silence_base64` (600 000 ms accepted, 600 001 → `LimitExceeded`), `mime_type`, `openai_format`, eq/hash. |
+| `test_formats.py` | Validation, `parse`, the neutral presets (exactly the exported set), `bytes_per_ms`, `silence` (600 000 ms accepted, 600 001 → `LimitExceeded`), `mime_type` (incl. stereo), eq/hash; every `listen*` method and `open_playback` default to `PCM16_48K_STEREO`. |
 | `test_connect.py` | **Exactly one op 4 carrying `self_mute`/`self_deaf`, and none before it.** On a directly constructed client, `set_self_mute(True)` before `connect(self_mute=False)` sends nothing and the join op 4 carries `self_mute=True` (explicit wins). `set_self_mute` during `connecting` sends nothing until `connected`, then exactly one op 4 with the new flags. Timeout → `ConnectTimeout` (`reason == "timeout"`, `timeout` set), `isinstance(e, asyncio.TimeoutError)`, client unregistered, best-effort leave sent; a second `channel.connect()` does not raise "Already connected". **Timeout → immediate reconnect: the recorded op 4 order is `None` (the stale leave) then the new join**, even when the fake gateway delays the leave by 1 s. `disconnect()` during `connect()` → `ConnectFailed("requested")` and only one leave op 4. **Cancellation** of `connect()` gives the same cleanup. `ConnectFailed` on terminal failure. `disconnect()` is idempotent and calls `cleanup()` even when op 4 raises. `move_to` waits for the new channel. Kick (`VoiceState(None)`) → `cleanup()` + `Disconnected`. A 4014 then a move keeps the connection. `Control.Rejoin` sends op 4 `None` then op 4 `(channel, flags)`. `reconnect()`. `user_id == client.user.id`. |
-| `test_receive.py` | N injected ticks give exactly N × 20 / `chunk_ms` chunks, including silence; exact byte lengths for every format; `speaking`/`speakers`/`dropped_ms`/`gap_ms`/`timeline_ms`; synthesis while no ticks arrive (manual clock); `skip_to_live` (with `reset_clock=True` the next chunk has `start_ms == seq == 0`; `origin_timeline_ms` follows); `overflow="error"` makes `async for` raise `StreamOverflow` once after the queued chunks; `set_include` at runtime without a gap; floor policy; `UserStreams` yields and ends on `UserLeft`; `memoryview(c).format == "h"`; `np.shares_memory(np.frombuffer(c, "<i2"), memoryview(c))`; `to_base64() == base64.b64encode(bytes(c)).decode()`; a chunk export outlives `stream.close()`; Arrow capsules round-trip through pyarrow 26 and arro3 0.9.1. |
+| `test_receive.py` | N injected ticks give exactly N × 20 / `chunk_ms` chunks, including silence; exact byte lengths for every format; `speaking`/`speakers`/`dropped_ms`/`gap_ms`/`timeline_ms`; synthesis while no ticks arrive (manual clock); `skip_to_live` (with `reset_clock=True` the next chunk has `start_ms == seq == 0`; `origin_timeline_ms` follows); `overflow="error"` makes `async for` raise `StreamOverflow` once after the queued chunks; `set_include` at runtime without a gap; floor policy; `UserStreams` yields and ends on `UserLeft`; `memoryview(c).format == "h"`; `np.shares_memory(np.frombuffer(c, "<i2"), memoryview(c))`; `bytes(c) == c.to_bytes()`; the default format is Discord's native 48 kHz stereo PCM16 (`listen()`, `listen_user()`, `listen_mixed()`, `listen_users()`; 3840-byte 20 ms chunks); a chunk export outlives `stream.close()`; Arrow capsules round-trip through pyarrow 26 and arro3 0.9.1. |
 | `test_cancellation.py` | 10 000 × `asyncio.wait_for(anext(stream), tiny)` interleaved with injections: every chunk is received exactly once (by `seq`). The same for `await playback.write()` under `TaskGroup` cancellation, which never writes partially. |
-| `test_playback.py` | **An opened but unwritten playback produces no pulls** (`track_log` shows it created paused, nothing else) **and the first write resumes it within one tick.** `write`/`write_nowait`/`write_base64(_nowait)`/`str` input; odd byte counts; `PlaybackFull` then `await write()` completes as the harness pulls; `clear()` within one pulled tick; `ClearResult.items[*].heard_ms ≤ written_ms`; an item that underran mid-stream is still in `items` and its late deltas are rejected; `end_item` → `complete`; `reject_late`; `reject_until_gap_ms` with GPT-Live-style contiguous `at_ms` deltas; `hold_ms`; GPT-Live-style `at_ms` gap fill including the idle-pause regression with the manual clock; `prebuffer_ms` with a reply shorter than the prebuffer; `set_self_mute(True)` holds `played_ms` and `drain()` waits; `drain()`; `wait_idle()`; `aclose(drain=True)`; `PlaybackStarted`/`PlaybackIdle` events; writes after close raise `StreamClosed`; bytearray/memoryview/numpy int16/`array('h')` accepted for pcm16le; **numpy float32, `array('f')` and `'>i2'` buffers into pcm16le raise `InvalidAudio`**; float32 accepted for f32le. |
+| `test_playback.py` | **An opened but unwritten playback produces no pulls** (`track_log` shows it created paused, nothing else) **and the first write resumes it within one tick.** `open_playback()` defaults to `PCM16_48K_STEREO` (stereo mixer output); `write`/`write_nowait` with bytes/bytearray/memoryview; a `str` raises `TypeError` and consumes nothing; odd byte counts; `PlaybackFull` then `await write()` completes as the harness pulls; `clear()` within one pulled tick; `ClearResult.items[*].heard_ms ≤ written_ms`; a tag that underran mid-stream is still in `items` and its late writes are rejected; `end_item` → `complete`; `reject_late`; `reject_until_gap_ms` with contiguous timed (`at_ms`) writes; `hold_ms`; `at_ms` gap fill including the idle-pause regression with the manual clock; `prebuffer_ms` with a segment shorter than the prebuffer; `set_self_mute(True)` holds `played_ms` and `drain()` waits; `drain()`; `wait_idle()`; `aclose(drain=True)`; `PlaybackStarted`/`PlaybackIdle` events; writes after close raise `StreamClosed`; bytearray/memoryview/numpy int16/`array('h')` accepted for pcm16le; **numpy float32, `array('f')` and `'>i2'` buffers into pcm16le raise `InvalidAudio`**; float32 accepted for f32le. |
 | `test_sources.py` | `AudioFile` (WAV fixture; probe metadata; `SourceError` on garbage; `from_path` missing → `OSError`; `load`; `from_arrow` with `pa.array(wav, pa.uint8())` and a one-value `pa.binary()` array); `RawPcm`; `RawPcm.from_samples` at 44 100 Hz stereo float32 (0.5 `RawPCMInput` parity) and from an Arrow Float32 array; `OpusPackets` validation (a 480-sample packet is rejected); `TrackHandle.wait_ended()` resolves after `stop()`, after `stop_all()`, after `Connection.close()` (`disconnected`), and after a 2 s loop stall with 2 000 tracks ending (level-triggered); `seek(-1)`/`seek(nan)`/`seek(inf)` → `LimitExceeded`; `TrackQueue` advance, skip, `stop()`, index 0 = first pending entry, `IndexError`; `enqueue(loops=, paused=)`; `set_volume`/`set_loops`/`pause` on a pending entry apply when it starts; `enqueue_stream(async_gen)` is fed only once current. |
 | `test_events.py` | Kind filter; `Lagged` after overflow; `match VoiceEvent.SpeakingStarted(user_id=u)`; `Disconnected(will_retry=False)` is last. |
 | `test_wake.py` | Doorbell end to end on the running loop. **Runs on Windows with the Proactor loop in CI.** A failing `Connection(...)` after `WakeBell` closes the fd exactly once (fd count is checked). |
 | `test_logging.py` | Records from a Rust thread reach `logging` with **no connection open**; the `songbird-log` thread exits at `_shutdown_all`; the token never appears in captured logs. |
-| `test_examples.py` | Imports every example (each guards `bot.run` with `if __name__ == "__main__":`, so importing neither raises `KeyError` nor starts a bot). Runs `record.record()` against a detached connection, and checks that it returns when the connection closes without `!stop`. Runs `gpt_live_bridge(vc, None, url=fake.url, api_key="test")` against a local fake WebSocket server (websockets 17.3). The fake sends **no** handshake ack, then deltas with `start_ms` gaps and an `error`-free normal close. The test asserts continuous 40 ms appends upstream starting right after `session.start`, gap-filled playback downstream, a local barge-in that drops only the contiguous rest of the utterance, and a clean return (no `ExceptionGroup`) when the server closes. Runs the OpenAI Realtime example against the same fake in Realtime mode (truncate per open item). `gemini_live.py` is imported and type-checked only. |
+| `test_examples.py` | Imports every example (each guards `bot.run` with `if __name__ == "__main__":`, so importing neither raises `KeyError` nor starts a bot). Runs `record.record()` against a detached connection, and checks that it returns when the connection closes without `!stop`. Runs `echo.echo()` against a detached connection: only voiced chunks are written back (the silence fill is not), the playback uses the default `PCM16_48K_STEREO`, it plays through `MixerHarness`, and `echo()` returns on `!stop` and when the connection closes. Runs `websocket_bridge.bridge(vc, url, input_format=PCM16_16K)` against a local fake **binary echo** WebSocket server (websockets 17.3): every upstream frame is one binary chunk of exactly `bytes_for(chunk_ms)` bytes and no text frame is sent; echoed frames are written to the playback; the server's `"clear"` text frame clears it (`clears == 1`, `discarded_ms > 0`) and later frames still play; the bridge returns `"websocket_closed"` when the server closes and `"stopped"` when its `stop` event is set. |
 
 ### 13.4 Leak tests (`tests/test_leaks.py`)
 
@@ -3086,9 +3143,9 @@ These use pytest 9.1.1 with pytest-asyncio 1.4.1 (`asyncio_mode = "auto"`) and r
 
 - **`test_bounds.py`.** Each case runs **in a subprocess**, and the test asserts the exit code is 0, never 134:
   - `max_queue_ms=10**15`, `max_buffer_ms=10**12`, `chunk_ms=0`/`1001`, `max_packets=10**9`, `max_buffer_bytes=2**62`, `max_decoded_users=10**9`;
-  - `PCM16_48K.silence(10**12)`, `F32_48K_STEREO.silence_base64(10**10)`, `silence(-1)`;
+  - `PCM16_48K.silence(10**12)`, `F32_48K_STEREO.silence(10**10)`, `silence(-1)`;
   - `seek(-1)`, `seek(float("nan"))`, `seek(float("inf"))`, `seek(1e300)`;
-  - `write_base64_nowait("A" * (200 << 20))` against a 100 ms buffer (rejected before decoding, no RSS spike);
+  - `write(bytes(200 << 20))` against a 100 ms buffer (rejected before parsing, no RSS spike);
   - `open_playback(max_buffer_ms=100, prebuffer_ms=1000)` and `open_playback(max_buffer_ms=100, max_gap_ms=10_000)`;
   - `RawPcm.from_samples(b"", 7_999, 2)` and `RawPcm.from_samples(b"", 192_001, 2)`;
   - `driver_retries=0` (rejected, with a message explaining that 0 would mean infinite in songbird);
@@ -3115,9 +3172,9 @@ Run before release with `examples/` against a real guild, with a DAVE-enabled cl
 - channel deletion;
 - server region change (4015 resume);
 - a network outage longer than 10 s (rejoin);
-- a 30-minute GPT-Live session (latency histogram from `captured_at`);
-- OpenAI Realtime barge-in (truncate accepted, no error);
-- Gemini `interrupted` flush;
+- a 30-minute `websocket_bridge.py` session against a local echo server (latency histogram from `captured_at`);
+- interruption: a `"clear"` frame silences playback within 40 ms, and `clear().items` reports the heard amount;
+- `echo.py` with two speakers;
 - music queue;
 - recording, with all WAV files aligned.
 
@@ -3131,13 +3188,14 @@ Run before release with `examples/` against a real guild, with a DAVE-enabled cl
   - `python scripts/check_invariants.py`;
   - `maturin develop --features test-hooks`, then `pytest` on {3.14, 3.14t} × {ubuntu, macos}, plus `windows-latest` running `test_wake.py` and `test_receive.py`;
   - a stub drift check that also catches deleted and untracked stubs: `rm -rf py-src/discord/ext/songbird/native && cargo run --bin stub_gen && test -z "$(git status --porcelain --untracked-files=all -- py-src/discord/ext/songbird/native)"`;
-  - `ruff check`, `ruff format --diff`, `ty check` (covers `examples/`; every example needs only `discord.py` and `websockets`, both in the dev group).
+  - `ruff check`, `ruff format --diff`, `ty check` (covers `examples/`; every example needs only `discord.py` and, for the bridge, `websockets`, both in the dev group).
 - **`release.yml`.** The three duplicated smoke one-liners are replaced by `python scripts/smoke.py`:
 
   ```python
   import io, wave
   import discord.ext.songbird as sb
-  f = sb.AudioFormat.parse("pcm16_24k"); assert f.bytes_per_ms == 48 and sb.GPT_LIVE == f
+  f = sb.AudioFormat.parse("pcm16_24k"); assert f.bytes_per_ms == 48 and sb.PCM16_24K == f
+  assert sb.AudioFormat.parse("pcm16_48k_stereo") == sb.PCM16_48K_STEREO
   sb.RawPcm(bytes(960), sb.PCM16_24K); sb.OpusPackets([b"\xf8\xff\xfe"])
   buf = io.BytesIO(); w = wave.open(buf, "wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(24000)
   w.writeframes(bytes(4800)); w.close(); sb.AudioFile(buf.getvalue())
@@ -3168,7 +3226,7 @@ Run before release with `examples/` against a real guild, with a DAVE-enabled cl
 5. **Identity.** The bot user id now comes from `client.user.id`, not `application_id`.
 6. **Receive is rewritten.**
    - Removed: `listen(sink)`, `SinkBase`, `BufferSink`, `StreamSink`, `Stream`, `VoiceKey`, `VoiceTick`, `PyAsyncIterator`, and the per-tick Arrow `RecordBatch` (`key_kind`, `key_id`, `speaking`, `pcm` at 48 kHz stereo).
-   - Use `listen_user()` / `listen_mixed()` / `listen_users()` / `listen()`. They yield `AudioChunk` (buffer protocol) in your format, and `events()` provides speaking, user and connection events.
+   - Use `listen_user()` / `listen_mixed()` / `listen_users()` / `listen()`. They yield `AudioChunk` (buffer protocol) in your format — by default Discord's native 48 kHz stereo PCM16, the format 0.5 delivered — and `events()` provides speaking, user and connection events.
    - Streams are continuous and silence-filled. They wait while empty instead of ending, and they are bounded, so overflow drops audio and reports it as `dropped_ms`.
    - Arrow is opt-in: `chunk.__arrow_c_array__`, `stream.read_batch()`.
 7. **Inputs are renamed or replaced:**
@@ -3182,7 +3240,7 @@ Run before release with `examples/` against a real guild, with a DAVE-enabled cl
    | `OpusPacketInput(frames)` | `OpusPackets(packets)` / `OpusPackets.from_arrow()` |
    | `OpusPacketStreamInput(max_packets)` + `send`/`close` | `vc.open_opus_stream(max_packets=)` → `send`/`send_nowait`/`aclose` (underrun → silence; never blocks the mixer) |
    | `InputBase`, `Compose` protocol | removed |
-   | — | **new:** `vc.open_playback(fmt)` → `PlaybackStream` for realtime PCM (AI output) |
+   | — | **new:** `vc.open_playback(fmt)` → `PlaybackStream` for realtime PCM written as it arrives (default format 48 kHz stereo PCM16) |
 
 8. **Tracks.**
    - The `Track` builder is removed. Use `vc.play(source, volume=, loops=, paused=)` or `vc.enqueue(source, volume=, loops=, paused=)`. `play` and `enqueue` are **synchronous** and return a `TrackHandle`; they used to return eager `asyncio.Future`s that were mistyped as coroutines. At most 32 tracks may play at once per connection (`LimitExceeded`).
@@ -3217,8 +3275,9 @@ Run before release with `examples/` against a real guild, with a DAVE-enabled cl
     - Receive uses `DecodeMode::Decrypt` plus our own decoder, so DAVE audio is undistorted and packet-loss concealment is exactly 20 ms.
     - The jitter buffer defaults to 60 ms (it was 100 ms); `VoiceConfig.low_latency()` gives 40 ms.
     - Only subscribed users are decoded, and `receive=False` disables decryption entirely.
+    - Every receive stream and `open_playback` default to `PCM16_48K_STEREO` (Discord's native format); pass another `AudioFormat` or spec string to have the library convert.
 13. **Examples and docs are rewritten.**
-    - `basic.py` (correct channel count), `send_stream.py` and `receive_stream.py` are replaced by `gpt_live.py`, `openai_realtime.py`, `gemini_live.py`, `record.py` and `music.py`.
+    - `basic.py` (correct channel count), `send_stream.py` and `receive_stream.py` are replaced by `echo.py` (receive + playback streaming), `websocket_bridge.py` (a generic raw-PCM WebSocket bridge), `record.py` and `music.py`.
     - README, `docs/send.md`, `docs/receive.md` and AGENTS.md are rewritten. AGENTS.md now has the correct commands (`uv run --no-sync maturin develop`), the correct artifact name, and `CHANNEL_ID` for the examples.
 
 ---
@@ -3234,8 +3293,8 @@ Run before release with `examples/` against a real guild, with a DAVE-enabled cl
 | **3. Unbounded `BufferSink`; iterator ends when empty** | `max_duration_secs=None` default; VoiceTick every 20 ms; `__anext__` stopped on empty | Every `SubQueue` is bounded (default 2 s, cap 60 s) under a per-connection budget (default 64 MiB), with drop-oldest and counters. Iterators **wait** and end only on close or disconnect. An unconsumed or dropped stream is unregistered. | `rx::pipeline` 1 h soak, `test_bounds.py` |
 | **4. `StreamSink` broadcast ring pinned by an idle `_rx`; `retain` never delivered** | `tokio::sync::broadcast` semantics | **No `broadcast` anywhere** (grep in `check_invariants.py`). Each subscriber has its own lazily grown bounded queue. "Retain" is replaced by working `max_queue_ms` buffering plus `skip_to_live()`. | `rx::queue` tests |
 | **5. A per-user array pins every speaker's PCM** | Zero-copy slice of the tick's shared buffer | Each `ChunkData` owns a `PcmBuf` holding **only its lane's source**. Arrow export wraps that chunk's own `Arc`, and `ChunkBatch` concatenates owned bytes. | `rx::lane` owned-length test, `test_receive.py` Arrow tests |
-| **6. User durations drive eager allocation, aborting the process** | `VecDeque::with_capacity(secs*50)`, `broadcast::channel(secs*50)` | `limits::check` runs before arithmetic, then `checked_mul`, raising `LimitExceeded`. This also covers the one-shot helpers (`AudioFormat.silence(ms)`, `seek(seconds)`, base64 write length). Capacities start at `min(bound, 16)` and grow lazily, so no `with_capacity(user_value)` exists. Large copies use `try_reserve` → `MemoryError`. | `test_bounds.py` (subprocess, exit code ≠ 134) |
-| **7. Redundant copies** | Each sink rebuilt its batch; `StreamInput` extracted to a `Vec` and then copied again | `Dispatch` clones `Bytes` handles only. One Opus decode per needed SSRC, one mix per bus, one resample per (source, rate, channels), one encode per lane, and an `Arc<ChunkData>` shared by subscribers. Python reads it through the buffer protocol without copying; `to_base64` is done in Rust. Send path: `bytes`/`str` are borrowed, there is one parse into the queue, and the mixer does memcpy plus resample. | allocation-counting tests, `Arc::ptr_eq` lane test |
+| **6. User durations drive eager allocation, aborting the process** | `VecDeque::with_capacity(secs*50)`, `broadcast::channel(secs*50)` | `limits::check` runs before arithmetic, then `checked_mul`, raising `LimitExceeded`. This also covers the one-shot helpers (`AudioFormat.silence(ms)`, `seek(seconds)`, write length). Capacities start at `min(bound, 16)` and grow lazily, so no `with_capacity(user_value)` exists. Large copies use `try_reserve` → `MemoryError`. | `test_bounds.py` (subprocess, exit code ≠ 134) |
+| **7. Redundant copies** | Each sink rebuilt its batch; `StreamInput` extracted to a `Vec` and then copied again | `Dispatch` clones `Bytes` handles only. One Opus decode per needed SSRC, one mix per bus, one resample per (source, rate, channels), one encode per lane, and an `Arc<ChunkData>` shared by subscribers. Python reads it through the buffer protocol without copying. Send path: `bytes` is borrowed, there is one parse into the queue, and the mixer does memcpy plus resample. | allocation-counting tests, `Arc::ptr_eq` lane test |
 | **8. Deadlock**: `blocking_lock` on the loop vs. a tokio Mutex held across `await update_hook` (which needs the same loop) | tokio Mutex held across a Python await | No tokio mutexes, no `blocking_*`, no lock across `.await`, Python calls or syscalls (I7). Every native method is synchronous. **Rust never awaits Python** (pull model). L2 actions execute after unlock, in step order, through one executor (§4.6), so terminal transitions cannot self-deadlock and actions cannot be reordered. Writers parse outside every lock, and `clear()`/`close()` never wait for a writer (§7.3). Logging never blocks (`try_lock`). | clippy `await_holding_lock`, `check_invariants.py` greps, the §13.1 self-deadlock regression, `test_threads.py` |
 | **9. `blocking_recv()` on the shared mixer thread** | `OpusPacketStreamInput::next_packet` waited for the producer; `StreamInput` blocked through `AsyncAdapterStream` | Every mixer-side reader and decoder uses atomics and `try_lock` only. Underrun gives PCM zeros or `SILENT_FRAME`. A packet is **always 960 frames, never 0** (`mix_logic.rs:151` spin) and never `Err` before close+drain. There is no allocation on the PCM path, everything runs under `catch_unwind`, and there are no wake-ups/flume/`TrackHandle` calls on the mixer (housekeeper instead). Encoded streams decode on dedicated threads (≤ 16 per process). At most 32 memory/file tracks play per connection, and `preallocated_tracks(48)` keeps track addition from allocating on the mixer. | MixerHarness tests (zero allocations, contention → silence), `Role` debug assertions, `test_bounds.py` |
 | **Other: deafen/mute before join** sent op 4 with `channel_id=None` before `join()` | `Call::deafen`/`mute` always send op 4 (`handler.rs:165-169,371-378`) | No `Call`. A single join op 4 carries `(channel, self_mute, self_deaf)`. `set_self_*` sends op 4 only while connected; otherwise it stores the flag, which wins over `connect()`'s arguments if set first and is flushed in one op 4 on reaching `connected` (§6.7). | `test_connect.py` (op 4 count, order and contents) |
@@ -3293,9 +3352,9 @@ Run before release with `examples/` against a real guild, with a DAVE-enabled cl
 | State machine matches songbird's real event flow (internal resumes, `DriverDisconnect{Reconnect}`, 4014 grace, stale quash) | §4.5, §6.8 |
 | No resampler tail across gaps/clear/idle; tags exclude gap silence | §7.2 (input-rate storage, mixer-side resampling), §7.3d, §7.7 |
 | Streams/playback/events work in joining/connecting/reconnecting; `set_self_*` before connect stores the flag | §9.4 (only `closed` raises), §6.7 |
-| Naming: async `write`/`write_base64` plus sync `*_nowait`; real coroutines | §9.7, §5.5 |
-| Odd byte counts carried, base64 `str` accepted, all-or-nothing `PlaybackFull` | §7.3 |
-| `clear()` frees capacity immediately (even parked), per-tag played/heard, late rejection, GPT-Live timeline-based rejection (`reject_until_gap_ms`, `hold_ms` as fallback) | §7.7 |
+| Naming: async `write` plus sync `write_nowait`; real coroutines | §9.7, §5.5 |
+| Odd byte counts carried, all-or-nothing `PlaybackFull` (text input superseded: `str` → `TypeError`, Decision 2026-10-27) | §7.3 |
+| `clear()` frees capacity immediately (even parked), per-tag played/heard, late rejection, timeline-based rejection for timed writes (`reject_until_gap_ms`, `hold_ms` as fallback) | §7.7 |
 | Receive timeline never drops voiced ticks; synthesises silence before the first tick and during outages | §8.8 |
 | Latency budget defaults; documented `clear()` and `played_ms` semantics | §3.3, §7.7, §8.1, `VoiceConfig.low_latency()` |
 | Every Driver call inside the runtime; Scheduler/DisposalThread created once | §4.8, §5.1 |
@@ -3310,20 +3369,20 @@ Run before release with `examples/` against a real guild, with a DAVE-enabled cl
 
 | Finding | Where it is resolved |
 |---|---|
-| `clear()` missed open items with an empty queue; `complete`/`open` undefined; tag overflow undefined | §7.7 (open-tag lifetime, `end_item`, items = open + recently pulled, eviction rule), §9.7, §9.13, §13.1 |
+| `clear()` missed open items with an empty queue; `complete`/`open` undefined; tag overflow undefined | §7.7 (open-tag lifetime, `end_item`, items = open + recently pulled, eviction rule), §9.7, §13.1 |
 | Unwritten live sources transmitted silence | §4.9, §7.3e, §7.5, §7.9 (start paused; Opus idle pause), §13.3 |
-| `silence(ms)` sized an allocation from a user number; unbounded compensation in the example | §9.2, §10 T14, §12.2 `SILENCE_MS`, §9.11 (chunk-sized fill capped at 2 s), §13.5 |
+| `silence(ms)` sized an allocation from a user number; unbounded compensation in the example | §9.2, §10 T14, §12.2 `SILENCE_MS`, §9.13 (`write_silence` in 1 s pieces), §13.5 |
 | Missing state-machine rows (`Move`, `SetFlags`, 4014 outside Connected, Connecting + `VoiceServer`) and no default rule | §4.5 (new rows, default no-op rule), §13.1 (phase × input enumeration) |
 | `RawPCMInput` at arbitrary rates lost | §7.9, §9.8 `RawPcm.from_samples`, §1.2, §14 |
 | Queue features lost (queued live streams, `loops`/`paused`, pending-entry control, index semantics, `stop`) | §7.10, §9.4, §9.8, §12.3, §12.5 `SourceSpec::Encoded`, §14 item 9 |
 | `AudioInput(pyarrow.Array)` migration did not work | §7.9, §8.12, §9.8 `AudioFile.from_arrow`, §14 |
-| Examples not importable or not runnable against a fake server; Gemini SDK dependency; 40 ms Gemini chunks | §9.10 rule 6, §9.11–§9.13, G6, §13.3, §13.7 |
+| Examples not importable or not runnable against a fake server; SDK dependencies in examples | §9.10 rule 6, §9.11–§9.13 (no SDKs; the bridge is raw `websockets`), G6, §13.3, §13.7 |
 | Leak fixture never reached `connecting`; detached tests had no track control; global allocation counter | §13.2 (`FakeTrackControl`, harness-owned readers), §13.4, §13.1 (per-thread counting) |
 | Stale stub subpackages; feature-dependent stubs | §2.4, §12.6, §12.7 phase 0, §13.7 |
-| GPT-Live example blocked on a non-existent `session.started`; `hold_ms` dropped new replies | §9.11, §7.7 `reject_until_gap_ms` |
-| No mapping from transcript `start_ms` to speakers after `skip_to_live` | §8.9 (`reset_clock`, `origin_timeline_ms`), §9.5, §9.11 (sent-ms ring) |
+| A bridge example blocked waiting for a handshake message; `hold_ms` dropped new replies | §9.12 (no handshake: the uplink starts at once), §7.7 `reject_until_gap_ms` |
+| No mapping from a consumer's stream offsets to speakers after `skip_to_live` | §8.9 (`reset_clock`, `origin_timeline_ms`), §9.5 |
 | Stale abort-leave op 4 could follow a retry's join | §6.2 (`_pending_leaves`), §13.3 |
-| Missing input checks (buffer format codes, base64 cap before decode, seek panics, anchor overflow) | §7.3, §7.6, §7.10, §11.1, §13.5 |
+| Missing input checks (buffer format codes, write cap before parsing, seek panics, anchor overflow) | §7.3, §7.6, §7.10, §11.1, §13.5 |
 | Prebuffer gate never released; prebuffer > buffer | §7.4, §12.2 cross-field rule, §13.1 |
 | Unbounded `play()` tracks and queue entries | I6, §7.10, §10 T13, §12.2, §13.5 |
 | CtrlQueue drop policy; `TrackEnded`/`Rejoin` could be lost | §6.4 (slots, `WAKE_TRACKS`), §12.3 `CtrlQueue` |
@@ -3339,7 +3398,7 @@ Run before release with `examples/` against a real guild, with a DAVE-enabled cl
 | `check` bound did not compile for `usize`/floats; `extract_opus` indexing | §12.2 (`LimitScalar`, `LimitNum`), §8.3, §9.9 |
 | `ProbedMetadata` reuse impossible; `into_inner` unspecified | §7.1 rule 6, §12.5 `probe_raw_header`, §10 T4 |
 | WakeHub relied on ordering the model does not guarantee | §5.4 (`SeqCst` on all four operations, enforced by `check_invariants.py`), §13.1 |
-| Base64 decode and parse under L6w | §7.3, §5.3 |
+| Parsing under L6w | §7.3, §5.3 |
 | Gap larger than the buffer could never be written | §7.3c, §7.6, §12.2 cross-field rule |
 | `heard_ms` froze while paused | §7.5 pull epoch, §7.7 |
 | Lost global handlers undetected with `receive=False` | §4.8, §8.2, §8.8 (heartbeat) |
@@ -3348,5 +3407,5 @@ Run before release with `examples/` against a real guild, with a DAVE-enabled cl
 | R1 understated; live mixers stay live with open streams | §10 R1, §10 live-worker scaling note, §7.5 |
 | `preallocated_tracks` default 1 | §4.8 |
 | "Gapless" queue overstated | §7.10, §9.8, §14 |
-| Example hangs (`record.py` stopper, `ConnectionClosedOK` in `gpt_live.py`) | §9.11, §9.12, §13.3 |
+| Example hangs (`record.py` stopper, a closed WebSocket in the bridge) | §9.12, §9.13, §13.3 |
 | `smallvec` pinned to an old version | §2.2 (`=1.16.4`) |

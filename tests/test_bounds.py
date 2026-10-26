@@ -23,24 +23,24 @@ def rss():
 """
 
 LIMIT_CASES = {
-    "max_queue_ms": "conn().subscribe_mixed(songbird.GPT_LIVE, 20, 10**15)",
-    "max_buffer_ms": "conn().open_playback(songbird.GPT_LIVE, 10**12)",
-    "chunk_ms_0": "conn().subscribe_mixed(songbird.GPT_LIVE, 0)",
-    "chunk_ms_1001": "conn().subscribe_mixed(songbird.GPT_LIVE, 1001)",
+    "max_queue_ms": "conn().subscribe_mixed(songbird.PCM16_24K, 20, 10**15)",
+    "max_buffer_ms": "conn().open_playback(songbird.PCM16_24K, 10**12)",
+    "chunk_ms_0": "conn().subscribe_mixed(songbird.PCM16_24K, 0)",
+    "chunk_ms_1001": "conn().subscribe_mixed(songbird.PCM16_24K, 1001)",
     "max_packets": "conn().open_opus(10**9)",
     "max_buffer_bytes": "conn().open_encoded(2**62)",
     "max_decoded_users": "songbird.VoiceConfig(max_decoded_users=10**9)",
     "silence": "songbird.PCM16_48K.silence(10**12)",
-    "silence_base64": "songbird.F32_48K_STEREO.silence_base64(10**10)",
+    "silence_stereo": "songbird.F32_48K_STEREO.silence(10**10)",
     "silence_negative": "songbird.PCM16_48K.silence(-1)",
-    "prebuffer": "conn().open_playback(songbird.GPT_LIVE, 100, 1000, 250, True, 0)",
-    "max_gap": "conn().open_playback(songbird.GPT_LIVE, 100, 0, 250, True, 10_000)",
+    "prebuffer": "conn().open_playback(songbird.PCM16_24K, 100, 1000, 250, True, 0)",
+    "max_gap": "conn().open_playback(songbird.PCM16_24K, 100, 0, 250, True, 10_000)",
     "rate_low": "songbird.RawPcm.from_samples(b'', 7_999, 2)",
     "rate_high": "songbird.RawPcm.from_samples(b'', 192_001, 2)",
     "driver_retries": "songbird.VoiceConfig(driver_retries=0)",
     "event_queue": "conn().subscribe_events(10**9, ALL_EVENT_KINDS)",
     "subscriptions": "c = conn(); subs = [c.subscribe_mixed(songbird.MULAW_8K) for _ in range(65)]",
-    "live_sources": "c = conn(); srcs = [c.open_playback(songbird.GPT_LIVE) for _ in range(17)]",
+    "live_sources": "c = conn(); srcs = [c.open_playback(songbird.PCM16_24K) for _ in range(17)]",
     "playing_tracks": "c = conn(); src = songbird.OpusPackets([b'\\xf8\\xff\\xfe']); ts = [c.play(src) for _ in range(33)]",
     "queue_entries": "c = conn(); src = songbird.OpusPackets([b'\\xf8\\xff\\xfe']); ts = [c.enqueue(src) for _ in range(10_001)]",
     "receive_budget": (
@@ -88,16 +88,16 @@ def test_mulaw_16k_is_invalid() -> None:
     assert "REJECTED InvalidAudio" in out, out
 
 
-def test_huge_base64_is_rejected_before_decoding() -> None:
+def test_huge_write_is_rejected_before_parsing() -> None:
     proc = run_isolated(
         PRELUDE
         + """
 c = conn()
-pb = c.open_playback(songbird.GPT_LIVE, 100, 0, 250, True, 0)
-payload = "A" * (200 << 20)
+pb = c.open_playback(songbird.PCM16_24K, 100, 0, 250, True, 0)
+payload = b"\\x01" * (200 << 20)
 before = rss()
 try:
-    pb.write_base64(payload)
+    pb.write(payload)
 except songbird.LimitExceeded:
     print("REJECTED")
 print("GROWTH", rss() - before)

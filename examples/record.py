@@ -1,4 +1,4 @@
-"""Recording bot (design §9.12): one timeline-aligned WAV per user plus a log of speaking events.
+"""Recording bot (design §9.13): one timeline-aligned WAV per user plus a log of speaking events.
 
 ``!record`` in a voice channel starts recording into ``recordings/<guild>-<time>/``; ``!stop`` ends
 it (so does the connection closing). Memory is bounded per user at 10 s of audio however slowly the

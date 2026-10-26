@@ -1,5 +1,5 @@
 //! `native.AudioChunk` (W3, §8.10): one received chunk, exposing its PCM through the buffer protocol
-//! without copying (`view.obj = self`), plus `to_bytes()` / `to_base64()` and Arrow export.
+//! without copying (`view.obj = self`), plus `to_bytes()` and Arrow export.
 
 use std::ffi::{CStr, c_int, c_void};
 use std::ptr;
@@ -14,10 +14,8 @@ use pyo3::types::{PyBytes, PyFrozenSet};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use pyo3_stub_gen::inventory::submit;
 use sbcore::Encoding;
-use sbcore::dsp::b64;
 use sbcore::rx::{ChunkData, Delivered};
 
-use crate::errors::CoreResultExt;
 use crate::py::format::PyAudioFormat;
 
 #[cfg(target_endian = "big")]
@@ -205,13 +203,6 @@ impl AudioChunk {
     /// One copy of the payload.
     fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, self.chunk.data.as_bytes())
-    }
-
-    /// Base64 of the payload, encoded in Rust.
-    fn to_base64(&self, py: Python<'_>) -> PyResult<String> {
-        let mut out = String::new();
-        b64::try_encode_into(self.chunk.data.as_bytes(), &mut out).py(py)?;
-        Ok(out)
     }
 
     /// ``[arrow]`` Zero-copy Arrow export (``Int16Array`` / ``Float32Array`` / ``UInt8Array``).

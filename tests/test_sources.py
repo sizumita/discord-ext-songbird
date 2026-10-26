@@ -82,7 +82,7 @@ def test_raw_pcm() -> None:
     src = RawPcm(tone(100, rate=24_000, channels=1), songbird.PCM16_24K)
     assert src.format == songbird.PCM16_24K and src.duration_ms == 100
     assert RawPcm(bytes(800), "mulaw").duration_ms == 100
-    with pytest.raises(InvalidAudio):
+    with pytest.raises(TypeError):
         RawPcm("not bytes", songbird.PCM16_24K)  # type: ignore
 
 

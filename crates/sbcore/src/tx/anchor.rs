@@ -1,5 +1,5 @@
-//! Wall-clock gap filling from provider timestamps (W4, §7.6). Checked arithmetic only: no provider
-//! value can overflow the anchor arithmetic or panic `Instant` arithmetic.
+//! Wall-clock gap filling from source-timeline timestamps (W4, §7.6). Checked arithmetic only: no
+//! caller-supplied value can overflow the anchor arithmetic or panic `Instant` arithmetic.
 
 use std::time::{Duration, Instant};
 
@@ -9,7 +9,7 @@ pub(crate) const MAX_DELTA_MS: u64 = 86_400_000;
 /// Jitter tolerance: gaps within ±40 ms (2 ticks) append without silence.
 pub(crate) const JITTER_US: i128 = 40_000;
 
-/// The gap-fill anchor: provider time `remote_ms` corresponds to wall time `wall`.
+/// The gap-fill anchor: source time `remote_ms` corresponds to wall time `wall`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Anchor {
     pub(crate) remote_ms: i64,
@@ -24,7 +24,7 @@ pub(crate) struct GapReject {
 }
 
 impl GapReject {
-    /// Whether a timed write starting at `at_ms` continues the interrupted utterance.
+    /// Whether a timed write starting at `at_ms` continues the interrupted audio.
     pub(crate) fn rejects(&self, at_ms: i64) -> bool {
         at_ms < self.cut_end_ms.saturating_add(i64::from(self.gap_ms))
     }
@@ -147,7 +147,7 @@ mod tests {
             decide(anchor(t0), 1_000, t0 + ms(1_500), 24_000, 2_000),
             GapDecision::Reanchor
         );
-        // Negative delta (provider rewound) that is still in the future of `earliest`.
+        // Negative delta (source timeline rewound) that is still in the future of `earliest`.
         let a = Some(Anchor {
             remote_ms: 10_000,
             wall: t0 + ms(10_000),

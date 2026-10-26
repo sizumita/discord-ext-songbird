@@ -1,12 +1,9 @@
-//! The lock-free half of `PcmQueue::write` (W4, §7.3 step 1): pre-checks, base64 decoding into a
-//! per-call buffer and parsing at the input rate, all **outside** every lock.
+//! The lock-free half of `PcmQueue::write` (W4, §7.3 step 1): the size pre-check and parsing at
+//! the input rate, all **outside** every lock.
 
-use crate::dsp::b64;
 use crate::error::CoreError;
 use crate::format::PcmParser;
 use crate::limits::{LimitError, LimitNum};
-
-use super::queue::WriteData;
 
 /// A write parsed outside the locks, ready for the L6w splice and the L6 commit.
 #[derive(Debug, Default)]
@@ -40,22 +37,14 @@ impl ParsedWrite {
     }
 }
 
-/// The size of `data` once decoded, as compared with the cap (§7.3: `len·3/4` for base64).
-pub(crate) fn decoded_size(data: WriteData<'_>) -> u64 {
-    match data {
-        WriteData::Pcm(b) => b.len() as u64,
-        WriteData::Base64(t) => (t.len() as u64).saturating_mul(3) / 4,
-    }
-}
-
-/// Size cap check before any decoding (`LimitExceeded`), then base64 decode + parse.
+/// Size cap check before any allocation (`LimitExceeded`), then parse.
 pub(crate) fn parse_write(
     parser: &PcmParser,
-    data: WriteData<'_>,
+    data: &[u8],
     carry_len: u8,
     cap_bytes: u64,
 ) -> Result<ParsedWrite, CoreError> {
-    let size = decoded_size(data);
+    let size = data.len() as u64;
     if size > cap_bytes {
         return Err(CoreError::Limit(LimitError {
             what: "write_bytes",
@@ -64,15 +53,7 @@ pub(crate) fn parse_write(
             max: LimitNum::Int(i128::from(cap_bytes)),
         }));
     }
-    match data {
-        WriteData::Pcm(raw) => parse_raw(parser, raw, carry_len),
-        WriteData::Base64(text) => {
-            // Per-call staging buffer (T2): freed when this call returns.
-            let mut raw = Vec::new();
-            b64::decode_into(text, &mut raw)?;
-            parse_raw(parser, &raw, carry_len)
-        }
-    }
+    parse_raw(parser, data, carry_len)
 }
 
 /// Parses raw wire bytes assuming a carried partial frame of `carry_len` bytes.
@@ -156,30 +137,24 @@ mod tests {
     }
 
     #[test]
-    fn cap_checked_before_decoding() {
+    fn cap_checked_before_parsing() {
         let p = PcmParser::new(F32_48K_STEREO);
-        let text = vec![b'A'; 4_000];
-        // 4000 base64 chars ≈ 3000 bytes > cap of 2000: rejected without decoding.
+        let data = vec![0u8; 2_001];
+        // 2001 bytes > cap of 2000: rejected without allocating.
         let _g = crate::alloc_count::CountGuard::new();
         let before = crate::alloc_count::count();
-        let r = parse_write(&p, WriteData::Base64(&text), 0, 2_000);
+        let r = parse_write(&p, &data, 0, 2_000);
         let after = crate::alloc_count::count();
         assert!(matches!(r, Err(CoreError::Limit(_))));
         assert_eq!(after, before, "no allocation before the cap check");
-        assert!(matches!(
-            parse_write(&p, WriteData::Pcm(&[0u8; 2_001]), 0, 2_000),
-            Err(CoreError::Limit(_))
-        ));
+        let w = parse_write(&p, &data[..2_000], 0, 2_000).unwrap();
+        assert_eq!(w.body_frames, 250);
     }
 
     #[test]
-    fn invalid_base64_is_invalid_audio() {
+    fn parse_write_parses_raw_bytes() {
         let p = PcmParser::new(PCM16_24K);
-        assert!(matches!(
-            parse_write(&p, WriteData::Base64(b"####"), 0, 1_000),
-            Err(CoreError::InvalidAudio(_))
-        ));
-        let w = parse_write(&p, WriteData::Base64(b"AQACAA=="), 0, 1_000).unwrap();
+        let w = parse_write(&p, &[1, 0, 2, 0], 0, 1_000).unwrap();
         assert_eq!(&*w.samples, &[1, 2]);
     }
 }

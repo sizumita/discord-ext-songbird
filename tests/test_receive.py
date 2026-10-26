@@ -6,7 +6,6 @@ so the timeline never synthesises or skips unless a test wants it to.
 
 from __future__ import annotations
 
-import base64
 import gc
 from typing import Any
 
@@ -67,11 +66,27 @@ async def test_chunk_count_and_sizes(
         assert c.gap_ms == 0 and c.dropped_ms == 0
 
 
+async def test_default_format_is_discord_native(connected_vc: HarnessClient, testing: Any) -> None:
+    vc = connected_vc
+    mapped(vc, testing, (SSRC_A, A))
+    native_fmt = songbird.PCM16_48K_STEREO
+    async with vc.listen_mixed() as mixed, vc.listen_user(A) as user, vc.listen(user=A) as via_listen:
+        assert mixed.format == user.format == via_listen.format == native_fmt
+        inject_ticks(vc, testing, 2, ssrc=SSRC_A)
+        chunks = drain(mixed) + drain(user) + drain(via_listen)
+    assert len(chunks) == 6
+    assert all(len(c) == native_fmt.bytes_for(20) == 3_840 and c.format == native_fmt for c in chunks)
+    async with vc.listen_users() as users:
+        assert users is not None
+    with pytest.raises(TypeError):
+        vc.listen_mixed(24_000)  # type: ignore
+
+
 async def test_speaking_and_speakers(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
     mapped(vc, testing, (SSRC_A, A), (SSRC_B, B))
     pkt = voice_packets(testing)[0]
-    async with vc.listen_mixed(songbird.GPT_LIVE) as mixed, vc.listen_user(B, songbird.GPT_LIVE) as only_b:
+    async with vc.listen_mixed(songbird.PCM16_24K) as mixed, vc.listen_user(B, songbird.PCM16_24K) as only_b:
         tick(vc, testing, [(SSRC_A, pkt), (SSRC_B, pkt)])
         tick(vc, testing, [(SSRC_A, pkt)])
         tick(vc, testing, [], [SSRC_A, SSRC_B])
@@ -100,7 +115,7 @@ async def test_absent_user_stream_is_silent_and_continuous(connected_vc: Harness
 
 async def test_silence_is_synthesised_without_ticks(connected_vc: HarnessClient) -> None:
     vc = connected_vc
-    async with vc.listen_mixed(songbird.GPT_LIVE) as stream:
+    async with vc.listen_mixed(songbird.PCM16_24K) as stream:
         vc.harness.step(1_000)
         chunks = drain(stream)
     assert 44 <= len(chunks) <= 50
@@ -111,7 +126,7 @@ async def test_silence_is_synthesised_without_ticks(connected_vc: HarnessClient)
 
 async def test_skip_to_live_resets_the_clock(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
-    async with vc.listen_mixed(songbird.GPT_LIVE) as stream:
+    async with vc.listen_mixed(songbird.PCM16_24K) as stream:
         inject_ticks(vc, testing, 5, voiced=False)
         assert stream.queued_ms == 100
         assert stream.skip_to_live() == 100
@@ -131,7 +146,7 @@ async def test_skip_to_live_resets_the_clock(connected_vc: HarnessClient, testin
 
 async def test_overflow_error_raises_once(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
-    stream = vc.listen_mixed(songbird.GPT_LIVE, max_queue_ms=40, overflow="error")
+    stream = vc.listen_mixed(songbird.PCM16_24K, max_queue_ms=40, overflow="error")
     inject_ticks(vc, testing, 5, voiced=False)
     got = []
     with pytest.raises(StreamOverflow):
@@ -148,7 +163,7 @@ async def test_overflow_error_raises_once(connected_vc: HarnessClient, testing: 
 
 async def test_drop_oldest_reports_dropped_ms(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
-    async with vc.listen_mixed(songbird.GPT_LIVE, max_queue_ms=40) as stream:
+    async with vc.listen_mixed(songbird.PCM16_24K, max_queue_ms=40) as stream:
         inject_ticks(vc, testing, 4, voiced=False)
         c2, c3 = drain(stream)
         assert (c2.seq, c2.dropped_ms) == (2, 40)
@@ -160,7 +175,7 @@ async def test_drop_oldest_reports_dropped_ms(connected_vc: HarnessClient, testi
 
 async def test_drop_newest_reports_dropped_ms(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
-    async with vc.listen_mixed(songbird.GPT_LIVE, max_queue_ms=40, overflow="drop_newest") as stream:
+    async with vc.listen_mixed(songbird.PCM16_24K, max_queue_ms=40, overflow="drop_newest") as stream:
         inject_ticks(vc, testing, 4, voiced=False)
         c0, c1 = drain(stream)
         assert (c0.seq, c1.seq) == (0, 1)
@@ -171,7 +186,7 @@ async def test_drop_newest_reports_dropped_ms(connected_vc: HarnessClient, testi
 
 async def test_async_iteration_and_read(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
-    stream = vc.listen_mixed(songbird.GPT_LIVE)
+    stream = vc.listen_mixed(songbird.PCM16_24K)
     inject_ticks(vc, testing, 3, voiced=False)
     got = [await stream.read(timeout=1), await anext(stream)]
     async for c in stream:
@@ -190,7 +205,7 @@ async def test_waiting_reader_is_woken_by_the_pump(connected_vc: HarnessClient, 
     import asyncio
 
     vc = connected_vc
-    async with vc.listen_mixed(songbird.GPT_LIVE) as stream:
+    async with vc.listen_mixed(songbird.PCM16_24K) as stream:
         reader = asyncio.create_task(stream.read(timeout=2))
         await pump_settle()
         assert not reader.done()  # armed, waiting on the wake id
@@ -203,7 +218,7 @@ async def test_set_include_rehomes_without_gap(connected_vc: HarnessClient, test
     vc = connected_vc
     mapped(vc, testing, (SSRC_A, A), (SSRC_B, B))
     pkt = voice_packets(testing)[0]
-    async with vc.listen_mixed(songbird.GPT_LIVE) as stream:
+    async with vc.listen_mixed(songbird.PCM16_24K) as stream:
         tick(vc, testing, [(SSRC_A, pkt), (SSRC_B, pkt)])
         stream.set_include([A])
         for _ in range(3):
@@ -225,7 +240,7 @@ async def test_floor_policy(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
     mapped(vc, testing, (SSRC_A, A), (SSRC_B, B))
     pkt = voice_packets(testing)[0]
-    async with vc.listen_mixed(songbird.GPT_LIVE, policy="floor") as stream:
+    async with vc.listen_mixed(songbird.PCM16_24K, policy="floor") as stream:
         tick(vc, testing, [(SSRC_A, pkt)])
         for _ in range(3):
             tick(vc, testing, [(SSRC_A, pkt), (SSRC_B, pkt)])
@@ -241,7 +256,7 @@ async def test_ignore_bots_after_classification(connected_vc: HarnessClient, tes
     vc.harness.step(20)  # UserMapped → Control.ClassifyUsers
     await pump_settle()  # the pump answers from the member cache
     pkt = voice_packets(testing)[0]
-    async with vc.listen_mixed(songbird.GPT_LIVE) as stream:
+    async with vc.listen_mixed(songbird.PCM16_24K) as stream:
         tick(vc, testing, [(SSRC_A, pkt), (SSRC_BOT, pkt)])
         (c,) = drain(stream)
     assert c.speakers == frozenset({A})
@@ -281,7 +296,6 @@ async def test_buffer_protocol(connected_vc: HarnessClient, testing: Any) -> Non
     assert mv.tolist() == list(np.frombuffer(pcm, "<i2"))
     assert np.shares_memory(np.frombuffer(pcm, "<i2"), memoryview(pcm))
     assert bytes(pcm) == pcm.to_bytes()
-    assert pcm.to_base64() == base64.b64encode(bytes(pcm)).decode()
     assert memoryview(chunks["f32le"]).format == "f"
     assert memoryview(chunks["mulaw"]).format == "B"
     assert pcm.rms_dbfs > -60 and 0 < pcm.peak <= 1.0
@@ -289,7 +303,7 @@ async def test_buffer_protocol(connected_vc: HarnessClient, testing: Any) -> Non
 
 async def test_chunk_outlives_its_stream(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
-    stream = vc.listen_mixed(songbird.GPT_LIVE)
+    stream = vc.listen_mixed(songbird.PCM16_24K)
     inject_ticks(vc, testing, 1)
     (chunk,) = drain(stream)
     view = memoryview(chunk)
@@ -335,7 +349,7 @@ async def test_full_rtp_path(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
     mapped(vc, testing, (SSRC_A, A))
     opus = voice_packets(testing, 40)
-    async with vc.listen_user(A, songbird.GPT_LIVE) as stream:
+    async with vc.listen_user(A, songbird.PCM16_24K) as stream:
         for seq, (ext, pad, dave) in enumerate([(True, 4, True), (False, 0, True)]):
             pkt = testing.rtp_wrap(opus[seq], seq, SSRC_A, extension=ext, padding=pad, dave_trailer=dave)
             testing.inject_voice_tick_rtp(vc._conn, [(SSRC_A, pkt)])
@@ -376,7 +390,7 @@ async def test_receive_budget(connected_vc: HarnessClient) -> None:
 
 async def test_streams_end_on_disconnect(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
-    stream = vc.listen_mixed(songbird.GPT_LIVE)
+    stream = vc.listen_mixed(songbird.PCM16_24K)
     inject_ticks(vc, testing, 2, voiced=False)
     await vc.disconnect()
     got = [c async for c in stream]  # queued chunks stay readable, then the stream ends

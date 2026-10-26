@@ -1,13 +1,14 @@
 # discord-ext-songbird
 
-A voice backend for [discord.py](https://github.com/Rapptz/discord.py) 2.7 built on
-[songbird](https://github.com/serenity-rs/songbird) (Rust). It is designed for realtime voice AI —
-GPT-Live, OpenAI Realtime, Gemini Live — as much as for music and recording bots:
+A general-purpose voice backend for [discord.py](https://github.com/Rapptz/discord.py) 2.7 built
+on [songbird](https://github.com/serenity-rs/songbird) (Rust): audio in and out of Discord voice
+channels with low latency, for music bots, recorders, voice tools and bridges to other audio
+systems:
 
-- **receive** continuous, silence-filled, real-time-paced per-user or mixed streams in the format a
-  model wants (8/16/24/48 kHz, mono/stereo, PCM16 / f32 / µ-law / A-law, 10–1000 ms chunks);
-- **send** realtime PCM with backpressure, base64 input, wall-clock gap filling from provider
-  timestamps, and barge-in (`clear()`) that is silent within 40 ms and reports what was heard;
+- **receive** continuous, silence-filled, real-time-paced per-user or mixed streams in the format
+  you need (8/16/24/48 kHz, mono/stereo, PCM16 / f32 / µ-law / A-law, 10–1000 ms chunks);
+- **send** realtime PCM with backpressure, wall-clock gap filling from source timestamps, and
+  interruption (`clear()`) that is silent within 40 ms and reports how much was played;
 - play files, raw PCM and Opus packets, with a sequential queue;
 - bounded memory everywhere, no Python object held by Rust, and no Rust thread that ever enters the
   interpreter — identical behaviour on CPython 3.14 and free-threaded 3.14t.
@@ -57,7 +58,7 @@ vc = await channel.connect(cls=songbird.SongbirdClient.with_config(receive=False
 - `status` (`ConnectionStatus`), `is_connected()`, `wait_connected()`, `ssrc`, `timeline_ms` and
   `stats()` describe the connection.
 
-Streams, playbacks, events and tracks can be created in every state except `"closed"` (so a bridge
+Streams, playbacks, events and tracks can be created in every state except `"closed"` (so a pipeline
 can be wired up while the connection is still being established). Before `connect()` they raise
 `NotConnected`; after the connection closed they raise `ConnectionClosed`.
 
@@ -82,53 +83,95 @@ can be wired up while the connection is still being established). Before `connec
 
 Invalid values raise `LimitExceeded` (a `ValueError`) when the config is constructed.
 
-## A realtime voice bridge in 20 lines
+## Audio formats
+
+Every receive stream and playback has one `AudioFormat` (sample rate, channels, encoding). The
+default everywhere is **`PCM16_48K_STEREO`, Discord's native format** (48 kHz, 2 channels,
+16-bit little-endian PCM): no resampling or channel conversion happens in either direction. Pass
+any other format (an `AudioFormat`, a preset such as `PCM16_16K`, or a string such as
+`"pcm16_24k"`) and the library converts in Rust: receive streams are resampled, down- or
+up-mixed and re-encoded before they reach Python, and playback input is converted to 48 kHz stereo
+on the mixer side.
 
 ```python
-import asyncio, json
-from websockets.asyncio.client import connect as ws_connect
-from discord.ext import songbird
-from discord.ext.songbird import GPT_LIVE, PlaybackFull
-
-async def bridge(vc: songbird.SongbirdClient, url: str, headers: dict[str, str]) -> None:
-    async with (
-        ws_connect(url, additional_headers=headers) as ws,
-        vc.listen_mixed(GPT_LIVE, chunk_ms=40, policy="floor") as mic,
-        vc.open_playback(GPT_LIVE) as speaker,
-    ):
-        await ws.send(json.dumps({"type": "session.start", "session": {"audio": {"format": GPT_LIVE.openai_format}}}))
-        mic.skip_to_live()
-
-        async def uplink() -> None:
-            async for chunk in mic:  # one chunk every 40 ms, silence included
-                await ws.send(json.dumps({"type": "session.input_audio.append", "audio": chunk.to_base64()}))
-
-        async with asyncio.TaskGroup() as tg:
-            up = tg.create_task(uplink())
-            async for raw in ws:
-                ev = json.loads(raw)
-                if ev["type"] == "session.output_audio.delta":
-                    try:
-                        speaker.write_base64_nowait(ev["delta"], at_ms=ev.get("start_ms"))
-                    except PlaybackFull:
-                        pass  # overrun: drop rather than block the reader
-            up.cancel()
+async with vc.listen_mixed() as mic:                         # 48 kHz stereo PCM16
+    ...
+async with vc.listen_user(member, songbird.PCM16_16K, chunk_ms=100) as mic:  # 16 kHz mono, 100 ms chunks
+    ...
 ```
 
-Complete, tested bridges live in `examples/` (`gpt_live.py`, `openai_realtime.py`,
-`gemini_live.py`); every bridge function takes `url=` and `api_key=`.
+## Streaming to external services
+
+Speech recognisers, realtime speech services and other audio systems usually take a stream of raw
+audio chunks and send audio back. The same building blocks cover all of them; nothing in the
+library is specific to one service:
+
+1. **Choose the format and chunk size the service expects** when you open the streams: 16 or
+   24 kHz mono PCM16 is common for speech services, with chunks of 20–100 ms.
+   `listen_mixed(..., policy="floor")` gives a dominant-speaker mix for consumers that expect one
+   speaker at a time; `listen_user` follows a single member.
+2. **Forward `bytes(chunk)`** for every chunk (or hand the chunk itself to anything that accepts a
+   buffer). Streams are continuous and
+   real-time paced, so the service receives silence while nobody speaks. Call `skip_to_live()`
+   once the service is ready (and again after it reconnects) to drop what queued up meanwhile.
+   If the protocol wants text-encoded audio, encode it yourself: `AudioChunk` supports the buffer
+   protocol, so `base64.b64encode(chunk)` works without an extra copy.
+3. **Write the returned audio to a `PlaybackStream`** opened in the service's output format, with
+   `write_nowait()` from the task that reads the connection (treat `PlaybackFull` as an overrun).
+   If the service timestamps its audio, pass `at_ms=` so gaps are filled with silence.
+4. **Call `clear()` on interruption** (for example when the service reports that the user started
+   talking): queued audio is discarded and playback is silent within 40 ms.
+5. **Use tags and `item()` to know how much was played.** Write each reply segment with
+   `tag=<segment id>`, call `end_item(tag)` when it is fully written, and read
+   `item(tag).played_ms` / `heard_ms` (or the `items` of the `ClearResult` returned by `clear()`)
+   to tell the service how much of a segment the listeners actually heard.
+
+```python
+import asyncio
+
+from websockets.asyncio.client import connect as ws_connect
+from discord.ext.songbird import PCM16_24K, PlaybackFull
+
+async with (
+    ws_connect(url) as ws,
+    vc.listen_mixed(PCM16_24K, chunk_ms=40, policy="floor") as mic,
+    vc.open_playback(PCM16_24K) as speaker,
+):
+    mic.skip_to_live()
+
+    async def uplink() -> None:
+        async for chunk in mic:
+            await ws.send(bytes(chunk))
+
+    async with asyncio.TaskGroup() as tg:
+        up = tg.create_task(uplink())
+        async for message in ws:
+            if message == "clear":
+                speaker.clear()
+            elif isinstance(message, bytes):
+                try:
+                    speaker.write_nowait(message)
+                except PlaybackFull:
+                    pass  # overrun: drop rather than block the reader
+        up.cancel()
+```
+
+[`examples/websocket_bridge.py`](../examples/websocket_bridge.py) is a complete, tested version of
+this loop (raw PCM in binary frames, a `"clear"` text frame as the interruption signal).
+[`VoiceConfig.low_latency()`](#voiceconfig) trims the receive jitter buffer for interactive use.
 
 ## asyncio rules
 
 1. Every stream, playback and event stream is an async context manager. Every `close()` is
    synchronous, idempotent and safe from any thread; dropping an unclosed object closes it.
 2. Awaiting is bound to the event loop that ran `connect()`; awaiting from another loop raises
-   `RuntimeError`. The synchronous methods (`read_nowait`, `write_nowait`, `write_base64_nowait`,
-   `clear`, `close`, properties) work from any thread.
-3. In the task that reads a provider WebSocket, use `write_*_nowait` and treat `PlaybackFull` as an
-   overrun; never `await write()` there, or backpressure delays handling of interruptions.
-4. Call `skip_to_live()` right after starting a provider session and again after a provider
-   reconnect: Discord streams stay open while the AI session reconnects.
+   `RuntimeError`. The synchronous methods (`read_nowait`, `write_nowait`, `clear`, `close`,
+   properties) work from any thread.
+3. In a task that reads audio from a network connection, use `write_nowait` and treat
+   `PlaybackFull` as an overrun; never `await write()` there, or backpressure delays handling of
+   interruptions.
+4. Call `skip_to_live()` right after a downstream consumer becomes ready and again after it
+   reconnects: Discord streams stay open while the consumer reconnects.
 5. Cancelling a pending `__anext__` or `write()` never loses or duplicates audio.
 
 ## How it works
@@ -161,7 +204,7 @@ Tokens are never logged; session ids are logged as lengths and endpoints as host
 | `StreamClosed(reason)` / `StreamOverflow` | reading or writing a closed stream / receive overflow under `overflow="error"` (raised once) |
 | `PlaybackFull(needed_ms, free_ms)` | a `*_nowait` write found no space (nothing consumed) |
 | `ReceiveDisabled` | `listen_*` with `VoiceConfig(receive=False)` |
-| `InvalidAudio` | bad format, base64, buffer type or Opus packet (a `ValueError`) |
+| `InvalidAudio` | bad format, buffer format or Opus packet, or a bad tag (a `ValueError`); a `str` passed as audio raises `TypeError` |
 | `LimitExceeded(what, value, minimum, maximum)` | a value is out of range or a cap was reached (a `ValueError`) |
 | `SourceError` | unrecognised encoded audio |
 | `TrackError` | a track operation failed |

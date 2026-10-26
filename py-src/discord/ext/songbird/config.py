@@ -87,7 +87,7 @@ class VoiceConfig:
 
     @classmethod
     def low_latency(cls, **overrides: Any) -> Self:
-        """Preset for realtime voice AI: ``playout_buffer_ms=40``, ``mix_mode="mono"``.
+        """Preset for interactive, low-latency audio: ``playout_buffer_ms=40``, ``mix_mode="mono"``.
 
         Parameters
         ----------

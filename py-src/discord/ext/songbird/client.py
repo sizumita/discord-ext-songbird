@@ -31,7 +31,7 @@ from . import native
 from ._pump import _Pump, cancel_tasks
 from .config import VoiceConfig
 from .errors import ConnectFailed, ConnectionClosed, ConnectTimeout, NotConnected
-from .formats import GPT_LIVE, PCM16_48K, FormatLike, as_format
+from .formats import PCM16_48K_STEREO, FormatLike, as_format
 from .playback import EncodedStream, OpusPacketStream, PlaybackStream
 from .streams import AudioStream, EventStream, MixPolicy, Overflow, UserStreams, kind_mask, user_id, user_ids
 from .tracks import Source, TrackHandle, TrackQueue
@@ -456,8 +456,10 @@ class SongbirdClient(discord.VoiceProtocol):
 
     # ── receive ──────────────────────────────────────────────────────────────────────────────────
 
-    def listen(self, format: FormatLike = GPT_LIVE, *, user: Any | None = None, **options: Any) -> AudioStream:
-        """``listen_user(user, ...)`` if ``user`` is given, else ``listen_mixed(...)``."""
+    def listen(self, format: FormatLike = PCM16_48K_STEREO, *, user: Any | None = None, **options: Any) -> AudioStream:
+        """``listen_user(user, ...)`` if ``user`` is given, else ``listen_mixed(...)``.
+
+        The default format is Discord's native 48 kHz stereo PCM16LE (no resampling)."""
         if user is not None:
             return self.listen_user(user, format, **options)
         return self.listen_mixed(format, **options)
@@ -465,7 +467,7 @@ class SongbirdClient(discord.VoiceProtocol):
     def listen_user(
         self,
         user: Any,
-        format: FormatLike = GPT_LIVE,
+        format: FormatLike = PCM16_48K_STEREO,
         *,
         chunk_ms: int = 20,
         max_queue_ms: int = 2_000,
@@ -476,7 +478,9 @@ class SongbirdClient(discord.VoiceProtocol):
         Parameters
         ----------
         user : int or discord.abc.Snowflake
-        format : AudioFormat or str
+        format : AudioFormat or str, default PCM16_48K_STEREO
+            Output format; audio is resampled, down/up-mixed and re-encoded to it. The default is
+            Discord's native 48 kHz stereo PCM16LE (no conversion).
         chunk_ms : int, default 20
             ``10..=1000``.
         max_queue_ms : int, default 2000
@@ -489,7 +493,7 @@ class SongbirdClient(discord.VoiceProtocol):
 
     def listen_mixed(
         self,
-        format: FormatLike = GPT_LIVE,
+        format: FormatLike = PCM16_48K_STEREO,
         *,
         chunk_ms: int = 20,
         max_queue_ms: int = 2_000,
@@ -504,6 +508,8 @@ class SongbirdClient(discord.VoiceProtocol):
 
         Parameters
         ----------
+        format : AudioFormat or str, default PCM16_48K_STEREO
+            Output format (Discord's native 48 kHz stereo PCM16LE by default).
         include : iterable of users or None
             Mix only these users (``None`` = everyone, plus unmapped audio).
         exclude : iterable of users
@@ -511,8 +517,8 @@ class SongbirdClient(discord.VoiceProtocol):
         ignore_bots : bool, default True
             Skip users classified as bots.
         policy : {"mix", "floor"}
-            ``"floor"``: the first voiced user holds the floor until silent for
-            ``floor_release_ms`` (single-caller models such as ``gpt-live-1``).
+            ``"floor"``: dominant-speaker mix; the first voiced user holds the floor until silent
+            for ``floor_release_ms``. For consumers that expect a single speaker at a time.
         """
         conn, pump = self._require()
         inc = None if include is None else user_ids(include)
@@ -531,7 +537,7 @@ class SongbirdClient(discord.VoiceProtocol):
 
     def listen_users(
         self,
-        format: FormatLike = PCM16_48K,
+        format: FormatLike = PCM16_48K_STEREO,
         *,
         chunk_ms: int = 20,
         max_queue_ms: int = 2_000,
@@ -540,7 +546,8 @@ class SongbirdClient(discord.VoiceProtocol):
         ignore_bots: bool = True,
         close_on_leave: bool = True,
     ) -> UserStreams:
-        """Router yielding one :class:`AudioStream` per user when they first speak."""
+        """Router yielding one :class:`AudioStream` per user when they first speak (each in
+        ``format``, Discord's native 48 kHz stereo PCM16LE by default)."""
         conn, pump = self._require()
         inc = None if include is None else user_ids(include)
         router = conn.subscribe_router(
@@ -565,7 +572,7 @@ class SongbirdClient(discord.VoiceProtocol):
 
     def open_playback(
         self,
-        format: FormatLike = GPT_LIVE,
+        format: FormatLike = PCM16_48K_STEREO,
         *,
         max_buffer_ms: int = 60_000,
         prebuffer_ms: int = 0,
@@ -576,20 +583,22 @@ class SongbirdClient(discord.VoiceProtocol):
         volume: float = 1.0,
         when_disconnected: Literal["buffer", "discard"] = "buffer",
     ) -> PlaybackStream:
-        """Realtime PCM output (AI speech). Several may be open at once; songbird mixes them.
+        """Realtime PCM output fed by ``write()``. Several may be open at once; songbird mixes them.
 
         Starts paused (nothing is sent until the first write). ``prebuffer_ms`` and ``max_gap_ms``
         must be ``<= max_buffer_ms / 2``.
 
         Parameters
         ----------
-        format : AudioFormat or str
-            Format of every write.
+        format : AudioFormat or str, default PCM16_48K_STEREO
+            Format of every write; other formats are resampled to Discord's 48 kHz stereo. The
+            default is Discord's native format (no conversion).
         max_buffer_ms : int, default 60000
             Buffer bound (``100..=120000``); a full buffer raises ``PlaybackFull`` / makes
             ``write()`` wait.
         prebuffer_ms : int, default 0
-            Hold the start of each turn until this much is buffered (or it times out).
+            After an idle period or ``clear()``, hold playback until this much is buffered (or it
+            times out), to absorb network jitter.
         idle_ms : int, default 250
             Empty this long after real audio → idle (``PlaybackIdle``; auto-pause).
         auto_pause : bool, default True

@@ -1,14 +1,13 @@
 //! `native.Playback`, `native.EncodedSink`, `native.OpusSink`, `native.ClearResult`,
 //! `native.ItemProgress` and `native.PlaybackStats` (W4, §7, §12.6).
 //!
-//! Writes are synchronous and all-or-nothing; audio is extracted (bytes/str borrowed, other buffers
+//! Writes are synchronous and all-or-nothing; audio is extracted (bytes borrowed, other buffers
 //! copied and released) **before** any sbcore call (I8).
 
 use std::sync::{Arc, Weak};
 
-use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyString, PyTuple};
+use pyo3::types::PyTuple;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use sbcore::conn::ConnShared;
 use sbcore::limits::{HOLD_MS, REJECT_GAP_MS};
@@ -16,7 +15,7 @@ use sbcore::tracks::TrackRef;
 use sbcore::tx::encoded::EncodedShared;
 use sbcore::tx::opus_stream::OpusQueue;
 use sbcore::tx::queue::{
-    ClearOpts, ClearSummary, ItemProgressData, PcmQueue, PlaybackStatsData, WriteData, WriteMeta,
+    ClearOpts, ClearSummary, ItemProgressData, PcmQueue, PlaybackStatsData, WriteMeta,
 };
 use sbcore::tx::{CloseMode, LiveSource, PcmProvider};
 
@@ -77,55 +76,41 @@ impl Drop for Playback {
 #[gen_stub_pymethods]
 #[pymethods]
 impl Playback {
-    /// Appends audio in the stream format (any size; partial frames are carried; ``str`` = base64).
+    /// Appends raw audio in the stream format (any size; partial frames are carried).
+    ///
+    /// Parameters
+    /// ----------
+    /// data : collections.abc.Buffer
+    ///     ``bytes`` or any C-contiguous buffer whose format matches the stream encoding.
+    /// tag : str or None, default None
+    ///     Application-defined segment tag (at most 128 bytes) used by ``item()`` / ``end_item()``.
+    /// at_ms : int or None, default None
+    ///     Source-timeline timestamp in ms; a gap since the previous timed write is filled with
+    ///     silence (up to ``max_gap_ms``).
     ///
     /// Raises
     /// ------
+    /// TypeError
+    ///     ``data`` is a ``str`` or not a buffer.
     /// PlaybackFull
     ///     Not enough space (nothing consumed).
     /// InvalidAudio
-    ///     A typed buffer whose format does not match the encoding, invalid base64, a bad tag.
+    ///     A typed buffer whose format does not match the encoding, or a bad tag.
     /// StreamClosed
     ///     The playback or connection is closed.
     #[pyo3(signature = (data, tag = None, at_ms = None))]
     fn write(
         &self,
         py: Python<'_>,
-        #[gen_stub(override_type(type_repr = "collections.abc.Buffer | str", imports = ("collections.abc",)))]
+        #[gen_stub(override_type(type_repr = "collections.abc.Buffer", imports = ("collections.abc",)))]
         data: &Bound<'_, PyAny>,
         tag: Option<&str>,
         at_ms: Option<i64>,
     ) -> PyResult<()> {
         ensure_not_forked(py)?;
         let audio = extract_audio(data, PcmProvider::format(&*self.q).encoding)?;
-        let wd = if audio.is_base64() {
-            WriteData::Base64(audio.bytes())
-        } else {
-            WriteData::Pcm(audio.bytes())
-        };
-        self.q.write(wd, WriteMeta { tag, at_ms }).py(py)?;
-        Ok(())
-    }
-
-    /// Appends base64-encoded audio (decoded in Rust).
-    #[pyo3(signature = (data, tag = None, at_ms = None))]
-    fn write_base64(
-        &self,
-        py: Python<'_>,
-        #[gen_stub(override_type(type_repr = "str | bytes"))] data: &Bound<'_, PyAny>,
-        tag: Option<&str>,
-        at_ms: Option<i64>,
-    ) -> PyResult<()> {
-        ensure_not_forked(py)?;
-        let text: &[u8] = if let Ok(s) = data.cast::<PyString>() {
-            s.to_str()?.as_bytes()
-        } else if let Ok(b) = data.cast::<PyBytes>() {
-            b.as_bytes()
-        } else {
-            return Err(PyTypeError::new_err("base64 data must be str or bytes"));
-        };
         self.q
-            .write(WriteData::Base64(text), WriteMeta { tag, at_ms })
+            .write(audio.bytes(), WriteMeta { tag, at_ms })
             .py(py)?;
         Ok(())
     }
@@ -150,7 +135,7 @@ impl Playback {
         self.q.arm_end()
     }
 
-    /// Barge-in: discards all queued audio now (any thread).
+    /// Interruption: discards all queued audio now (any thread).
     ///
     /// Parameters
     /// ----------
@@ -181,7 +166,8 @@ impl Playback {
         Ok(ClearResult { s: Arc::new(s) })
     }
 
-    /// The provider finished this item: closes the tag and releases the prebuffer gate.
+    /// The application finished writing this tagged segment: closes the tag and releases the
+    /// prebuffer gate.
     fn end_item(&self, py: Python<'_>, tag: &str) -> PyResult<()> {
         ensure_not_forked(py)?;
         self.q.end_item(tag);
@@ -513,7 +499,7 @@ impl ClearResult {
     }
 }
 
-/// Progress of one provider item (§7.7).
+/// Playback progress of one tagged segment (§7.7).
 #[gen_stub_pyclass]
 #[pyclass(module = "discord.ext.songbird.native", frozen)]
 pub struct ItemProgress {

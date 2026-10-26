@@ -1,8 +1,8 @@
 # Migrating from 0.5 to 0.6
 
 0.6 is a rewrite. The architecture changed so that a client can never leak (no Python object is
-held by Rust), receive and send are bounded, and the API fits realtime voice AI. Source
-compatibility with 0.5 was not kept; this page maps every 0.5 API to its replacement.
+held by Rust), receive and send are bounded, and audio can be streamed in and out with low latency.
+Source compatibility with 0.5 was not kept; this page maps every 0.5 API to its replacement.
 
 ## Packaging
 
@@ -54,8 +54,9 @@ Removed: `listen(sink)`, `SinkBase`, `BufferSink`, `StreamSink`, `Stream`, `Voic
 | `RecordBatch` with `pcm` | `memoryview(chunk)` / `np.frombuffer(chunk, "<i2")`; Arrow: `pyarrow.array(chunk)`, `stream.read_batch()` |
 | unbounded buffers, `retain` | bounded `max_queue_ms`, `overflow=` policy, `dropped_ms`, `skip_to_live()` |
 
-Chunks come in the format you ask for (`GPT_LIVE`, `"pcm16_48k_stereo"`, µ-law, …), are continuous
-and silence-filled, and only subscribed users are decoded. Receive uses songbird's `Decrypt` mode
+Chunks come in the format you ask for (default: Discord's native 48 kHz stereo PCM16, as in 0.5;
+or `PCM16_16K`, `"pcm16_24k"`, µ-law, …), are continuous and silence-filled, and only subscribed
+users are decoded. Receive uses songbird's `Decrypt` mode
 plus our own decoder, so DAVE audio is undistorted and packet-loss concealment is exactly 20 ms. The
 jitter buffer defaults to 60 ms (it was 100 ms); `VoiceConfig.low_latency()` gives 40 ms.
 `receive=False` disables decryption entirely.
@@ -73,7 +74,7 @@ jitter buffer defaults to 60 ms (it was 100 ms); `VoiceConfig.low_latency()` giv
 | `OpusPacketInput(frames)` | `OpusPackets(packets)` / `OpusPackets.from_arrow()` |
 | `OpusPacketStreamInput(max_packets)` + `send`/`close` | `vc.open_opus_stream(max_packets=)` → `send`/`send_nowait`/`aclose` (underrun sends silence; never blocks the mixer) |
 | `InputBase`, the `Compose` protocol | removed |
-| — | new: `vc.open_playback(fmt)` → `PlaybackStream` for realtime PCM (AI output) |
+| — | new: `vc.open_playback(fmt)` → `PlaybackStream` for realtime PCM written as it arrives |
 
 ## Tracks
 
@@ -131,7 +132,7 @@ The old names remain importable for one release and emit a `DeprecationWarning`.
 
 ## Examples
 
-`basic.py`, `send_stream.py` and `receive_stream.py` were replaced by `gpt_live.py`,
-`openai_realtime.py`, `gemini_live.py`, `record.py` and `music.py`. Each one guards `bot.run(...)`
-with `if __name__ == "__main__":`, and the AI bridges take `url=` and `api_key=` so they can be
-tested against a local server.
+`basic.py`, `send_stream.py` and `receive_stream.py` were replaced by `echo.py` (receive +
+playback streaming), `websocket_bridge.py` (a generic raw-PCM WebSocket bridge), `record.py` and
+`music.py`. Each one guards `bot.run(...)` with `if __name__ == "__main__":`, and the bridge takes
+its `url` as an argument so it can be tested against a local server.

@@ -35,8 +35,8 @@ fn format_arg(obj: &Bound<'_, PyAny>) -> PyResult<Format> {
     ))
 }
 
-/// An owned copy of raw (non-base64) audio bytes.
-fn owned(py: Python<'_>, data: AudioData<'_>) -> PyResult<Vec<u8>> {
+/// An owned copy of raw audio bytes.
+fn owned(data: AudioData<'_>) -> PyResult<Vec<u8>> {
     match data {
         AudioData::Owned(v) => Ok(v),
         AudioData::Bytes(b) => {
@@ -46,11 +46,6 @@ fn owned(py: Python<'_>, data: AudioData<'_>) -> PyResult<Vec<u8>> {
             v.extend_from_slice(b);
             Ok(v)
         }
-        AudioData::Base64(_) => Err(msg_exc(
-            py,
-            Exc::InvalidAudio,
-            "expected a bytes-like object, not str",
-        )),
     }
 }
 
@@ -98,7 +93,7 @@ impl AudioFile {
         data: &Bound<'_, PyAny>,
     ) -> PyResult<Self> {
         ensure_not_forked(py)?;
-        let bytes = owned(py, extract_bytes(data)?)?;
+        let bytes = owned(extract_bytes(data)?)?;
         let b = py.detach(|| EncodedBytes::new(bytes)).py(py)?;
         Ok(AudioFile { b: Arc::new(b) })
     }
@@ -201,7 +196,7 @@ impl RawPcm {
     ) -> PyResult<Self> {
         ensure_not_forked(py)?;
         let fmt = format_arg(format)?;
-        let bytes = owned(py, extract_audio(data, fmt.encoding)?)?;
+        let bytes = owned(extract_audio(data, fmt.encoding)?)?;
         let p = if bytes.len() > DETACH_ABOVE {
             py.detach(|| MemPcm::from_bytes(fmt, &bytes))
         } else {
@@ -270,7 +265,7 @@ impl RawPcm {
             }
             bytes
         } else {
-            owned(py, extract_audio(data, enc)?)?
+            owned(extract_audio(data, enc)?)?
         };
         let p = py
             .detach(|| MemPcm::from_any_rate(sample_rate, channels, enc, &bytes))
@@ -323,7 +318,7 @@ impl OpusPackets {
         let mut total = 0usize;
         for item in packets.try_iter()? {
             let item = item?;
-            let p = owned(py, extract_bytes(&item)?)?;
+            let p = owned(extract_bytes(&item)?)?;
             total = total.saturating_add(p.len());
             if out.len() >= MAX_OPUS_PACKETS || total > MAX_SOURCE_BYTES {
                 let (what, value, max) = if out.len() >= MAX_OPUS_PACKETS {

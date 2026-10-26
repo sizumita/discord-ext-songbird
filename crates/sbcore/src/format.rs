@@ -118,14 +118,8 @@ pub const F32_48K: Format = preset(SampleRate::Hz48000, 1, Encoding::F32Le);
 pub const F32_48K_STEREO: Format = preset(SampleRate::Hz48000, 2, Encoding::F32Le);
 pub const MULAW_8K: Format = preset(SampleRate::Hz8000, 1, Encoding::MuLaw);
 pub const ALAW_8K: Format = preset(SampleRate::Hz8000, 1, Encoding::ALaw);
-/// `gpt-live-1` default: one format for input and output.
-pub const GPT_LIVE: Format = PCM16_24K;
-pub const OPENAI_REALTIME: Format = PCM16_24K;
-pub const GEMINI_LIVE_INPUT: Format = PCM16_16K;
-pub const GEMINI_LIVE_OUTPUT: Format = PCM16_24K;
-
 /// Every named preset (lower-case names are accepted by [`Format::parse`]).
-pub const PRESETS: [(&str, Format); 13] = [
+pub const PRESETS: [(&str, Format); 9] = [
     ("PCM16_8K", PCM16_8K),
     ("PCM16_16K", PCM16_16K),
     ("PCM16_24K", PCM16_24K),
@@ -135,10 +129,6 @@ pub const PRESETS: [(&str, Format); 13] = [
     ("F32_48K_STEREO", F32_48K_STEREO),
     ("MULAW_8K", MULAW_8K),
     ("ALAW_8K", ALAW_8K),
-    ("GPT_LIVE", GPT_LIVE),
-    ("OPENAI_REALTIME", OPENAI_REALTIME),
-    ("GEMINI_LIVE_INPUT", GEMINI_LIVE_INPUT),
-    ("GEMINI_LIVE_OUTPUT", GEMINI_LIVE_OUTPUT),
 ];
 
 fn bad_spec(spec: &str) -> CoreError {
@@ -174,7 +164,8 @@ impl Format {
     }
 
     /// Parses `'pcm16_24k'`, `'pcm16_48k_stereo'`, `'f32_48k'`, `'mulaw'`, `'alaw'`,
-    /// `'pcm16le/24000/1'`, a preset name (`'GPT_LIVE'`), or a MIME type from [`Format::mime_type`].
+    /// `'pcm16le/24000/1'`, a preset name (`'PCM16_48K_STEREO'`), or a MIME type from
+    /// [`Format::mime_type`].
     pub fn parse(spec: &str) -> Result<Self, CoreError> {
         let s = spec.trim().to_ascii_lowercase();
         if let Some((_, f)) = PRESETS
@@ -312,19 +303,6 @@ impl Format {
             Encoding::ALaw => Cow::Borrowed("audio/pcma"),
             Encoding::Pcm16Le => Cow::Owned(format!("audio/pcm;rate={}{ch}", self.rate.hz())),
             Encoding::F32Le => Cow::Owned(format!("audio/x-f32le;rate={}{ch}", self.rate.hz())),
-        }
-    }
-
-    /// The OpenAI session format object as `(type, rate)`: `("audio/pcm", Some(R))` for mono PCM16
-    /// at 16/24 kHz, `("audio/pcmu", None)`, `("audio/pcma", None)`; `None` for anything else.
-    pub fn openai_format(self) -> Option<(&'static str, Option<u32>)> {
-        match (self.encoding, self.rate, self.channels) {
-            (Encoding::Pcm16Le, SampleRate::Hz16000 | SampleRate::Hz24000, 1) => {
-                Some(("audio/pcm", Some(self.rate.hz())))
-            }
-            (Encoding::MuLaw, _, _) => Some(("audio/pcmu", None)),
-            (Encoding::ALaw, _, _) => Some(("audio/pcma", None)),
-            _ => None,
         }
     }
 
@@ -678,8 +656,8 @@ mod tests {
             ("f32le/48000", F32_48K),
             ("alaw/8000/1", ALAW_8K),
             ("  Pcm16_16k ", PCM16_16K),
-            ("gpt_live", GPT_LIVE),
-            ("GEMINI_LIVE_INPUT", PCM16_16K),
+            ("PCM16_48K_STEREO", PCM16_48K_STEREO),
+            ("alaw_8k", ALAW_8K),
             ("audio/pcm;rate=24000", PCM16_24K),
             ("audio/pcmu", MULAW_8K),
             ("audio/x-f32le;rate=48000;channels=2", F32_48K_STEREO),
@@ -753,19 +731,11 @@ mod tests {
     }
 
     #[test]
-    fn openai_formats() {
-        assert_eq!(PCM16_24K.openai_format(), Some(("audio/pcm", Some(24_000))));
-        assert_eq!(PCM16_16K.openai_format(), Some(("audio/pcm", Some(16_000))));
-        assert_eq!(MULAW_8K.openai_format(), Some(("audio/pcmu", None)));
-        assert_eq!(ALAW_8K.openai_format(), Some(("audio/pcma", None)));
-        assert_eq!(PCM16_48K.openai_format(), None);
-        assert_eq!(F32_48K.openai_format(), None);
-        assert_eq!(
-            Format::new(24_000, 2, Encoding::Pcm16Le)
-                .unwrap()
-                .openai_format(),
-            None
-        );
+    fn only_neutral_presets() {
+        assert_eq!(PCM16_48K_STEREO.bytes_per_ms(), 192);
+        for (name, f) in PRESETS {
+            assert_eq!(Format::parse(name).unwrap(), f, "{name}");
+        }
     }
 
     #[test]

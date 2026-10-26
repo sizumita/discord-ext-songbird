@@ -19,7 +19,7 @@ use super::test_util::{RtpBuild, hub, opus_frames, sine48, token};
 use crate::ctrl::CtrlQueue;
 use crate::error::CloseReason;
 use crate::events::{EventData, EventHub, Pop};
-use crate::format::{Encoding, Format, GPT_LIVE, PCM16_24K, PCM16_48K, SampleRate};
+use crate::format::{Encoding, Format, PCM16_24K, PCM16_48K, SampleRate};
 use crate::wake::WakeHub;
 
 const A: u64 = 1_001;
@@ -322,7 +322,7 @@ fn real_audio_per_user_and_mixed() {
     let ua = r.user(A, PCM16_48K, 20);
     let ub = r.user(B, PCM16_48K, 20);
     let ub2 = r.user(B, PCM16_48K, 20);
-    let mix = r.mixed(MixFilter::everyone(), GPT_LIVE, 20);
+    let mix = r.mixed(MixFilter::everyone(), PCM16_24K, 20);
     let pa = voice(440.0, 0.3, 60);
     let pb = voice(660.0, 0.05, 60);
     for i in 0..60 {

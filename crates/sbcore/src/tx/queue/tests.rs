@@ -84,7 +84,7 @@ impl Rig {
     }
 
     pub(crate) fn write(&self, b: &[u8]) -> Result<WriteOutcome, CoreError> {
-        self.q.write(WriteData::Pcm(b), WriteMeta::default())
+        self.q.write(b, WriteMeta::default())
     }
 
     pub(crate) fn write_at(
@@ -93,7 +93,7 @@ impl Rig {
         tag: Option<&str>,
         at_ms: Option<i64>,
     ) -> Result<WriteOutcome, CoreError> {
-        self.q.write(WriteData::Pcm(b), WriteMeta { tag, at_ms })
+        self.q.write(b, WriteMeta { tag, at_ms })
     }
 
     /// `ms` of a non-zero signal in the stream format.
@@ -285,25 +285,20 @@ fn exact_stream_survives_full_and_retry() {
 }
 
 #[test]
-fn base64_errors_consume_nothing_and_cap_is_checked_first() {
+fn rejected_writes_consume_nothing_and_cap_is_checked_first() {
     let r = Rig::new(small(spec(PCM16_24K), 100)); // 4800 bytes
     r.write(&[0x34]).unwrap();
-    assert!(matches!(
-        r.q.write(WriteData::Base64(b"@@@@"), WriteMeta::default()),
-        Err(CoreError::InvalidAudio(_))
-    ));
-    assert_eq!(r.q.st.carry_len.load(Ordering::Acquire), 1);
-    let text = vec![b'A'; 8_000]; // ≈ 6000 bytes > 4800
+    let data = vec![0u8; 6_000]; // > 4800
     let guard = crate::alloc_count::CountGuard::new();
     let before = crate::alloc_count::count();
-    let res = r.q.write(WriteData::Base64(&text), WriteMeta::default());
+    let res = r.q.write(&data, WriteMeta::default());
     let after = crate::alloc_count::count();
     drop(guard);
     assert_eq!(after, before, "no allocation before the cap check");
     assert!(matches!(res, Err(CoreError::Limit(_))));
-    // "EgA=" = [0x12, 0x00]: completes the carried byte → 0x1234, then carries 0x00.
-    r.q.write(WriteData::Base64(b"EgA="), WriteMeta::default())
-        .unwrap();
+    assert_eq!(r.q.st.carry_len.load(Ordering::Acquire), 1);
+    // [0x12, 0x00]: completes the carried byte → 0x1234, then carries 0x00.
+    r.q.write(&[0x12, 0x00], WriteMeta::default()).unwrap();
     assert_eq!(r.queued(), 1);
     let (buf, _) = r.pull();
     assert_eq!(buf[0], 0x1234);
@@ -329,8 +324,7 @@ fn concurrent_writers_never_lose_or_duplicate_bytes() {
             std::thread::spawn(move || {
                 for i in 0..3_000usize {
                     let data = vec![t as u8; 1 + (i + t) % 5];
-                    q.write(WriteData::Pcm(&data), WriteMeta::default())
-                        .unwrap();
+                    q.write(&data, WriteMeta::default()).unwrap();
                 }
             })
         })
@@ -354,11 +348,10 @@ fn clear_and_close_never_wait_for_a_parsing_writer() {
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
     let writer = std::thread::spawn(move || {
-        let mut text = String::new();
-        crate::dsp::b64::encode_into(&vec![7u8; 3 << 20], &mut text);
+        let data = vec![7u8; 4 << 20];
         let mut n = 0;
         while !stop2.load(Ordering::Acquire) && n < 20 {
-            let _ = q.write(WriteData::Base64(text.as_bytes()), WriteMeta::default());
+            let _ = q.write(&data, WriteMeta::default());
             n += 1;
         }
     });
@@ -1019,8 +1012,7 @@ fn a_close_before_attach_is_applied_when_the_track_attaches() {
     assert_eq!(log.calls(), vec!["stop"]);
     // Written, then drain-closed before the attach: it plays out (EOF once empty), no stop.
     let (q, _hub, _bell) = unattached(spec(PCM16_24K));
-    q.write(WriteData::Pcm(&[1, 0, 2, 0]), WriteMeta::default())
-        .unwrap();
+    q.write(&[1, 0, 2, 0], WriteMeta::default()).unwrap();
     LiveSource::close(&*q, CloseMode::Drain);
     let log = Rec::default();
     q.attach_track(Box::new(log.clone()));
