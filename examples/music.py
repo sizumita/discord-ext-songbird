@@ -2,7 +2,8 @@
 
 Commands (in a guild text channel, while in a voice channel):
 
-* ``!play <path>``   — queue a local audio file (wav/mp3/ogg/flac/…, see ``supported_codecs()``)
+* ``!play <path>``   — queue an audio file from ``MUSIC_DIR`` (wav/mp3/ogg/flac/…, see
+  ``supported_codecs()``)
 * ``!stream <url>``  — queue an HTTP audio stream; it is fetched and decoded only once it is current
 * ``!skip``, ``!pause``, ``!resume``, ``!stop``, ``!queue``, ``!volume <0-200>``, ``!leave``
 
@@ -34,13 +35,23 @@ async def http_stream(url: str, chunk_size: int = 16_384) -> AsyncIterator[bytes
             yield chunk
 
 
-async def voice_for(msg: discord.Message) -> songbird.SongbirdClient | None:
-    """The guild's songbird client, connecting to the author's channel if needed."""
+def music_path(arg: str) -> Path | None:
+    """``arg`` resolved inside ``MUSIC_DIR``; ``None`` if it points anywhere else (``../``, absolute
+    paths, symlinks out of the directory): chat users must not choose arbitrary files to read."""
+    root = MUSIC_DIR.resolve()
+    path = (root / arg).resolve()
+    return path if path.is_relative_to(root) and path != root else None
+
+
+async def voice_for(msg: discord.Message, *, join: bool) -> songbird.SongbirdClient | None:
+    """The guild's songbird client; with ``join=True`` connect to the author's channel if needed."""
     guild = msg.guild
     if guild is None or not isinstance(msg.author, discord.Member):
         return None
     if isinstance(guild.voice_client, songbird.SongbirdClient):
         return guild.voice_client
+    if not join:
+        return None
     if msg.author.voice is None or msg.author.voice.channel is None:
         await msg.reply("Join a voice channel first.")
         return None
@@ -68,16 +79,21 @@ async def on_message(msg: discord.Message) -> None:
     cmd, _, arg = msg.content.partition(" ")
     if cmd not in {"!play", "!stream", "!skip", "!pause", "!resume", "!stop", "!queue", "!volume", "!leave"}:
         return
-    vc = await voice_for(msg)
+    vc = await voice_for(msg, join=cmd in {"!play", "!stream"})
     if vc is None:
         return
+    for ended in [h for h in titles if h.ended]:  # keep the title table bounded
+        del titles[ended]
     volume = volumes.get(msg.guild.id, 1.0)
     match cmd:
         case "!play":
+            if (path := music_path(arg.strip())) is None:
+                await msg.reply("Only files inside the music directory can be played.")
+                return
             try:
-                source = await load_audio_file(MUSIC_DIR / arg.strip())  # off the event loop
-            except (OSError, SourceError) as e:
-                await msg.reply(f"Cannot play {arg!r}: {e}")
+                source = await load_audio_file(path)  # off the event loop
+            except OSError, SourceError:
+                await msg.reply(f"Cannot play {arg.strip()!r}.")
                 return
             handle = vc.enqueue(source, volume=volume)
             titles[handle] = f"{arg.strip()} ({(source.duration_ms or 0) // 1000} s)"

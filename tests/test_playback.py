@@ -451,3 +451,55 @@ async def test_mixer_pull_does_not_allocate(connected_vc: HarnessClient, testing
     mh.pull(40)
     assert testing.alloc_count() == before
     pb.close()
+
+
+class _StubbornSink:
+    """A native sink/playback stand-in that reports space but rejects the first writes
+    (another thread took the space, or gap silence does not fit)."""
+
+    track: Any = None
+    wake_id = 0
+    playback_id = 1
+
+    def __init__(self, rejections: int) -> None:
+        self.rejections = rejections
+        self.calls = 0
+
+    def _attempt(self, *_args: Any) -> None:
+        self.calls += 1
+        if self.calls <= self.rejections:
+            raise PlaybackFull(20, 20)
+
+    write = send = write_base64 = _attempt
+
+    def arm_space(self, *_args: Any) -> bool:
+        return True
+
+
+@pytest.mark.parametrize("kind", ["playback", "encoded", "opus"])
+async def test_write_retries_never_starve_the_loop(kind: str) -> None:
+    from discord.ext.songbird import EncodedStream, OpusPacketStream
+
+    stub = _StubbornSink(rejections=3)
+    sink: Any = stub  # stands in for the native sink types
+    ticks = 0
+
+    async def other_task() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    t = asyncio.create_task(other_task())
+    await asyncio.sleep(0)
+    before = ticks
+    pump: Any = None  # never reached: arm_space always reports space
+    if kind == "playback":
+        await asyncio.wait_for(PlaybackStream(sink, pump, FMT).write(b"\0\0"), 2)
+    elif kind == "encoded":
+        await asyncio.wait_for(EncodedStream(sink, pump).write(b"\0\0"), 2)
+    else:
+        await asyncio.wait_for(OpusPacketStream(sink, pump).send(b"\xf8\xff\xfe"), 2)
+    t.cancel()
+    assert stub.calls == 4
+    assert ticks > before  # the retry loop yielded to the event loop between attempts

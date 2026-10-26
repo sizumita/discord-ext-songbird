@@ -237,3 +237,15 @@ async def test_record_stops_on_request(world: World, testing: Any, tmp_path: Pat
     await asyncio.wait_for(task, 5)
     assert vc.is_connected()
     await vc.disconnect()
+
+
+def test_music_paths_stay_inside_the_music_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    mod = load_example("music")
+    monkeypatch.setattr(mod, "MUSIC_DIR", tmp_path)
+    (tmp_path / "song.wav").write_bytes(b"")
+    (tmp_path / "sub").mkdir()
+    assert mod.music_path("song.wav") == (tmp_path / "song.wav").resolve()
+    assert mod.music_path("sub/../song.wav") == (tmp_path / "song.wav").resolve()
+    assert mod.music_path("../outside.wav") is None
+    assert mod.music_path("/etc/passwd") is None
+    assert mod.music_path("") is None

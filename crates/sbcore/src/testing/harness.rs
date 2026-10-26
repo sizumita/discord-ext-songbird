@@ -110,7 +110,6 @@ impl Harness {
             return Ok(());
         };
         let target = self.clock.elapsed().saturating_add(advance);
-        let tick = Duration::from_millis(u64::from(TICK_MS));
         loop {
             let now = self.clock.now();
             let next = match catch_unwind(AssertUnwindSafe(|| worker.step(now))) {
@@ -127,14 +126,9 @@ impl Harness {
             if elapsed >= target {
                 return Ok(());
             }
-            let mut inc = tick.min(target.saturating_sub(elapsed));
-            if let Some(at) = next
-                && let Some(until) = at.checked_duration_since(now)
-                && !until.is_zero()
-            {
-                inc = inc.min(until).max(Duration::from_millis(1));
-            }
-            self.clock.advance(inc);
+            let until = next.and_then(|at| at.checked_duration_since(now));
+            self.clock
+                .advance(next_increment(target.saturating_sub(elapsed), until));
         }
     }
 
@@ -176,6 +170,19 @@ impl Drop for Harness {
         registry::sweep(self.key, true);
         registry::unregister_conn(self.key);
     }
+}
+
+/// The next manual-clock increment of [`Harness::step`]: at most one tick, earlier when the worker
+/// asked to be woken sooner (`until`, but at least 1 ms), and **never past `remaining`**, so a step
+/// of `n` ms advances the clock by exactly `n` ms.
+fn next_increment(remaining: Duration, until: Option<Duration>) -> Duration {
+    let mut inc = Duration::from_millis(u64::from(TICK_MS)).min(remaining);
+    if let Some(u) = until
+        && !u.is_zero()
+    {
+        inc = inc.min(u).max(Duration::from_millis(1));
+    }
+    inc.min(remaining)
 }
 
 #[cfg(unix)]
@@ -379,6 +386,30 @@ mod tests {
             }
             Err(e) => assert!(matches!(e, CoreError::Internal(_)), "{e:?}"),
         }
+    }
+
+    #[test]
+    fn step_increments_never_overshoot() {
+        let ms = Duration::from_millis;
+        let us = Duration::from_micros;
+        assert_eq!(next_increment(ms(100), None), ms(20));
+        assert_eq!(next_increment(ms(5), None), ms(5));
+        assert_eq!(next_increment(ms(100), Some(ms(3))), ms(3));
+        assert_eq!(next_increment(ms(100), Some(Duration::ZERO)), ms(20));
+        // A sub-millisecond wake-up is rounded up to 1 ms …
+        assert_eq!(next_increment(ms(100), Some(us(200))), ms(1));
+        // … but never past the end of the step (it used to overshoot by up to 1 ms).
+        assert_eq!(next_increment(us(500), Some(us(200))), us(500));
+        // Summing increments reaches the target exactly, whatever the wake-ups.
+        let target = ms(100);
+        let mut elapsed = Duration::ZERO;
+        let wakes = [us(1_500), us(300), us(700), us(19_900)];
+        let mut i = 0;
+        while elapsed < target {
+            elapsed += next_increment(target - elapsed, Some(wakes[i % wakes.len()]));
+            i += 1;
+        }
+        assert_eq!(elapsed, target);
     }
 
     #[test]

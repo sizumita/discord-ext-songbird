@@ -327,3 +327,29 @@ async def test_opus_stream_plumbing(connected_vc: HarnessClient, testing: Any) -
             stream.send_nowait(TEN_MS_FRAME)
         assert stream.clear() == 40
         stream.close()
+
+
+async def test_queue_feed_ends_quietly_when_the_connection_closes(
+    connected_vc: HarnessClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    vc = connected_vc
+    blocked = asyncio.Event()
+
+    async def endless() -> AsyncIterator[bytes]:
+        yield wav_bytes(40)
+        blocked.set()
+        await asyncio.Event().wait()  # an upstream that never sends again
+        yield b""
+
+    vc.queue.enqueue_stream(endless())
+    for _ in range(3):
+        vc.harness.step(20)
+        await pump_settle()
+    await asyncio.wait_for(blocked.wait(), 2)
+    feeds = set(vc.queue._tasks)
+    assert feeds
+    with caplog.at_level("ERROR", logger="discord.ext.songbird"):
+        await vc.disconnect()
+        await asyncio.sleep(0.01)
+    assert all(t.done() for t in feeds)  # the feed waiting on its source was cancelled
+    assert not [r for r in caplog.records if r.levelname == "ERROR"], caplog.records

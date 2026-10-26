@@ -372,3 +372,139 @@ async def test_helper_connect(world: World, testing: Any, monkeypatch: pytest.Mo
     await t
     assert isinstance(vc, HarnessClient) and vc._config.mix_mode == "mono"
     await vc.disconnect()
+
+
+async def test_cancelled_connect_keeps_the_owed_leave(world: World) -> None:
+    # An aborted connect owes a (slow) leave. A second connect() that is cancelled while it waits
+    # for that leave must not cancel it: the bot would otherwise stay in the channel.
+    world.guild.send_server_update = False
+    world.guild.leave_delay = 0.3
+    with pytest.raises(ConnectTimeout):
+        await world.channel.connect(cls=client_factory(), timeout=0.05, reconnect=True)
+    task = asyncio.create_task(world.channel.connect(cls=client_factory(), timeout=5, reconnect=True))
+    await asyncio.sleep(0.05)  # the new connect is waiting for the owed leave
+    assert world.guild.op4 == [Op4(CHANNEL_ID, False, False)]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert registered(world) is None
+    await wait_for(lambda: Op4(None, False, False) in world.guild.op4, timeout=2)
+    # The next connect still orders its join after that leave.
+    world.guild.send_server_update = True
+    world.guild.leave_delay = 0.0
+    vc = await connect_detached(world)
+    assert [op.channel_id for op in world.guild.op4] == [CHANNEL_ID, None, CHANNEL_ID]
+    await vc.disconnect()
+
+
+async def test_owed_leave_is_still_awaited_after_a_cancelled_connect(world: World) -> None:
+    world.guild.send_server_update = False
+    world.guild.leave_delay = 0.3
+    with pytest.raises(ConnectTimeout):
+        await world.channel.connect(cls=client_factory(), timeout=0.05, reconnect=True)
+    task = asyncio.create_task(world.channel.connect(cls=client_factory(), timeout=5, reconnect=True))
+    await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # Connect again at once: the join must still wait for the (re-registered) owed leave.
+    world.guild.send_server_update = True
+    vc = await connect_detached(world)
+    assert [op.channel_id for op in world.guild.op4] == [CHANNEL_ID, None, CHANNEL_ID]
+    await vc.disconnect()
+
+
+async def test_disconnect_during_a_rejoin_never_rejoins(world: World, testing: Any) -> None:
+    vc = await connect_detached(world)
+    world.guild.respond = False
+    world.guild.leave_delay = 0.2  # the rejoin's leave op 4 is slow
+    testing.inject_driver_event(vc._conn, "disconnect", reason="io")
+    vc.harness.step(2_000)  # backoff elapses → Rejoining → Control.Rejoin → _rejoin() task
+    await pump_settle()
+    assert any(t.get_name().startswith("songbird-rejoin") for t in vc._tasks)
+    await vc.disconnect()
+    await asyncio.sleep(0.4)
+    await world.guild.settle()
+    # Nothing that puts the bot back in a channel is sent once disconnect() began.
+    assert world.guild.op4[0] == Op4(CHANNEL_ID, False, False)
+    assert all(op.channel_id is None for op in world.guild.op4[1:]), world.guild.op4
+    assert registered(world) is None
+
+
+async def test_flag_change_during_disconnect_sends_no_join(world: World) -> None:
+    vc = await connect_detached(world)
+    world.guild.leave_delay = 0.1
+    leaving = asyncio.create_task(vc.disconnect())
+    await asyncio.sleep(0.01)  # disconnect() is sending its leave op 4
+    await vc.set_self_mute(True)  # must not re-join the channel with the new flags
+    await leaving
+    assert world.guild.op4 == [Op4(CHANNEL_ID, False, False), Op4(None, False, False)]
+
+
+async def test_reconnect_and_move_after_disconnect_raise(world: World) -> None:
+    vc = await connect_detached(world)
+    await vc.disconnect()
+    with pytest.raises(ConnectionClosed):
+        await vc.reconnect(timeout=1)
+    with pytest.raises(ConnectionClosed):
+        await vc.move_to(world.other, timeout=1)
+    assert world.guild.op4 == [Op4(CHANNEL_ID, False, False), Op4(None, False, False)]
+
+
+async def test_terminal_loss_sends_a_best_effort_leave(world: World, testing: Any) -> None:
+    # Closed(lost) with reconnect=False: the last op 4 was our join, so the gateway still lists the
+    # bot in the channel. A leave is sent (once) and the next connect orders its join after it.
+    vc = await connect_detached(world, reconnect=False)
+    world.guild.respond = False
+    testing.inject_driver_event(vc._conn, "disconnect", reason="io")
+    await wait_for(lambda: registered(world) is None)
+    assert vc.status.close_reason == "lost"
+    await wait_for(lambda: len(world.guild.op4) == 2)
+    assert world.guild.op4 == [Op4(CHANNEL_ID, False, False), Op4(None, False, False)]
+    await vc.disconnect()  # already finalized: nothing more is sent
+    await asyncio.sleep(0.01)
+    assert len(world.guild.op4) == 2
+
+
+async def test_kick_sends_no_leave(world: World) -> None:
+    vc = await connect_detached(world)
+    await vc.on_voice_state_update({"channel_id": None, "session_id": "s"})  # type: ignore
+    await wait_for(lambda: registered(world) is None)
+    await asyncio.sleep(0.01)
+    assert [op.channel_id for op in world.guild.op4] == [CHANNEL_ID]  # already out of the channel
+
+
+async def test_pending_leave_of_another_event_loop_is_ignored(world: World) -> None:
+    # A leave left behind by an earlier event loop (e.g. a previous asyncio.run) can be neither
+    # awaited nor cancelled from this loop: connect() must not wait 5 s for it or touch it.
+    import threading
+
+    from discord.ext.songbird import client as client_mod
+
+    other = asyncio.new_event_loop()
+    ready = threading.Event()
+    box: dict[str, Any] = {}
+
+    def run_other() -> None:
+        asyncio.set_event_loop(other)
+        box["task"] = other.create_task(asyncio.sleep(30))
+        ready.set()
+        other.run_forever()
+        box["task"].cancel()
+        other.run_until_complete(asyncio.gather(box["task"], return_exceptions=True))
+        other.close()
+
+    thread = threading.Thread(target=run_other)
+    thread.start()
+    assert ready.wait(2)
+    client_mod._pending_leaves[GUILD_ID] = box["task"]
+    try:
+        async with asyncio.timeout(2):  # well under the 5 s owed-leave wait
+            vc = await connect_detached(world)
+        assert not box["task"].done()  # untouched
+        assert GUILD_ID not in client_mod._pending_leaves
+        await vc.disconnect()
+    finally:
+        client_mod._pending_leaves.pop(GUILD_ID, None)
+        other.call_soon_threadsafe(other.stop)
+        thread.join(5)

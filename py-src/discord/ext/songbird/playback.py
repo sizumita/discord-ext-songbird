@@ -38,6 +38,12 @@ _DRAIN_GRACE_S = 2.0
 _RETRY_S = 0.02
 
 
+async def _yield_before_retry(spins: int) -> None:
+    """Pause before retrying a write that did not fit although space was reported: yield to the
+    loop on the first retry, then wait one tick, so a retry loop can never starve the event loop."""
+    await asyncio.sleep(0 if spins <= 1 else _RETRY_S)
+
+
 def _nbytes(data: Buffer | str) -> int:
     """Decoded byte length of a write (base64 strings decode to ~3/4 of their length)."""
     if isinstance(data, str):
@@ -194,11 +200,10 @@ class PlaybackStream:
                 except PlaybackFull:
                     pass
                 if self._pb.arm_space(nbytes):
-                    # Space for `nbytes` exists, yet the write did not fit: it also needs room for
-                    # inserted gap silence. Retry after a tick instead of spinning.
+                    # Space for `nbytes` exists, yet the write did not fit (it also needs room for
+                    # inserted gap silence, or another thread took the space): never spin.
                     spins += 1
-                    if spins > 1:
-                        await asyncio.sleep(_RETRY_S)
+                    await _yield_before_retry(spins)
                     continue
                 spins = 0
                 if self._pump.is_closed:
@@ -335,6 +340,7 @@ class EncodedStream:
         """Append encoded bytes, waiting while the buffer is full."""
         n = memoryview(data).nbytes
         async with asyncio.timeout(timeout):
+            spins = 0
             while True:
                 try:
                     self._sink.write(data)
@@ -342,7 +348,10 @@ class EncodedStream:
                 except PlaybackFull:
                     pass
                 if self._sink.arm_space(n):
+                    spins += 1  # space was reported but taken (another thread): never spin
+                    await _yield_before_retry(spins)
                     continue
+                spins = 0
                 if self._pump.is_closed:
                     raise StreamClosed("connection_closed")
                 await self._pump.wait(self._sink.wake_id)
@@ -436,6 +445,7 @@ class OpusPacketStream:
     async def send(self, packet: Buffer, *, timeout: float | None = None) -> None:
         """Queue one packet, waiting while the queue is full."""
         async with asyncio.timeout(timeout):
+            spins = 0
             while True:
                 try:
                     self._sink.send(packet)
@@ -443,7 +453,10 @@ class OpusPacketStream:
                 except PlaybackFull:
                     pass
                 if self._sink.arm_space():
+                    spins += 1  # space was reported but taken (another thread): never spin
+                    await _yield_before_retry(spins)
                     continue
+                spins = 0
                 if self._pump.is_closed:
                     raise StreamClosed("connection_closed")
                 await self._pump.wait(self._sink.wake_id)

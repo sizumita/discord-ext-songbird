@@ -204,3 +204,20 @@ def test_repeated_cycles_do_not_grow_rss() -> None:
     assert proc.returncode == 0, proc.stderr
     growth = int(proc.stdout.split("GROWTH")[1])
     assert growth < 5 * 1024 * 1024
+
+
+async def test_track_queue_holds_no_reference_to_the_client(world: World) -> None:
+    vc = await connect_detached(world)
+    queue = vc.queue
+    queue_ref = weakref.ref(queue)
+    ref = weakref.ref(vc)
+    await vc.disconnect()
+    gc.disable()  # reference counting alone must free the client: no client ↔ queue cycle
+    try:
+        del vc
+        assert ref() is None
+    finally:
+        gc.enable()
+    del queue
+    collect()
+    assert queue_ref() is None

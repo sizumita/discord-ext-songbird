@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 from . import native
-from .errors import ConnectionClosed, LimitExceeded
+from ._pump import cancel_tasks
+from .errors import ConnectionClosed, LimitExceeded, StreamClosed
 
 if TYPE_CHECKING:
     from ._pump import _Pump
@@ -213,11 +214,12 @@ class TrackQueue:
     entry is :attr:`current`. Advancing is not gapless (about 20–60 ms between entries).
     """
 
-    def __init__(self, pump: _Pump, spawn: Any) -> None:
+    def __init__(self, pump: _Pump) -> None:
+        # The queue holds the pump, never the client: no client ↔ queue reference cycle.
         self._pump = pump
-        self._spawn = spawn
         # Lazy encoded-stream entries: native track → feed, fed only once the entry is current.
         self._feeds: dict[native.NativeTrack, Any] = {}
+        self._tasks: set[asyncio.Task[Any]] = set()
 
     def _wrap(self, t: native.NativeTrack) -> TrackHandle:
         return TrackHandle(t, self._pump)
@@ -341,4 +343,24 @@ class TrackQueue:
             from .playback import EncodedStream  # local: playback imports tracks
 
             stream = EncodedStream(sink, self._pump)
-            self._spawn(stream.feed_from(feed), name=f"songbird-queue-feed-{t.id}")
+            task = self._pump.loop.create_task(_feed(stream, feed), name=f"songbird-queue-feed-{t.id}")
+            self._tasks.add(task)
+            task.add_done_callback(self._feed_done)
+
+    def _feed_done(self, task: asyncio.Task[Any]) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            _log.error("songbird queue feed %s failed", task.get_name(), exc_info=exc)
+
+    def _close(self) -> None:
+        """The connection closed: stop feeding (a feed may wait on its source indefinitely)."""
+        self._feeds.clear()
+        cancel_tasks(self._tasks)
+
+
+async def _feed(stream: Any, feed: Any) -> None:
+    """Pump a queued stream's feed; ends quietly when the stream or connection closes."""
+    try:
+        await stream.feed_from(feed)
+    except StreamClosed, ConnectionClosed:
+        pass

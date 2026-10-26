@@ -28,7 +28,7 @@ import discord
 from discord import utils
 
 from . import native
-from ._pump import _Pump
+from ._pump import _Pump, cancel_tasks
 from .config import VoiceConfig
 from .errors import ConnectFailed, ConnectionClosed, ConnectTimeout, NotConnected
 from .formats import GPT_LIVE, PCM16_48K, FormatLike, as_format
@@ -49,6 +49,8 @@ _log = logging.getLogger("discord.ext.songbird")
 _pending_leaves: dict[int, asyncio.Task[None]] = {}
 
 _LEAVE_TIMEOUT_S = 5.0
+#: Terminal close reasons after which the gateway may still list the bot in a channel.
+_LEAVE_AFTER = frozenset({"connect_failed", "rejoin_failed", "lost", "session_invalid", "internal_error"})
 _PUMP_CLOSE_TIMEOUT_S = 2.0
 
 
@@ -160,8 +162,7 @@ class SongbirdClient(discord.VoiceProtocol):
         try:
             if (prev := _pending_leaves.pop(self.guild.id, None)) is not None:
                 # The leave op 4 of an earlier aborted connect must not land after our join op 4.
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(prev, _LEAVE_TIMEOUT_S)
+                await _await_pending_leave(self.guild.id, prev)
             rsock, wsock = socket.socketpair()
             self._rsock = rsock
             rsock.setblocking(False)
@@ -283,6 +284,9 @@ class SongbirdClient(discord.VoiceProtocol):
                 child.close()
         if self._conn is not None:
             self._conn.close("cleanup")
+        self._cancel_tasks()
+        if self._queue is not None:
+            self._queue._close()
         key, _ = self.channel._get_voice_client_key()
         state = self.client._connection
         if state._get_voice_client(key) is self:
@@ -366,6 +370,7 @@ class SongbirdClient(discord.VoiceProtocol):
         pump = self._require_pump()
         if channel.id == self.channel.id and conn.status().state == "connected":
             return
+        self._check_may_join()
         conn.request_move(channel.id)
         self._sent_flags = (self._self_mute, self._self_deaf)
         await self.guild.change_voice_state(channel=channel, self_mute=self._self_mute, self_deaf=self._self_deaf)
@@ -394,9 +399,11 @@ class SongbirdClient(discord.VoiceProtocol):
         """
         conn = self._require_conn()
         pump = self._require_pump()
+        self._check_may_join()
         generation = conn.status().generation
         conn.begin_rejoin()  # Rejoining: the channel=None echo is not a kick
         await self.guild.change_voice_state(channel=None)
+        self._check_may_join()  # disconnect()/close while leaving: never join again
         self._sent_flags = (self._self_mute, self._self_deaf)
         await self.guild.change_voice_state(channel=self.channel, self_mute=self._self_mute, self_deaf=self._self_deaf)
         try:
@@ -434,7 +441,7 @@ class SongbirdClient(discord.VoiceProtocol):
 
     async def _send_flags(self) -> None:
         flags = (self._self_mute, self._self_deaf)
-        if flags == self._sent_flags:
+        if flags == self._sent_flags or not self._may_join():
             return
         self._sent_flags = flags
         await self.guild.change_voice_state(channel=self.channel, self_mute=flags[0], self_deaf=flags[1])
@@ -643,7 +650,7 @@ class SongbirdClient(discord.VoiceProtocol):
         """The sequential track queue."""
         if self._queue is None:
             _conn, pump = self._require()
-            self._queue = TrackQueue(pump, self._spawn)
+            self._queue = TrackQueue(pump)
         return self._queue
 
     def stop_all(self) -> None:
@@ -668,6 +675,21 @@ class SongbirdClient(discord.VoiceProtocol):
     def _require(self) -> tuple[native.Connection, _Pump]:
         return self._require_conn(), self._require_pump()
 
+    def _may_join(self) -> bool:
+        """Whether an op 4 that puts the bot in a channel may still be sent.
+
+        Never after a leave was sent (``disconnect()``, an aborted connect) or the connection closed:
+        such an op 4 would put the bot back in the channel with nothing registered to serve it.
+        """
+        conn = self._conn
+        return conn is not None and not conn.closed and not self._finalized and not self._leave_sent
+
+    def _check_may_join(self) -> None:
+        if not self._may_join():
+            conn = self._conn
+            reason = conn.status().close_reason if conn is not None else None
+            raise ConnectionClosed(reason or "requested")
+
     def _adopt[T](self, child: T) -> T:
         self._children.add(child)
         return child
@@ -683,6 +705,10 @@ class SongbirdClient(discord.VoiceProtocol):
         self._tasks.discard(task)
         if not task.cancelled() and (exc := task.exception()) is not None:
             _log.error("songbird background task %s failed", task.get_name(), exc_info=exc)
+
+    def _cancel_tasks(self) -> None:
+        """Cancel the gateway helper tasks (rejoin, flag flush): nothing is sent after a close."""
+        cancel_tasks(self._tasks)
 
     # Pump callbacks (loop thread).
 
@@ -720,8 +746,12 @@ class SongbirdClient(discord.VoiceProtocol):
         conn.set_users_bot(pairs)
 
     async def _rejoin(self, attempt: int, channel_id: int) -> None:
+        if not self._may_join():
+            return
         _log.info("voice rejoin attempt %d (channel %d)", attempt, channel_id)
         await self.guild.change_voice_state(channel=None)
+        if not self._may_join():  # disconnect() or a close happened while leaving: stay out
+            return
         self._sent_flags = (self._self_mute, self._self_deaf)
         await self.guild.change_voice_state(
             channel=discord.Object(id=channel_id), self_mute=self._self_mute, self_deaf=self._self_deaf
@@ -732,9 +762,16 @@ class SongbirdClient(discord.VoiceProtocol):
             self._queue._on_tracks()
 
     def _finalize(self, reason: str) -> None:
-        """The connection closed (control ``Closed`` or pump EOF): close children, clean up."""
+        """The connection closed (control ``Closed`` or pump EOF): close children, clean up.
+
+        After a terminal failure the gateway may still list the bot in the channel (the last op 4
+        we sent was a join), so a best-effort leave is sent, exactly as for an aborted connect
+        (§6.2): otherwise the bot would stay visible in the channel with nothing serving it.
+        """
         if not self._finalized:
             _log.debug("songbird connection in guild %s closed: %s", self.guild.id, reason)
+            if reason in _LEAVE_AFTER and self._join_sent and not self._leave_sent:
+                self._schedule_leave()
         self.cleanup()
 
 
@@ -743,6 +780,27 @@ def _voice_channel(ch: Any) -> VocalGuildChannel | None:
     if ch is not None and callable(getattr(ch, "_get_voice_client_key", None)):
         return ch
     return None
+
+
+async def _await_pending_leave(guild_id: int, prev: asyncio.Task[None]) -> None:
+    """Wait (at most 5 s) for the best-effort leave of an earlier aborted connect (§6.2).
+
+    On timeout the leave is cancelled, so it can never be sent after the new join. If *this* wait is
+    cancelled (the new ``connect()`` was cancelled), the leave keeps running and stays registered for
+    the next ``connect()``: it is still owed, and ``asyncio.wait_for`` would have cancelled it.
+    A leave scheduled on another event loop (an earlier ``asyncio.run``) is ignored: it can neither
+    be awaited nor cancelled from here, and its gateway session is not ours.
+    """
+    if prev.get_loop() is not asyncio.get_running_loop():
+        return
+    try:
+        done, _ = await asyncio.wait({prev}, timeout=_LEAVE_TIMEOUT_S)
+    except asyncio.CancelledError:
+        if not prev.done():
+            _pending_leaves.setdefault(guild_id, prev)
+        raise
+    if not done:
+        prev.cancel()
 
 
 async def _best_effort_leave(guild: discord.Guild) -> None:

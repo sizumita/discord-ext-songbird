@@ -4,7 +4,7 @@
 //! songbird semantics that are reproduced:
 //!
 //! * a **paused** track is not pulled at all (`mixer/mod.rs:830`): live sources start paused
-//!   (§4.9), and the `FakeTrackControl` log (`pause`/`play`) tells whether the track is paused;
+//!   (§4.9), and the fake control's last `pause`/`play` tells whether the track is paused;
 //! * a packet whose `track_id` differs from the input's is skipped;
 //! * any `Err` from `next_packet` or `decode` ends the track: the pair is dropped, which runs the
 //!   real `DoneGuard` path;
@@ -190,13 +190,10 @@ impl Drop for MixerHarness {
     }
 }
 
-/// Live sources start paused (§4.9); afterwards the last `pause`/`play` of the fake control wins.
+/// Live sources start paused (§4.9); afterwards the last `pause`/`play` of the fake control wins
+/// (tracked on every call, not read from the bounded log). No fake control: paused.
 fn is_paused(flags: &Arc<TrackFlags>) -> bool {
-    registry::fake_log(flags)
-        .iter()
-        .rev()
-        .find(|c| matches!(**c, "pause" | "play"))
-        .is_none_or(|c| *c == "pause")
+    registry::fake_paused(flags).unwrap_or(true)
 }
 
 /// One `mix_symph_indiv` tick: `next_packet` → (skip foreign track ids) → `decode` → copy.
@@ -276,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn paused_state_follows_the_fake_log() {
+    fn paused_state_follows_the_fake_control() {
         let flags = Arc::new(TrackFlags::new(
             2,
             TrackKind::Playback,

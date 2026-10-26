@@ -5,6 +5,7 @@
 //! a control is dropped (drops happen after unlocking).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -192,57 +193,85 @@ pub(crate) fn parked_count(conn: ConnKey) -> usize {
 
 // ── fake track controls ─────────────────────────────────────────────────────────────────────────────
 
+/// A [`FakeTrackControl`] plus the track's pause state as songbird would see it.
+///
+/// The fake's call log is bounded ([`FakeTrackControl::LOG_CAP`]: later calls are not recorded), so
+/// the pause state cannot be derived from the log: a long test (many auto-pause/resume cycles) would
+/// freeze it at the state of the last recorded call. It is tracked here instead, on every call.
+struct SharedFake {
+    fake: FakeTrackControl,
+    /// Live sources start paused (§4.9); afterwards the last `pause`/`play` wins.
+    paused: AtomicBool,
+}
+
 struct FakeEntry {
     flags: Weak<TrackFlags>,
-    fake: Weak<FakeTrackControl>,
+    fake: Weak<SharedFake>,
 }
 
 static FAKES: Mutex<Vec<FakeEntry>> = Mutex::new(Vec::new());
 
-/// A `TrackControl` forwarding to a shared [`FakeTrackControl`] whose log `track_log` can read.
-struct SharedFake(Arc<FakeTrackControl>);
+/// The `TrackControl` a detached connection attaches: forwards to the shared fake.
+struct FakeHandle(Arc<SharedFake>);
 
-impl TrackControl for SharedFake {
+impl TrackControl for FakeHandle {
     fn pause(&self) {
-        self.0.pause();
+        self.0.paused.store(true, Ordering::SeqCst);
+        self.0.fake.pause();
     }
 
     fn play(&self) {
-        self.0.play();
+        self.0.paused.store(false, Ordering::SeqCst);
+        self.0.fake.play();
     }
 
     fn stop(&self) {
-        self.0.stop();
+        self.0.fake.stop();
     }
 }
 
 /// The track control a detached connection attaches instead of a songbird `TrackHandle` (§13.2):
 /// it records `pause`/`play`/`stop`, and `stop()` resolves `flags` as a Dispatch `End(Stop)` would.
 pub fn fake_track_control(flags: &Arc<TrackFlags>) -> Box<dyn TrackControl> {
-    let fake = Arc::new(FakeTrackControl::new(flags.clone()));
-    {
+    let shared = Arc::new(SharedFake {
+        fake: FakeTrackControl::new(flags.clone()),
+        paused: AtomicBool::new(true),
+    });
+    let evicted = {
         let mut fakes = FAKES.lock();
         fakes.retain(|e| e.fake.strong_count() > 0);
-        if fakes.len() >= MAX_FAKES {
-            fakes.remove(0);
-        }
+        let evicted = if fakes.len() >= MAX_FAKES {
+            Some(fakes.remove(0))
+        } else {
+            None
+        };
         fakes.push(FakeEntry {
             flags: Arc::downgrade(flags),
-            fake: Arc::downgrade(&fake),
+            fake: Arc::downgrade(&shared),
         });
-    }
-    Box::new(SharedFake(fake))
+        evicted
+    };
+    drop(evicted);
+    Box::new(FakeHandle(shared))
 }
 
-/// The call log of the fake control attached to `flags`; empty if there is none.
-pub(crate) fn fake_log(flags: &Arc<TrackFlags>) -> Vec<&'static str> {
-    let fake = FAKES
+fn find_fake(flags: &Arc<TrackFlags>) -> Option<Arc<SharedFake>> {
+    FAKES
         .lock()
         .iter()
         .rev()
         .find(|e| std::ptr::eq(e.flags.as_ptr(), Arc::as_ptr(flags)))
-        .and_then(|e| e.fake.upgrade());
-    fake.map(|f| f.log()).unwrap_or_default()
+        .and_then(|e| e.fake.upgrade())
+}
+
+/// The call log of the fake control attached to `flags`; empty if there is none.
+pub(crate) fn fake_log(flags: &Arc<TrackFlags>) -> Vec<&'static str> {
+    find_fake(flags).map(|f| f.fake.log()).unwrap_or_default()
+}
+
+/// Whether songbird would consider the track paused: `None` if no fake control is attached.
+pub(crate) fn fake_paused(flags: &Arc<TrackFlags>) -> Option<bool> {
+    find_fake(flags).map(|f| f.paused.load(Ordering::SeqCst))
 }
 
 #[cfg(test)]
@@ -275,6 +304,24 @@ mod tests {
         assert!(fake_log(&flags(2)).is_empty());
         drop(ctl);
         assert!(fake_log(&f).is_empty());
+    }
+
+    #[test]
+    fn pause_state_survives_the_bounded_log() {
+        let f = flags(3);
+        let ctl = fake_track_control(&f);
+        assert_eq!(fake_paused(&f), Some(true)); // live sources start paused
+        // Far more calls than the log keeps: the pause state must still follow the last call.
+        for _ in 0..FakeTrackControl::LOG_CAP {
+            ctl.play();
+            ctl.pause();
+        }
+        assert_eq!(fake_log(&f).len(), FakeTrackControl::LOG_CAP);
+        ctl.play();
+        assert_eq!(fake_paused(&f), Some(false));
+        ctl.pause();
+        assert_eq!(fake_paused(&f), Some(true));
+        assert_eq!(fake_paused(&flags(4)), None);
     }
 
     #[test]

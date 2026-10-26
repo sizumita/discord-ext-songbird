@@ -18,10 +18,11 @@ connection too (``"loop_closed"``), so a loop that dies always tears it down.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import socket
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any
 
 from . import native
@@ -30,7 +31,7 @@ from .errors import ConnectionClosed
 if TYPE_CHECKING:
     from .client import SongbirdClient
 
-__all__ = ["_Pump"]
+__all__ = ["_Pump", "cancel_tasks"]
 
 _log = logging.getLogger("discord.ext.songbird")
 
@@ -321,3 +322,21 @@ class _Pump:
                         pass
                     if not futs:
                         del self._track_waiters[track]
+
+
+def cancel_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:
+    """Cancel every pending task of ``tasks`` except the running one; thread-safe."""
+    try:
+        current = asyncio.current_task()
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        current = running = None
+    for task in list(tasks):
+        if task is current or task.done():
+            continue
+        loop = task.get_loop()
+        if loop is running:
+            task.cancel()
+        elif not loop.is_closed():
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(task.cancel)

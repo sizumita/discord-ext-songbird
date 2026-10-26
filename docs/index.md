@@ -46,7 +46,10 @@ vc = await channel.connect(cls=songbird.SongbirdClient.with_config(receive=False
   raises `ConnectFailed`. On *any* failure — including cancellation — the connection is torn down,
   a best-effort leave is sent and the client is unregistered, so retrying never hits "Already
   connected".
-- `disconnect()` always cleans up, is idempotent and never raises for gateway errors.
+- `disconnect()` always cleans up, is idempotent and never raises for gateway errors. Once it has
+  started, nothing the library does in the background (a rejoin, a flag flush) sends another join.
+- When an established connection ends terminally (`lost`, `rejoin_failed`, `session_invalid`, …)
+  a best-effort leave is sent too, so the bot does not stay listed in the channel.
 - `move_to(channel)` waits until the move completes; `reconnect()` forces a fresh voice session
   (the recovery for stalled receive or DAVE; `VoiceConfig.auto_recover` does it automatically).
 - `await set_self_mute(True)` stops sending audio; live streams hold their position while muted.
