@@ -266,14 +266,24 @@ pub struct StatusSnapshot {
 }
 
 /// The voice server half of the connection info.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct ServerInfo {
     token: Box<str>,
     endpoint: Box<str>,
 }
 
+/// Secrets (§6.3): `GatewayState` is `Debug`, so the token must never be printed.
+impl std::fmt::Debug for ServerInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerInfo")
+            .field("token", &"<redacted>")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
 /// The state machine. Pure: `step` performs no I/O and never blocks.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GatewayState {
     p: GatewayParams,
     phase: Phase,
@@ -302,6 +312,25 @@ pub struct GatewayState {
     /// (phase, input) pairs that matched no row (§4.5 default rule).
     unlisted: u64,
     action_seq: u64,
+}
+
+/// Secrets (§6.3): the token is never printed and the session id only as a length.
+impl std::fmt::Debug for GatewayState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayState")
+            .field("phase", &self.phase)
+            .field("target", &self.target)
+            .field("channel", &self.channel)
+            .field("connect_target", &self.connect_target)
+            .field("session_len", &self.session.as_ref().map(|s| s.len()))
+            .field("server", &self.server)
+            .field("prev_server", &self.prev_server)
+            .field("generation", &self.generation)
+            .field("attempt", &self.attempt)
+            .field("leave_requested", &self.leave_requested)
+            .field("ssrc", &self.ssrc)
+            .finish_non_exhaustive()
+    }
 }
 
 /// SplitMix64 (deterministic jitter; the state machine stays pure).

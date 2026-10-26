@@ -1195,3 +1195,19 @@ fn new_state_is_idle() {
     assert_eq!(s.generation, 0);
     assert!(g.next_deadline().is_none());
 }
+
+#[test]
+fn debug_output_never_contains_secrets() {
+    let mut h = H::new(params(true, 3));
+    h.step(GwInput::Join {
+        channel: nz(10),
+        self_mute: false,
+        self_deaf: false,
+    });
+    h.step(vs("secret-session-id", Some(10)));
+    h.step(vsrv("secret-token", Some("wss://host.example/")));
+    let dbg = format!("{:?}", h.g);
+    assert!(!dbg.contains("secret-token"), "{dbg}");
+    assert!(!dbg.contains("secret-session-id"), "{dbg}");
+    assert!(dbg.contains("host.example"));
+}

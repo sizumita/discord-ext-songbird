@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+mod admission;
 #[cfg(feature = "test-hooks")]
 mod detached;
 pub mod dispatch;

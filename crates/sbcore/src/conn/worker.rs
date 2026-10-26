@@ -558,6 +558,63 @@ mod tests {
         assert!(w.cmds.lock().is_empty());
     }
 
+    /// §13.1: a heartbeat gap > 3 s (receive off) triggers a rate-limited `ReinstallDispatch`.
+    #[test]
+    fn heartbeat_gap_reinstalls_the_dispatcher_rate_limited() {
+        use crate::clock::Clock;
+        use crate::conn::settings::{ConnParams, RawVoiceSettings, VoiceSettings};
+        use crate::wake::Doorbell;
+        use std::num::NonZeroU64;
+        use std::os::unix::net::UnixStream;
+
+        let _serial = crate::conn::TEST_LOCK.lock();
+        let (clock, m) = Clock::manual();
+        let (a, _peer) = UnixStream::pair().unwrap();
+        let p = ConnParams {
+            guild_id: NonZeroU64::new(1).unwrap(),
+            user_id: NonZeroU64::new(2).unwrap(),
+            reconnect: true,
+            settings: VoiceSettings::validate(RawVoiceSettings {
+                receive: false,
+                ..RawVoiceSettings::default()
+            })
+            .unwrap(),
+            clock,
+        };
+        let (conn, mut w) =
+            ConnShared::new_unspawned(p, Doorbell::from_unix_stream(a).unwrap()).unwrap();
+        let reinstalls = || {
+            conn.stats()
+                .iter()
+                .find(|(k, _)| *k == "dispatch_reinstalls")
+                .map(|(_, v)| *v)
+        };
+        conn.request_join(NonZeroU64::new(10).unwrap(), false, false);
+        // Within 3 s of the last heartbeat (or of the Driver's creation): nothing.
+        let due = w.watch_heartbeat(&conn, m.now()).expect("watchdog armed");
+        assert!(due > m.now());
+        assert_eq!(reinstalls(), Some(0));
+        // The (manual) clock runs 10 s ahead of every real heartbeat: handlers are lost.
+        m.advance(Duration::from_secs(10));
+        let next = w.watch_heartbeat(&conn, m.now());
+        assert_eq!(next, Some(m.now() + WATCHDOG_REPEAT));
+        assert_eq!(reinstalls(), Some(1));
+        assert_eq!(w.shared.heartbeat_misses(), 1);
+        // Repeated every second while the gap lasts; the reinstall itself at most every 5 s.
+        m.advance(Duration::from_secs(1));
+        w.watch_heartbeat(&conn, m.now());
+        assert_eq!(reinstalls(), Some(1));
+        assert_eq!(w.shared.heartbeat_misses(), 2);
+        m.advance(Duration::from_secs(4));
+        w.watch_heartbeat(&conn, m.now());
+        assert_eq!(reinstalls(), Some(2));
+        conn.close(CloseReason::Cleanup);
+        assert!(
+            w.watch_heartbeat(&conn, m.now()).is_none(),
+            "no watchdog after close"
+        );
+    }
+
     #[test]
     fn earliest_picks_the_minimum() {
         let t = Instant::now();

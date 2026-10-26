@@ -378,5 +378,118 @@ fn shutdown_all_closes_every_registered_connection() {
     );
 }
 
+#[test]
+fn an_op_started_while_closing_is_failed_at_once() {
+    let _serial = TEST_LOCK.lock();
+    let (b, _peer) = bell();
+    let conn = ConnShared::new(params(Clock::Real, RawVoiceSettings::default()), b).unwrap();
+    conn.close(CloseReason::Requested);
+    // An op that passed `ensure_open` before T0 but registered after T8's `fail_all`.
+    let id = conn
+        .ops
+        .start(&conn.wake, std::future::pending::<OpResult>())
+        .unwrap();
+    conn.fail_ops_if_closed();
+    let mut out = Vec::new();
+    conn.take_op_results(&mut out);
+    assert!(
+        matches!(out[..], [(i, OpResult::Err(CoreError::ConnectionClosed(_)))] if i == id),
+        "{out:?}"
+    );
+    assert_eq!(conn.ops.pending(), 0);
+}
+
+#[test]
+fn an_executor_panic_does_not_wedge_the_state_machine() {
+    let _serial = TEST_LOCK.lock();
+    let (b, _peer) = bell();
+    let conn = ConnShared::new(params(Clock::Real, RawVoiceSettings::default()), b).unwrap();
+    conn.panic_next_execute.store(true, Ordering::Release);
+    // Join → SetSendMute(false): its execution unwinds (as a bug in an action would).
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        conn.request_join(NonZeroU64::new(10).unwrap(), false, false)
+    }));
+    assert!(r.is_err());
+    assert_eq!(conn.status().state, "joining");
+    // Later batches still execute (a stuck `executing` flag would only queue them).
+    conn.set_self_flags(true, false);
+    assert!(conn.send_muted.load(Ordering::Acquire));
+    assert!(conn.pending.lock().is_empty());
+    conn.close(CloseReason::Cleanup);
+    assert_eq!(conn.status().state, "closed");
+}
+
+#[test]
+fn a_forked_child_leaks_the_driver_instead_of_dropping_it() {
+    let _serial = TEST_LOCK.lock();
+    let (b, _peer) = bell();
+    let foreign = std::process::id().wrapping_add(1);
+    let conn =
+        ConnShared::new_with_pid(params(Clock::Real, RawVoiceSettings::default()), b, foreign)
+            .unwrap();
+    let events = conn.subscribe_events(4, KindMask::ALL).unwrap();
+    let drivers = live(&live::OWNED_DRIVER);
+    // In the child, close() and Drop skip T1–T9 (§4.10)…
+    conn.close(CloseReason::LoopClosed);
+    assert_eq!(conn.status().state, "idle", "T1 skipped");
+    assert!(!events.is_closed(), "T6 skipped");
+    assert_eq!(live(&live::OWNED_DRIVER), drivers, "T2–T4 skipped");
+    // …and the last reference leaks the inherited Driver (no Poison from the child).
+    drop(conn);
+    let leaked: Vec<OwnedDriver> = std::mem::take(&mut *LEAKED_DRIVERS.lock());
+    assert_eq!(leaked.len(), 1);
+    assert_eq!(live(&live::OWNED_DRIVER), drivers);
+    // This test runs in the creating process: tear the "leaked" Driver down for real.
+    for d in leaked {
+        d.teardown();
+    }
+    assert_eq!(live(&live::OWNED_DRIVER), drivers - 1);
+}
+
+#[test]
+fn entries_enqueued_while_closing_always_end() {
+    let _serial = TEST_LOCK.lock();
+    for _ in 0..20 {
+        let (b, _peer) = bell();
+        let conn = ConnShared::new(params(Clock::Real, RawVoiceSettings::default()), b).unwrap();
+        let start = Arc::new(std::sync::Barrier::new(5));
+        let enqueuers: Vec<_> = (0..4)
+            .map(|_| {
+                let (c, start) = (conn.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    let mut got = Vec::new();
+                    while let Ok(t) = c.queue().enqueue(
+                        SourceSpec::Encoded(crate::tx::source::EncodedFactory {
+                            spec: EncodedSpec {
+                                max_buffer_bytes: 1 << 20,
+                                volume: 1.0,
+                            },
+                        }),
+                        PlayOpts::default(),
+                        c.tracks(),
+                    ) {
+                        got.push(t);
+                        if got.len() >= 2_000 {
+                            break;
+                        }
+                    }
+                    got
+                })
+            })
+            .collect();
+        start.wait();
+        conn.close(CloseReason::Requested);
+        for t in enqueuers {
+            for track in t.join().unwrap() {
+                assert!(
+                    track.flags.ended().is_some(),
+                    "a pending entry outlived the connection unresolved"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(feature = "test-hooks")]
 mod detached;

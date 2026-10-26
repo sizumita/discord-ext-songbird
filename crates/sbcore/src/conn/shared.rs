@@ -22,6 +22,7 @@ use songbird::tracks::TrackHandle;
 use tokio::task::AbortHandle;
 
 use super::LogLimiter;
+use super::admission::{Admission, Reservation};
 use super::dispatch::Dispatch;
 use super::driver::{OwnedDriver, build_config, connect_deadline};
 use super::gateway::{
@@ -119,10 +120,19 @@ pub struct ConnShared {
     t0: Instant,
     next_sub_id: AtomicU64,
     stats: ConnStats,
+    /// Race-free I6 admissions (free-threaded callers): `MAX_PLAYING_TRACKS_PER_CONN`,
+    /// `MAX_LIVE_SOURCES_PER_CONN`, `MAX_SUBS_PER_CONN` (subscriptions and routers).
+    playing_adm: Admission,
+    live_adm: Admission,
+    subs_adm: Admission,
+    routers_adm: Admission,
     #[cfg(feature = "test-hooks")]
     pub(super) det: super::detached::DetachedState,
     #[cfg(test)]
     exec_log: Mutex<Vec<Exec>>,
+    /// Makes the next `execute` panic (executor unwind-safety test).
+    #[cfg(test)]
+    panic_next_execute: AtomicBool,
     _live: LiveCounter,
 }
 
@@ -140,7 +150,28 @@ impl ConnShared {
     /// Builds the Driver, the Dispatch and the ConnWorker (spawned on the RX runtime) and registers
     /// the connection. The doorbell is dropped (closed) on failure.
     pub fn new(p: ConnParams, bell: Doorbell) -> Result<Arc<Self>, CoreError> {
-        let (conn, worker) = Self::build(p, bell, false)?;
+        let (conn, worker) = Self::build(p, bell, false, std::process::id())?;
+        runtime::rx().spawn(worker.run());
+        Ok(conn)
+    }
+
+    /// `new` with the ConnWorker returned instead of spawned (worker tests with a real Driver).
+    #[cfg(test)]
+    pub(crate) fn new_unspawned(
+        p: ConnParams,
+        bell: Doorbell,
+    ) -> Result<(Arc<Self>, ConnWorker), CoreError> {
+        Self::build(p, bell, false, std::process::id())
+    }
+
+    /// `new` as if created by process `pid` (fork tests: a foreign pid behaves like a forked child).
+    #[cfg(test)]
+    pub(crate) fn new_with_pid(
+        p: ConnParams,
+        bell: Doorbell,
+        pid: u32,
+    ) -> Result<Arc<Self>, CoreError> {
+        let (conn, worker) = Self::build(p, bell, false, pid)?;
         runtime::rx().spawn(worker.run());
         Ok(conn)
     }
@@ -152,13 +183,14 @@ impl ConnShared {
         p: ConnParams,
         bell: Doorbell,
     ) -> Result<(Arc<Self>, ConnWorker), CoreError> {
-        Self::build(p, bell, true)
+        Self::build(p, bell, true, std::process::id())
     }
 
     fn build(
         p: ConnParams,
         bell: Doorbell,
         detached: bool,
+        pid: u32,
     ) -> Result<(Arc<Self>, ConnWorker), CoreError> {
         runtime::check_not_forked()?;
         let ConnParams {
@@ -226,15 +258,21 @@ impl ConnShared {
                 unclassified: Arc::new(Mutex::new(Vec::new())),
                 closing,
                 send_muted: Arc::new(AtomicBool::new(false)),
-                pid: std::process::id(),
+                pid,
                 clock,
                 t0,
                 next_sub_id: AtomicU64::new(1),
                 stats: ConnStats::default(),
+                playing_adm: Admission::new(),
+                live_adm: Admission::new(),
+                subs_adm: Admission::new(),
+                routers_adm: Admission::new(),
                 #[cfg(feature = "test-hooks")]
                 det: super::detached::DetachedState::new(),
                 #[cfg(test)]
                 exec_log: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                panic_next_execute: AtomicBool::new(false),
                 _live: LiveCounter::new(&live::CONN_SHARED),
             }
         });
@@ -379,11 +417,12 @@ impl ConnShared {
             return Err(CoreError::ReceiveDisabled);
         }
         spec.validate()?;
-        check(
-            "subscriptions",
-            self.worker.open_queues().saturating_add(1),
-            1..=MAX_SUBS_PER_CONN,
-        )?;
+        // Held until the queue is registered (visible to `open_queues`).
+        let _slot = self
+            .subs_adm
+            .reserve("subscriptions", MAX_SUBS_PER_CONN, || {
+                self.worker.open_queues()
+            })?;
         let budget = self.worker.reserve_budget(spec.budget_bytes()?)?;
         let token = self.wake.alloc()?;
         let queue = SubQueue::new(&spec, token);
@@ -422,11 +461,10 @@ impl ConnShared {
             overflow: spec.overflow,
         }
         .validate()?;
-        check(
-            "routers",
-            self.worker.open_routers().saturating_add(1),
-            1..=MAX_SUBS_PER_CONN,
-        )?;
+        // Held until the router is registered (visible to `open_routers`).
+        let _slot = self
+            .routers_adm
+            .reserve("routers", MAX_SUBS_PER_CONN, || self.worker.open_routers())?;
         let token = self.wake.alloc()?;
         let queue = RouterQueue::new(token);
         self.worker.register_router(&queue);
@@ -466,7 +504,7 @@ impl ConnShared {
     ) -> Result<(Arc<PcmQueue>, TrackRef), CoreError> {
         self.ensure_open()?;
         spec.validate()?;
-        self.check_live_capacity()?;
+        let _slot = self.reserve_live()?;
         let token = self.wake.alloc()?;
         let id = next_source_id();
         let q = PcmQueue::new(
@@ -492,7 +530,7 @@ impl ConnShared {
     ) -> Result<(Arc<EncodedShared>, TrackRef), CoreError> {
         self.ensure_open()?;
         check("volume", spec.volume, VOLUME)?;
-        self.check_live_capacity()?;
+        let _slot = self.reserve_live()?;
         let token = self.wake.alloc()?;
         let (track, done) = self.tracks.register(TrackKind::EncodedStream);
         let (shared, input) = spawn_encoded(spec, token, done)?;
@@ -511,7 +549,7 @@ impl ConnShared {
     ) -> Result<(Arc<OpusQueue>, TrackRef), CoreError> {
         self.ensure_open()?;
         check("volume", spec.volume, VOLUME)?;
-        self.check_live_capacity()?;
+        let _slot = self.reserve_live()?;
         let token = self.wake.alloc()?;
         let q = OpusQueue::new(&spec, token, self.send_muted.clone())?;
         let (track, done) = self.tracks.register(TrackKind::OpusStream);
@@ -534,11 +572,8 @@ impl ConnShared {
         }
         check("volume", opts.volume, VOLUME)?;
         loop_state(opts.loops)?;
-        check(
-            "playing_tracks",
-            self.tracks.playing().saturating_add(1),
-            1..=MAX_PLAYING_TRACKS_PER_CONN,
-        )?;
+        // Held until the track is started (visible to `TrackRegistry::playing`).
+        let _slot = self.reserve_playing()?;
         let (track, done) = self.tracks.register(src.kind());
         let (input, _) = src.to_input(done, &self.wake)?;
         self.start_track(&track, input, opts)?;
@@ -568,7 +603,8 @@ impl ConnShared {
         if self.is_closed() {
             return;
         }
-        self.queue.clear();
+        // `stop()` (not just `clear()`): also an entry the worker is starting right now ends.
+        self.queue.stop();
         let sources: Vec<Arc<dyn LiveSource>> = lock_checked(&self.sources)
             .iter()
             .filter_map(Weak::upgrade)
@@ -615,13 +651,25 @@ impl ConnShared {
     pub fn start_track_info(&self, t: &TrackRef, timeout: Duration) -> Result<u32, CoreError> {
         self.ensure_open()?;
         let h = Self::songbird_handle(t)?;
-        self.ops.start(&self.wake, async move {
+        let id = self.ops.start(&self.wake, async move {
             match tokio::time::timeout(timeout, h.get_info()).await {
                 Ok(Ok(state)) => OpResult::Info(TrackInfoData::from_state(&state)),
                 Ok(Err(e)) => OpResult::Err(CoreError::Track(e.to_string().into())),
                 Err(_) => OpResult::TimedOut,
             }
-        })
+        })?;
+        self.fail_ops_if_closed();
+        Ok(id)
+    }
+
+    /// An op started while the connection closes: T8's `fail_all` may already have run (the
+    /// slots lock orders this check after T0 whenever `fail_all` missed the op), so the op is
+    /// resolved now instead of running until its timeout.
+    fn fail_ops_if_closed(&self) {
+        if self.is_closed() {
+            self.ops.fail_all();
+            self.wake.notify(WAKE_OPS);
+        }
     }
 
     /// Starts a seek op; returns the op id (`TrackError` for live sources and pending entries).
@@ -637,13 +685,15 @@ impl ConnShared {
             return Err(CoreError::Track("live sources cannot seek".into()));
         }
         let h = Self::songbird_handle(t)?;
-        self.ops.start(&self.wake, async move {
+        let id = self.ops.start(&self.wake, async move {
             match tokio::time::timeout(timeout, h.seek(pos).result_async()).await {
                 Ok(Ok(d)) => OpResult::Seeked(d),
                 Ok(Err(e)) => OpResult::Err(CoreError::Track(e.to_string().into())),
                 Err(_) => OpResult::TimedOut,
             }
-        })
+        })?;
+        self.fail_ops_if_closed();
+        Ok(id)
     }
 
     /// Finished op results.
@@ -792,6 +842,10 @@ impl ConnShared {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            // Clears `executing` even if an action unwinds (the caller's `catch_unwind` in
+            // `Dispatch::act`, the worker tick or pyo3): a stuck flag would leave every later
+            // batch queued forever and the state machine without effects.
+            let running = Executing(&self.executing);
             loop {
                 let next = lock_checked(&self.pending).pop_front(); // L2q held only for the pop
                 let Some(b) = next else {
@@ -801,7 +855,7 @@ impl ConnShared {
                     self.execute(a, b.seq);
                 }
             }
-            self.executing.store(false, Ordering::Release);
+            drop(running); // executing = false
             // Re-check: a batch queued after our last pop, whose producer lost the CAS.
             if lock_checked(&self.pending).is_empty() {
                 break;
@@ -811,6 +865,10 @@ impl ConnShared {
 
     /// Runs one action. Never called while L2 or L2q is held. After close, only `Teardown` runs.
     fn execute(&self, a: GwAction, seq: u64) {
+        #[cfg(test)]
+        if self.panic_next_execute.swap(false, Ordering::AcqRel) {
+            panic!("injected executor panic");
+        }
         if self.closing.load(Ordering::Acquire) && !matches!(a, GwAction::Teardown(_)) {
             return;
         }
@@ -1049,19 +1107,24 @@ impl ConnShared {
         g.as_mut().map(f)
     }
 
-    /// `MAX_LIVE_SOURCES_PER_CONN` (dead sources are pruned).
-    fn check_live_capacity(&self) -> Result<(), CoreError> {
-        let n = {
-            let mut v = lock_checked(&self.sources);
-            v.retain(|w| w.strong_count() > 0);
-            v.len()
-        };
-        check(
-            "live_sources",
-            n.saturating_add(1),
-            1..=MAX_LIVE_SOURCES_PER_CONN,
-        )?;
-        Ok(())
+    /// One of `MAX_LIVE_SOURCES_PER_CONN` (dead sources are pruned); hold the reservation until
+    /// `add_source` has registered the source.
+    fn reserve_live(&self) -> Result<Reservation<'_>, CoreError> {
+        self.live_adm
+            .reserve("live_sources", MAX_LIVE_SOURCES_PER_CONN, || {
+                let mut v = lock_checked(&self.sources);
+                v.retain(|w| w.strong_count() > 0);
+                v.len()
+            })
+    }
+
+    /// One of `MAX_PLAYING_TRACKS_PER_CONN` (`play()` tracks plus the current queue entry); hold
+    /// the reservation until the track is started (`TrackRegistry::playing` counts it).
+    pub(crate) fn reserve_playing(&self) -> Result<Reservation<'_>, CoreError> {
+        self.playing_adm
+            .reserve("playing_tracks", MAX_PLAYING_TRACKS_PER_CONN, || {
+                self.tracks.playing()
+            })
     }
 
     /// Registers a live source for T5 and the housekeeper.
@@ -1112,11 +1175,46 @@ impl ConnShared {
     }
 }
 
+/// Clears the executor flag when dropped, including on unwind (§4.6).
+struct Executing<'a>(&'a AtomicBool);
+
+impl Drop for Executing<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl Drop for ConnShared {
     fn drop(&mut self) {
+        if runtime::in_foreign_process(self.pid) {
+            // §4.10: a forked child never touches the inherited Driver. Dropping it would send
+            // `Poison` through channels and wake a runtime whose locks a vanished parent thread may
+            // hold; `close()` skipped T2–T9 for the same reason. Leak it.
+            self.closing.store(true, Ordering::Release);
+            if let Some(d) = self.driver.get_mut().take() {
+                leak_driver(d);
+            }
+            return;
+        }
         // Normally already closed by `native.Connection`'s Drop; idempotent.
         self.close(CloseReason::Dropped);
     }
+}
+
+/// §4.10: the inherited Driver of a forked child is leaked, never dropped.
+#[cfg(not(test))]
+fn leak_driver(d: OwnedDriver) {
+    std::mem::forget(d);
+}
+
+/// Unit tests run in the creating process: the "leaked" Driver is kept here so the test can
+/// assert the leak and then tear it down.
+#[cfg(test)]
+pub(crate) static LEAKED_DRIVERS: Mutex<Vec<OwnedDriver>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn leak_driver(d: OwnedDriver) {
+    LEAKED_DRIVERS.lock().push(d);
 }
 
 /// A short name of an input for logs (never its payload: tokens and session ids are secrets).

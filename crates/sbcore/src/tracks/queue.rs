@@ -19,7 +19,7 @@ use crate::conn::LogLimiter;
 use crate::conn::shared::ConnShared;
 use crate::conn::worker::WorkerShared;
 use crate::error::{CloseReason, CoreError};
-use crate::limits::{MAX_PLAYING_TRACKS_PER_CONN, MAX_QUEUE_ENTRIES, VOLUME, check};
+use crate::limits::{MAX_QUEUE_ENTRIES, VOLUME, check};
 use crate::sync::lock_checked;
 use crate::tx::encoded::EncodedShared;
 use crate::tx::source::SourceSpec;
@@ -142,13 +142,16 @@ impl TrackQueue {
         opts: PlayOpts,
         reg: &TrackRegistry,
     ) -> Result<TrackRef, CoreError> {
-        if reg.is_closing() {
-            return Err(CoreError::ConnectionClosed(CloseReason::ConnectionClosed));
-        }
         check("volume", opts.volume, VOLUME)?;
         loop_state(opts.loops)?;
         let track = {
             let mut st = lock_checked(&self.state);
+            // Checked under the queue lock: T8's `close_all` drains under it after T0 set
+            // `closing`, so it either already ran (and `closing` is visible here) or will resolve
+            // this entry. Checked before the lock, an entry could be added after T8 and never end.
+            if reg.is_closing() {
+                return Err(CoreError::ConnectionClosed(CloseReason::ConnectionClosed));
+            }
             check(
                 "queue_entries",
                 st.items.len().saturating_add(1),
@@ -219,10 +222,22 @@ impl TrackQueue {
         self.skip();
     }
 
+    /// The current track to control directly, or `None` when there is none or it is being
+    /// started right now (then `c` is recorded and applied as soon as it has started).
+    fn current_or_record(&self, c: PendingChange) -> Option<TrackRef> {
+        let mut st = lock_checked(&self.state);
+        let cur = st.current.as_mut()?;
+        if cur.starting {
+            cur.late.record(c);
+            return None;
+        }
+        Some(cur.track.clone())
+    }
+
     /// Pauses the current track and blocks advancing.
     pub fn pause(&self) {
         self.paused.store(true, Ordering::Release);
-        if let Some(t) = self.current() {
+        if let Some(t) = self.current_or_record(PendingChange::Paused(true)) {
             let _ = t.pause();
         }
     }
@@ -230,7 +245,7 @@ impl TrackQueue {
     /// Resumes the current track and allows advancing.
     pub fn resume(&self) {
         self.paused.store(false, Ordering::Release);
-        if let Some(t) = self.current() {
+        if let Some(t) = self.current_or_record(PendingChange::Paused(false)) {
             let _ = t.resume();
         }
         self.wake();
@@ -259,24 +274,30 @@ impl TrackQueue {
     }
 
     /// Removes the pending entry of `t` and marks it `stopped` (`TrackHandle.stop()` on a pending
-    /// entry); `false` if `t` is not pending.
+    /// entry); `false` if `t` is not pending. The current entry while it is being started counts as
+    /// pending: it is marked `stopped` now and `advance` stops it right after it started.
     pub fn remove(&self, t: &TrackRef) -> bool {
         let entry = {
             let mut st = lock_checked(&self.state);
             match st.items.iter().position(|e| e.track.same(t)) {
                 Some(i) => st.items.remove(i),
-                None => None,
+                None => {
+                    let starting = st
+                        .current
+                        .as_ref()
+                        .is_some_and(|c| c.starting && c.track.same(t));
+                    drop(st);
+                    if !starting {
+                        return false;
+                    }
+                    None
+                }
             }
         };
-        match entry {
-            Some(e) => {
-                drop(e);
-                t.flags.resolve(TrackEndReason::Stopped, None);
-                self.report(std::slice::from_ref(&t.flags));
-                true
-            }
-            None => false,
-        }
+        drop(entry);
+        t.flags.resolve(TrackEndReason::Stopped, None);
+        self.report(std::slice::from_ref(&t.flags));
+        true
     }
 
     /// Pending entries: pause/resume/volume/loops update the stored `PlayOpts` (`Ok(false)` = not
@@ -351,7 +372,9 @@ impl TrackQueue {
             if self.is_paused() || conn.is_closed() {
                 return;
             }
-            let playing = conn.tracks().playing();
+            // Taken before the queue lock (the registry's list is another L10 leaf) and held until
+            // the entry is started, so a concurrent `play()` cannot overshoot the limit either.
+            let slot = conn.reserve_playing();
             let (entry, finished) = {
                 let mut st = lock_checked(&self.state);
                 if let Some(cur) = &st.current
@@ -365,7 +388,8 @@ impl TrackQueue {
                     drop(finished);
                     return;
                 }
-                if playing >= MAX_PLAYING_TRACKS_PER_CONN {
+                if slot.is_err() {
+                    // MAX_PLAYING_TRACKS_PER_CONN tracks are playing: the next entry waits.
                     return;
                 }
                 let Some(e) = st.items.pop_front() else {
@@ -387,6 +411,7 @@ impl TrackQueue {
                 done,
             } = entry;
             let started = conn.start_queue_entry(&src, opts, &track, done);
+            drop(slot); // the started entry is visible to `TrackRegistry::playing` now
             let (late, has_stream) = {
                 let mut st = lock_checked(&self.state);
                 match st.current.as_mut() {
@@ -415,6 +440,11 @@ impl TrackQueue {
                 Err(e) => {
                     if START_FAIL_LOG.allow() {
                         ::log::warn!("queue entry {} failed to start: {e}", track.flags.id);
+                    }
+                    if conn.is_closed() {
+                        // Closed while starting: T8 resolves it (or already did).
+                        track.flags.resolve(TrackEndReason::Disconnected, None);
+                        return;
                     }
                     let msg = e.to_string();
                     track.flags.resolve(TrackEndReason::Error, Some(&msg));
@@ -583,6 +613,54 @@ mod tests {
         q.close_all(TrackEndReason::Disconnected);
         assert_eq!(a.flags.ended(), Some(TrackEndReason::Disconnected));
         assert!(q.is_empty());
+    }
+
+    /// Puts the first pending entry into the "being started" window of `advance`.
+    fn begin_start(q: &TrackQueue) -> TrackRef {
+        let mut st = q.state.lock();
+        let e = st.items.pop_front().unwrap();
+        st.current = Some(Current {
+            track: e.track.clone(),
+            starting: true,
+            late: Late::default(),
+            stream: None,
+        });
+        e.track
+    }
+
+    #[test]
+    fn stop_while_the_entry_is_being_started_is_not_lost() {
+        let (q, reg, _) = setup();
+        let t = q.enqueue(spec(), PlayOpts::default(), &reg).unwrap();
+        let cur = begin_start(&q);
+        assert!(cur.same(&t));
+        // `NativeTrack.stop()` sees a track that is neither pending nor started.
+        assert!(q.remove(&t), "the starting entry counts as pending");
+        assert_eq!(t.flags.ended(), Some(TrackEndReason::Stopped));
+        let mut out = Vec::new();
+        reg.poll_ended(0, &mut out);
+        assert_eq!(out, vec![(t.flags.id, TrackEndReason::Stopped)]);
+        // Not the current entry, or no longer starting: not removable here.
+        let other = q.enqueue(spec(), PlayOpts::default(), &reg).unwrap();
+        q.state.lock().items.clear();
+        assert!(!q.remove(&other));
+        q.state.lock().current.as_mut().unwrap().starting = false;
+        assert!(!q.remove(&t));
+    }
+
+    #[test]
+    fn queue_pause_while_the_entry_is_being_started_applies_after_start() {
+        let (q, reg, _) = setup();
+        let t = q.enqueue(spec(), PlayOpts::default(), &reg).unwrap();
+        begin_start(&q);
+        q.pause();
+        assert!(q.is_paused());
+        let late = q.state.lock().current.as_ref().unwrap().late;
+        assert_eq!(late.paused, Some(true), "recorded for after the start");
+        q.resume();
+        let late = q.state.lock().current.as_ref().unwrap().late;
+        assert_eq!(late.paused, Some(false));
+        assert!(!t.is_started());
     }
 
     #[test]

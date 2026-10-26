@@ -74,6 +74,13 @@ impl TrackRegistry {
         if flags.set_watched() {
             lock_checked(&self.list).push(Arc::downgrade(flags));
         }
+        // A track started while the connection closes (e.g. `play()` racing `close()`): T8's
+        // `finish_all` may already have swept the list, and no housekeeper runs any more. The list
+        // lock orders this load after T0 whenever `finish_all` missed the entry, so the track
+        // always resolves.
+        if self.is_closing() {
+            flags.resolve(TrackEndReason::Disconnected, None);
+        }
     }
 
     /// Dispatch's global `End`/`Error` handler: authoritative `resolve()` (§7.10).
@@ -217,6 +224,23 @@ mod tests {
         let mut out = Vec::new();
         r.poll_ended(0, &mut out);
         assert_eq!(out, vec![(t.flags.id, TrackEndReason::Stopped)]);
+    }
+
+    #[test]
+    fn a_track_started_after_teardown_resolves_disconnected() {
+        // `play()` racing `close()`: the track is bound after T8's `finish_all` swept the list.
+        let (r, closing) = reg();
+        let (t, _g) = r.register(TrackKind::File);
+        closing.store(true, Ordering::Release);
+        r.finish_all(TrackEndReason::Disconnected);
+        assert_eq!(t.flags.ended(), None, "not in the list yet");
+        r.mark_started(&t);
+        assert_eq!(t.flags.ended(), Some(TrackEndReason::Disconnected));
+        // An already resolved entry keeps its reason.
+        let (s, _g2) = r.register(TrackKind::File);
+        s.flags.resolve(TrackEndReason::Stopped, None);
+        r.watch(&s.flags);
+        assert_eq!(s.flags.ended(), Some(TrackEndReason::Stopped));
     }
 
     #[test]
