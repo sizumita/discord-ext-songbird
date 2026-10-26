@@ -149,6 +149,8 @@ fn a_stream_closed_before_its_first_byte_is_never_probed() {
             wait_until("thread exited", || Arc::strong_count(&r.shared) == 1);
             assert!(PROBED.lock().contains(&r.shared.id));
             assert!(r.flags.hints() & DECODE_ERROR != 0);
+            // A real decode error: symphonia's report is kept.
+            assert!(MUTED_AT_EXIT.lock().contains(&(r.shared.id, false)));
             continue;
         }
         LiveSource::close(&*r.shared, mode);
@@ -163,6 +165,21 @@ fn a_stream_closed_before_its_first_byte_is_never_probed() {
     wait_until("probed", || PROBED.lock().contains(&r.shared.id));
     LiveSource::close(&*r.shared, CloseMode::Abort);
     wait_until("thread exited", || Arc::strong_count(&r.shared) == 1);
+}
+
+#[test]
+fn a_close_between_the_wait_and_the_probe_mutes_symphonias_eof_report() {
+    let _s = SERIAL.lock();
+    let r = erig(64 << 10).unwrap();
+    CLOSE_BEFORE_PROBE.lock().push(r.shared.id);
+    let bytes = wav(48_000, 1, &[0i16; 4_800]);
+    r.shared.write(&bytes).unwrap();
+    wait_until("thread exited", || Arc::strong_count(&r.shared) == 1);
+    assert!(PROBED.lock().contains(&r.shared.id));
+    // The probe read EOF at 0 bytes because of the close: a normal close, not a decode error, and
+    // symphonia's "probe reach EOF at 0 bytes." ERROR record was dropped on that thread.
+    assert_eq!(r.flags.hints() & DECODE_ERROR, 0);
+    assert!(MUTED_AT_EXIT.lock().contains(&(r.shared.id, true)));
 }
 
 #[test]

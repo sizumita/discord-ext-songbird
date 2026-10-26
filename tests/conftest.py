@@ -407,9 +407,10 @@ def drain(stream: Any) -> list[Any]:
 # ── subprocess isolation ───────────────────────────────────────────────────────────────────────────
 
 
-def run_isolated(code: str, *, timeout: float = 120.0, env: dict[str, str] | None = None) -> Any:
+def run_isolated(code: str, *, timeout: float = 120.0, env: dict[str, str | None] | None = None) -> Any:
     """Run ``code`` in a fresh interpreter that selects the native module exactly as this session
-    did (it imports ``conftest`` first). Returns the ``subprocess.CompletedProcess``."""
+    did (it imports ``conftest`` first). ``env`` entries override this process's environment; a
+    ``None`` value removes the variable. Returns the ``subprocess.CompletedProcess``."""
     import subprocess
     import textwrap
 
@@ -421,8 +422,11 @@ def run_isolated(code: str, *, timeout: float = 120.0, env: dict[str, str] | Non
     if full_env.get("PYTHONPATH"):
         paths.append(full_env["PYTHONPATH"])
     full_env["PYTHONPATH"] = os.pathsep.join(paths)
-    if env:
-        full_env.update(env)
+    for key, value in (env or {}).items():
+        if value is None:
+            full_env.pop(key, None)
+        else:
+            full_env[key] = value
     return subprocess.run(
         [sys.executable, "-X", "faulthandler", "-c", prelude + textwrap.dedent(code)],
         capture_output=True,

@@ -4,6 +4,7 @@
 //! counts the record). A Python-created daemon thread parks in [`wait`] (detached) and drains the
 //! ring with [`drain`]. The level table is lock-free for readers.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt::{self, Write as _};
 use std::sync::OnceLock;
@@ -155,6 +156,31 @@ impl LevelTable {
             }
         }
     }
+}
+
+// ── per-thread muting of other crates ──────────────────────────────────────────────────────────────
+
+thread_local! {
+    /// See [`mute_dependencies`].
+    static DEPENDENCIES_MUTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// From now on, drops every record **of the calling thread** whose target is not this library's
+/// (`OUR_PREFIXES`). For a thread whose input was cut off on purpose: an encoded stream's decode
+/// thread once `close()` has emptied its ring. symphonia then reports the truncated input as if it
+/// were broken (`probe reach EOF at 0 bytes.` at ERROR, symphonia-core 0.5.5 `probe.rs:298`),
+/// although nothing went wrong. Other threads are unaffected; the flag dies with the thread.
+pub(crate) fn mute_dependencies() {
+    let _ = DEPENDENCIES_MUTED.try_with(|m| m.set(true));
+}
+
+/// Whether [`mute_dependencies`] was called on this thread.
+pub(crate) fn dependencies_muted() -> bool {
+    DEPENDENCIES_MUTED.try_with(Cell::get).unwrap_or(false)
+}
+
+fn is_ours(target: &str) -> bool {
+    OUR_PREFIXES.iter().any(|p| prefix_matches(target, p))
 }
 
 // ── token bucket (50 records/s, burst 200; atomics only) ─────────────────────────────────────────────
@@ -310,6 +336,9 @@ impl LogCore {
         }
         let target = record.target();
         if target.starts_with("tracing::span") || !self.levels.enabled(target, record.level()) {
+            return;
+        }
+        if dependencies_muted() && !is_ours(target) {
             return;
         }
         if self.rate_limited && !self.bucket.take(self.now_ms()) {
@@ -468,6 +497,51 @@ mod tests {
 
     fn count(core: &LogCore) -> usize {
         core.ring.lock().len()
+    }
+
+    #[test]
+    fn a_muted_thread_drops_other_crates_records_only() {
+        let core = Arc::new(LogCore::new_private(false));
+        let c2 = core.clone();
+        std::thread::spawn(move || {
+            assert!(!dependencies_muted());
+            mute_dependencies();
+            assert!(dependencies_muted());
+            emit(
+                &c2,
+                Level::Error,
+                "symphonia_core::probe",
+                "probe reach EOF at 0 bytes.",
+            );
+            emit(&c2, Level::Warn, "songbird::driver", "dropped too");
+            emit(&c2, Level::Warn, "sbcore::tx::encoded", "ours");
+            emit(
+                &c2,
+                Level::Warn,
+                "discord_ext_songbird_native::py",
+                "ours too",
+            );
+        })
+        .join()
+        .unwrap();
+        assert_eq!(count(&core), 2);
+        // Other threads are unaffected.
+        assert!(!dependencies_muted());
+        emit(&core, Level::Error, "symphonia_core::probe", "kept");
+        let got: Vec<_> = core
+            .ring
+            .lock()
+            .iter()
+            .map(|r| r.target.to_string())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "sbcore::tx::encoded",
+                "discord_ext_songbird_native::py",
+                "symphonia_core::probe"
+            ]
+        );
     }
 
     #[test]

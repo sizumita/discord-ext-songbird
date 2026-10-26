@@ -51,6 +51,15 @@ static DECODE_THREAD_SEQ: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static PROBED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
+/// Ids of the encoded streams whose decode thread closes the ring itself right before the probe,
+/// as a `close()` landing between `wait_for_input` and the probe's first read would (tests).
+#[cfg(test)]
+static CLOSE_BEFORE_PROBE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// `(stream id, log::dependencies_muted())` of every decode thread at its exit (tests).
+#[cfg(test)]
+static MUTED_AT_EXIT: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+
 /// Decoded lookahead of the internal queue.
 const LOOKAHEAD_MS: u32 = 1_000;
 /// Decoded audio is pushed in pieces of at most this many 48 kHz frames (100 ms).
@@ -364,6 +373,10 @@ impl Read for ByteRingSource {
         let mut g = lock_checked(&ring.inner);
         loop {
             if g.closed {
+                // `close()` cut the input off: whatever symphonia now reports about the truncated
+                // stream on this thread (e.g. "probe reach EOF at 0 bytes." at ERROR when the close
+                // landed between `wait_for_input` and the probe) is not an error.
+                crate::log::mute_dependencies();
                 return Ok(0);
             }
             if !g.bytes.is_empty() {
@@ -559,6 +572,10 @@ fn decode_loop(shared: &Arc<EncodedShared>) -> Outcome {
     }
     #[cfg(test)]
     PROBED.lock().push(shared.id);
+    #[cfg(test)]
+    if CLOSE_BEFORE_PROBE.lock().contains(&shared.id) {
+        shared.close_ring();
+    }
     let mss = MediaSourceStream::new(
         Box::new(ByteRingSource {
             shared: shared.clone(),
@@ -677,7 +694,6 @@ fn decode_loop(shared: &Arc<EncodedShared>) -> Outcome {
 
 fn decode_main(shared: Arc<EncodedShared>, flags: Arc<TrackFlags>, slot: WorkerSlot) {
     set_role(Role::Decode);
-    let _live = LiveCounter::new(&live::DECODE_THREAD);
     let outcome = match catch_unwind(AssertUnwindSafe(|| decode_loop(&shared))) {
         Ok(o) => o,
         Err(_) => {
@@ -704,6 +720,10 @@ fn decode_main(shared: Arc<EncodedShared>, flags: Arc<TrackFlags>, slot: WorkerS
             shared.pcm.fail();
         }
     }
+    #[cfg(test)]
+    MUTED_AT_EXIT
+        .lock()
+        .push((shared.id, crate::log::dependencies_muted()));
     drop(shared);
     drop(slot);
 }
@@ -777,9 +797,15 @@ pub fn spawn_encoded_with(
     });
     let n = DECODE_THREAD_SEQ.fetch_add(1, Ordering::Relaxed);
     let thread_shared = shared.clone();
+    // Counted from the spawn, not from when the OS first schedules the thread, so the live count
+    // never misses a thread that holds a worker slot (a failed spawn drops the closure and both).
+    let live = LiveCounter::new(&live::DECODE_THREAD);
     std::thread::Builder::new()
         .name(format!("songbird-decode-{n}"))
-        .spawn(move || decode_main(thread_shared, flags, slot))
+        .spawn(move || {
+            let _live = live;
+            decode_main(thread_shared, flags, slot)
+        })
         .map_err(|_| CoreError::Internal("spawn decode thread"))?;
     Ok((shared, input))
 }
