@@ -1,26 +1,50 @@
 //! Detached connections (§13.2): a full `ConnShared` with **no songbird Driver** and a
 //! `ManualClock`; `Harness::step` runs `ConnWorker::step` synchronously, so tests are deterministic.
-#![allow(dead_code, unused_variables)] // phase-0 skeleton
+//!
+//! Injection (`inject_*`) feeds the **same** tick channel and `apply()` path that `Dispatch` uses;
+//! only songbird's UDP/WS layer is bypassed.
 
 use std::num::NonZeroU64;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use parking_lot::Mutex;
+use smallvec::SmallVec;
+use tokio::sync::mpsc::error::TrySendError;
 
-use crate::clock::ManualClock;
-use crate::conn::gateway::{DiscKind, DiscReason};
-use crate::conn::settings::VoiceSettings;
+use super::registry::{self, ConnKey};
+use super::rtp::{self, RtpOpts};
+use crate::clock::{Clock, ManualClock};
+use crate::conn::gateway::{ConnectFailure, DiscKind, DiscReason, GwInput};
+use crate::conn::settings::{ConnParams, VoiceSettings};
 use crate::conn::shared::ConnShared;
 use crate::conn::worker::ConnWorker;
 use crate::error::CoreError;
+use crate::limits::{self, LimitError, LimitNum, TICK_CHANNEL_CAP, TICK_MS};
+use crate::runtime::{Role, role, set_role};
+use crate::rx::raw::{RawTick, RawVoice, RxInput};
 use crate::wake::Doorbell;
+
+/// Longest single `Harness::step` advance (1 h of manual time).
+pub const MAX_STEP_MS: u64 = 3_600_000;
+/// Most voices or silent SSRCs in one injected tick.
+pub const MAX_TICK_VOICES: usize = 256;
+
+/// The read end of a harness-owned doorbell (`bell=None`), drained by `step`.
+#[cfg(unix)]
+type BellReader = std::os::unix::net::UnixStream;
+#[cfg(not(unix))]
+type BellReader = std::net::TcpStream;
 
 /// The worker and clock of a detached connection.
 pub struct Harness {
     conn: Weak<ConnShared>,
+    key: ConnKey,
     worker: Mutex<Option<ConnWorker>>,
     clock: Arc<ManualClock>,
+    bell_rx: Option<BellReader>,
 }
 
 impl Harness {
@@ -31,65 +55,345 @@ impl Harness {
         user_id: NonZeroU64,
         settings: VoiceSettings,
         bell: Option<Doorbell>,
+        reconnect: bool,
     ) -> Result<(Arc<ConnShared>, Harness), CoreError> {
-        Err(CoreError::Internal("unimplemented"))
+        let (bell, bell_rx) = match bell {
+            Some(b) => (b, None),
+            None => {
+                let (b, rx) =
+                    internal_bell().map_err(|_| CoreError::Internal("harness doorbell"))?;
+                (b, Some(rx))
+            }
+        };
+        let (clock, manual) = Clock::manual();
+        let params = ConnParams {
+            guild_id,
+            user_id,
+            reconnect,
+            settings,
+            clock,
+        };
+        let (conn, worker) = ConnShared::new_detached(params, bell)?;
+        let key = registry::key_of(&conn);
+        registry::register_conn(key, &manual);
+        let harness = Harness {
+            conn: Arc::downgrade(&conn),
+            key,
+            worker: Mutex::new(Some(worker)),
+            clock: manual,
+            bell_rx,
+        };
+        Ok((conn, harness))
     }
 
-    /// Advances the manual clock by `advance_ms` and runs one worker iteration.
+    /// Runs one worker iteration at the current manual time (processing whatever was injected),
+    /// then advances the clock by `advance_ms` in steps of at most one tick (20 ms, or earlier if
+    /// the worker asked to be woken sooner), running one iteration after each step.
+    ///
+    /// Afterwards the inputs of ended tracks are disposed of, as songbird would (all of them once
+    /// the connection is closed), and an internal doorbell is drained.
     pub fn step(&self, advance_ms: u64) -> Result<(), CoreError> {
-        self.clock.advance(Duration::from_millis(advance_ms));
-        Err(CoreError::Internal("unimplemented"))
+        limits::check("advance_ms", advance_ms, 0..=MAX_STEP_MS)?;
+        let prev_role = role();
+        set_role(Role::Rx);
+        let result = self.run(Duration::from_millis(advance_ms));
+        set_role(prev_role);
+        let closed = self.conn.upgrade().is_none_or(|c| c.is_closed());
+        registry::sweep(self.key, closed);
+        self.drain_bell();
+        result
+    }
+
+    fn run(&self, advance: Duration) -> Result<(), CoreError> {
+        let mut guard = self.worker.lock();
+        let Some(worker) = guard.as_mut() else {
+            return Ok(());
+        };
+        let target = self.clock.elapsed().saturating_add(advance);
+        let tick = Duration::from_millis(u64::from(TICK_MS));
+        loop {
+            let now = self.clock.now();
+            let next = match catch_unwind(AssertUnwindSafe(|| worker.step(now))) {
+                Ok(next) => next,
+                Err(_) => {
+                    // The worker is unusable after a panic; drop it (its exit path is cleanup only).
+                    *guard = None;
+                    return Err(CoreError::Internal(
+                        "testing::Harness::step (worker panicked)",
+                    ));
+                }
+            };
+            let elapsed = self.clock.elapsed();
+            if elapsed >= target {
+                return Ok(());
+            }
+            let mut inc = tick.min(target.saturating_sub(elapsed));
+            if let Some(at) = next
+                && let Some(until) = at.checked_duration_since(now)
+                && !until.is_zero()
+            {
+                inc = inc.min(until).max(Duration::from_millis(1));
+            }
+            self.clock.advance(inc);
+        }
+    }
+
+    fn drain_bell(&self) {
+        let Some(rx) = &self.bell_rx else {
+            return;
+        };
+        let mut buf = [0u8; 256];
+        loop {
+            match std::io::Read::read(&mut &*rx, &mut buf) {
+                Ok(n) if n > 0 => continue,
+                _ => return,
+            }
+        }
     }
 
     /// The manual clock.
     pub fn clock(&self) -> &Arc<ManualClock> {
         &self.clock
     }
+
+    /// Manual time elapsed since the connection was created.
+    pub fn elapsed(&self) -> Duration {
+        self.clock.elapsed()
+    }
+
+    /// Songbird inputs currently parked for this connection (live sources not yet taken by a
+    /// `MixerHarness`, and memory/file tracks).
+    pub fn parked(&self) -> usize {
+        registry::parked_count(self.key)
+    }
 }
 
-/// A songbird driver event to inject through `apply()` (and `RxInput::Link*`).
+impl Drop for Harness {
+    fn drop(&mut self) {
+        // The worker drops first (best-effort cleanup), then every parked input (their
+        // `DoneGuard`s fire, as songbird's `SetTrack(None)` would), then the injection state.
+        drop(self.worker.lock().take());
+        registry::sweep(self.key, true);
+        registry::unregister_conn(self.key);
+    }
+}
+
+#[cfg(unix)]
+fn internal_bell() -> std::io::Result<(Doorbell, BellReader)> {
+    let (rx, tx) = std::os::unix::net::UnixStream::pair()?;
+    rx.set_nonblocking(true)?;
+    Ok((Doorbell::from_unix_stream(tx)?, rx))
+}
+
+#[cfg(windows)]
+fn internal_bell() -> std::io::Result<(Doorbell, BellReader)> {
+    use std::os::windows::io::IntoRawSocket;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let tx = std::net::TcpStream::connect(listener.local_addr()?)?;
+    let (rx, _) = listener.accept()?;
+    rx.set_nonblocking(true)?;
+    let raw = i64::try_from(tx.into_raw_socket())
+        .map_err(|_| std::io::Error::other("socket handle out of range"))?;
+    // SAFETY: `raw` is a connected socket we own; `adopt` takes ownership exactly once.
+    let bell = unsafe { Doorbell::adopt(raw)? };
+    Ok((bell, rx))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn internal_bell() -> std::io::Result<(Doorbell, BellReader)> {
+    Err(std::io::Error::other("no doorbell on this platform"))
+}
+
+/// A songbird driver event to inject through `apply()` (and `RxInput::Link*`), plus the outcome
+/// of the connect future a real Driver would report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DriverEvent {
-    Connect {
-        ssrc: u32,
-    },
-    Reconnect {
-        ssrc: u32,
-    },
+    /// A successful connect: `DriverConnect{ssrc}`, then — if the state is `connecting` — the
+    /// connect future's `ConnectResult{generation, Ok}`, then `RxInput::LinkUp`.
+    Connect { ssrc: u32 },
+    /// A failed connect future: `ConnectResult{generation, Err(TimedOut | Other)}`.
+    ConnectFailed { timed_out: bool },
+    /// `DriverReconnect{ssrc}`, then `RxInput::LinkUp`.
+    Reconnect { ssrc: u32 },
+    /// `DriverDisconnect{kind, reason}`, then `RxInput::LinkDown`.
     Disconnect {
         kind: DiscKind,
         reason: Option<DiscReason>,
     },
 }
 
-/// One tick: `(ssrc, Some(opus payload) | None = lost)` voices plus silent SSRCs.
+/// Sends one input on the connection's tick channel, exactly where `Dispatch` sends it. A full
+/// channel raises `LimitExceeded("tick_channel")` (call `Harness::step` to drain it) instead of
+/// silently dropping like `Dispatch`; a closed channel (connection closed, or receive disabled)
+/// drops the input like `Dispatch` does.
+fn send_rx(conn: &ConnShared, input: RxInput) -> Result<(), CoreError> {
+    let Some(tx) = conn.test_rx_sender() else {
+        return Ok(());
+    };
+    match tx.try_send(input) {
+        Ok(()) | Err(TrySendError::Closed(_)) => Ok(()),
+        Err(TrySendError::Full(_)) => Err(CoreError::Limit(LimitError {
+            what: "tick_channel",
+            value: LimitNum::Int(TICK_CHANNEL_CAP as i128 + 1),
+            min: LimitNum::Int(0),
+            max: LimitNum::Int(TICK_CHANNEL_CAP as i128),
+        })),
+    }
+}
+
+fn tick_from(conn: &ConnShared, voices: SmallVec<[RawVoice; 8]>, silent: Vec<u32>) -> RxInput {
+    RxInput::Tick(RawTick {
+        arrived: now(conn),
+        voices,
+        silent: silent.into_iter().collect(),
+    })
+}
+
+fn now(conn: &ConnShared) -> Instant {
+    registry::now_for(registry::key_of(conn))
+}
+
+/// One tick: `(ssrc, Some(opus payload) | None = lost)` voices plus silent SSRCs. Each payload is
+/// wrapped by [`rtp::rtp_wrap`] with consecutive per-SSRC sequence numbers (a lost voice consumes
+/// one), so the pipeline sees exactly what songbird's Decrypt mode delivers.
 pub fn inject_tick(
     conn: &ConnShared,
     voices: Vec<(u32, Option<Vec<u8>>)>,
     silent: Vec<u32>,
 ) -> Result<(), CoreError> {
-    Err(CoreError::Internal("unimplemented"))
+    limits::check("tick_voices", voices.len(), 0..=MAX_TICK_VOICES)?;
+    limits::check("tick_silent", silent.len(), 0..=MAX_TICK_VOICES)?;
+    let key = registry::key_of(conn);
+    let mut raw: SmallVec<[RawVoice; 8]> = SmallVec::new();
+    for (ssrc, payload) in voices {
+        let seq = registry::next_seq(key, ssrc);
+        match payload {
+            Some(opus) => {
+                let pkt = rtp::rtp_wrap(&opus, seq, ssrc, RtpOpts::default())?;
+                let (payload_offset, payload_end) = rtp::payload_bounds(&pkt);
+                raw.push(RawVoice::Packet {
+                    ssrc,
+                    packet: Bytes::from(pkt),
+                    payload_offset,
+                    payload_end,
+                });
+            }
+            None => raw.push(RawVoice::Lost { ssrc }),
+        }
+    }
+    send_rx(conn, tick_from(conn, raw, silent))
 }
 
 /// `SpeakingStateUpdate`: maps `ssrc` to `user_id`.
 pub fn inject_map(conn: &ConnShared, ssrc: u32, user_id: u64) -> Result<(), CoreError> {
-    Err(CoreError::Internal("unimplemented"))
+    send_rx(conn, RxInput::Map { ssrc, user_id })
 }
 
 /// `ClientDisconnect`.
 pub fn inject_user_left(conn: &ConnShared, user_id: u64) -> Result<(), CoreError> {
-    Err(CoreError::Internal("unimplemented"))
+    send_rx(conn, RxInput::UserLeft { user_id })
 }
 
-/// `DriverConnect` / `DriverReconnect` / `DriverDisconnect`.
+/// `DriverConnect` / `DriverReconnect` / `DriverDisconnect` (and the connect future's result).
 pub fn inject_driver_event(conn: &ConnShared, ev: DriverEvent) -> Result<(), CoreError> {
-    Err(CoreError::Internal("unimplemented"))
+    match ev {
+        DriverEvent::Connect { ssrc } => {
+            conn.apply(GwInput::DriverConnect { ssrc });
+            let st = conn.status();
+            if st.state == "connecting" {
+                conn.apply(GwInput::ConnectResult {
+                    generation: st.generation,
+                    result: Ok(()),
+                });
+            }
+            send_rx(conn, RxInput::LinkUp { ssrc: Some(ssrc) })
+        }
+        DriverEvent::ConnectFailed { timed_out } => {
+            let st = conn.status();
+            conn.apply(GwInput::ConnectResult {
+                generation: st.generation,
+                result: Err(if timed_out {
+                    ConnectFailure::TimedOut
+                } else {
+                    ConnectFailure::Other("injected connect failure".into())
+                }),
+            });
+            Ok(())
+        }
+        DriverEvent::Reconnect { ssrc } => {
+            conn.apply(GwInput::DriverReconnect { ssrc });
+            send_rx(conn, RxInput::LinkUp { ssrc: Some(ssrc) })
+        }
+        DriverEvent::Disconnect { kind, reason } => {
+            conn.apply(GwInput::DriverDisconnect { kind, reason });
+            send_rx(conn, RxInput::LinkDown)
+        }
+    }
 }
 
-/// One tick of full RTP packets `(ssrc, packet)` (exercises `extract_opus` end to end).
+/// One tick of full RTP packets `(ssrc, packet)` as [`rtp::rtp_wrap`] builds them (20-byte crypto
+/// suffix; exercises `extract_opus` end to end). A packet that does not parse as RTP is still
+/// delivered (with an empty payload range), so the pipeline counts it as a bad packet.
 pub fn inject_voice_tick_rtp(
     conn: &ConnShared,
     packets: Vec<(u32, Vec<u8>)>,
 ) -> Result<(), CoreError> {
-    Err(CoreError::Internal("unimplemented"))
+    limits::check("tick_voices", packets.len(), 0..=MAX_TICK_VOICES)?;
+    let mut raw: SmallVec<[RawVoice; 8]> = SmallVec::new();
+    for (ssrc, pkt) in packets {
+        limits::check("rtp_packet_bytes", pkt.len(), 0..=rtp::MAX_RTP_PACKET)?;
+        let (payload_offset, payload_end) = rtp::payload_bounds(&pkt);
+        raw.push(RawVoice::Packet {
+            ssrc,
+            packet: Bytes::from(pkt),
+            payload_offset,
+            payload_end,
+        });
+    }
+    send_rx(conn, tick_from(conn, raw, Vec::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conn::settings::RawVoiceSettings;
+
+    fn settings() -> VoiceSettings {
+        VoiceSettings::validate(RawVoiceSettings::default()).unwrap()
+    }
+
+    #[test]
+    fn detached_follows_the_connshared_contract() {
+        // `ConnShared::new_detached` is W2's; until it is implemented `detached` must surface its
+        // error rather than panic, and must not leak the internal doorbell or registry entries.
+        let id = NonZeroU64::new(1).unwrap();
+        match Harness::detached(id, id, settings(), None, true) {
+            Ok((conn, h)) => {
+                assert_eq!(conn.status().state, "idle");
+                h.step(0).unwrap();
+                h.step(100).unwrap();
+                assert_eq!(h.elapsed(), Duration::from_millis(100));
+                assert_eq!(h.parked(), 0);
+                conn.close(crate::error::CloseReason::Requested);
+                h.step(20).unwrap();
+            }
+            Err(e) => assert!(matches!(e, CoreError::Internal(_)), "{e:?}"),
+        }
+    }
+
+    #[test]
+    fn step_is_bounded() {
+        assert!(limits::check("advance_ms", MAX_STEP_MS + 1, 0..=MAX_STEP_MS).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn internal_bell_rings_and_drains() {
+        let (bell, rx) = internal_bell().unwrap();
+        bell.ring();
+        let mut buf = [0u8; 8];
+        let n = std::io::Read::read(&mut &rx, &mut buf).unwrap();
+        assert_eq!(n, 1);
+        assert!(std::io::Read::read(&mut &rx, &mut buf).is_err()); // WouldBlock
+    }
 }
