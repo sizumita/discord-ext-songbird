@@ -52,7 +52,7 @@ pub(crate) fn monotonic(py: Python<'_>, t: Instant) -> f64 {
 /// ``wave.writeframes(chunk)`` read the payload without an intermediate copy. The buffer is
 /// read-only and 1-D with format ``'h'`` (pcm16le), ``'f'`` (f32le) or ``'B'`` (G.711).
 #[gen_stub_pyclass]
-#[pyclass(module = "discord.ext.songbird.native", frozen)]
+#[pyclass(module = "discord.ext.songbird.native", frozen, weakref)]
 pub struct AudioChunk {
     chunk: Arc<ChunkData>,
     seq: u64,
@@ -229,7 +229,7 @@ impl AudioChunk {
             Bound<'py, PyAny>,
         >,
     ) -> PyResult<Bound<'py, PyAny>> {
-        crate::py::arrow::export_chunk(py, &self.chunk, requested_schema).py(py)
+        crate::py::arrow::export_chunk(py, &self.chunk, requested_schema)
     }
 
     #[gen_stub(skip)]

@@ -18,6 +18,9 @@ use crate::py::arrow::ChunkBatch;
 use crate::py::chunk::AudioChunk;
 use crate::py::format::PyAudioFormat;
 
+/// Largest `read_batch(max_chunks)`: every chunk of the largest queue (60 s of 10 ms chunks).
+const MAX_BATCH_CHUNKS: usize = (sbcore::limits::MAX_QUEUE_MS_MAX / 10) as usize;
+
 /// `"drop_oldest"` / `"drop_newest"` / `"error"`.
 pub(crate) fn parse_overflow(s: &str) -> PyResult<Overflow> {
     match s {
@@ -195,22 +198,31 @@ impl ReceiveSubscription {
 
     /// ``[arrow]`` Drains up to ``max_chunks`` chunks into one batch; ``None`` if empty.
     ///
+    /// Parameters
+    /// ----------
+    /// max_chunks : int, default 50
+    ///     ``1..=6000`` (the largest queue bound: 60 s of 10 ms chunks).
+    ///
     /// Raises
     /// ------
     /// SongbirdError
     ///     Built without the ``arrow`` feature.
+    /// StreamOverflow
+    ///     Once, after the queued chunks, under ``overflow="error"``.
     /// StreamClosed
     ///     Once closed and drained.
     #[pyo3(signature = (max_chunks = 50))]
-    fn read_batch(&self, py: Python<'_>, max_chunks: usize) -> PyResult<Option<ChunkBatch>> {
+    fn read_batch(&self, py: Python<'_>, max_chunks: i64) -> PyResult<Option<ChunkBatch>> {
         ensure_not_forked(py)?;
         if !cfg!(feature = "arrow") {
             return Err(core_err(py, CoreError::FeatureMissing("arrow")));
         }
+        let max_chunks = int_arg(py, "max_chunks", max_chunks, 1..=MAX_BATCH_CHUNKS)?;
         let mut rows = Vec::new();
         let closed = self.sub.queue.drain(max_chunks, &mut rows);
         match (rows.is_empty(), closed) {
             (false, _) => Ok(Some(ChunkBatch::new(rows))),
+            (true, Some(CloseReason::Overflow)) => Err(core_err(py, CoreError::StreamOverflow)),
             (true, Some(r)) => Err(core_err(py, CoreError::StreamClosed(r))),
             (true, None) => Ok(None),
         }
