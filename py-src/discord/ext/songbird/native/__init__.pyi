@@ -416,8 +416,16 @@ class ChunkBatch:
     def to_pyarrow(self) -> typing.Any:
         r"""
         ``pyarrow.RecordBatch`` (lazy ``pyarrow`` import).
+        
+        Raises
+        ------
+        SongbirdError
+            Built without the ``arrow`` feature.
+        ImportError
+            ``pyarrow`` is not installed.
         """
     def __len__(self) -> builtins.int: ...
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class ClearResult:
@@ -1184,10 +1192,17 @@ class ReceiveSubscription:
         r"""
         ``[arrow]`` Drains up to ``max_chunks`` chunks into one batch; ``None`` if empty.
         
+        Parameters
+        ----------
+        max_chunks : int, default 50
+            ``1..=6000`` (the largest queue bound: 60 s of 10 ms chunks).
+        
         Raises
         ------
         SongbirdError
             Built without the ``arrow`` feature.
+        StreamOverflow
+            Once, after the queued chunks, under ``overflow="error"``.
         StreamClosed
             Once closed and drained.
         """
@@ -1220,6 +1235,12 @@ class RouterSubscription:
     def close(self, close_streams: builtins.bool = True) -> None:
         r"""
         Closes the router; ``close_streams`` also closes every stream it created.
+        
+        Notes
+        -----
+        Idempotent; the first call decides. After ``close(close_streams=False)`` the streams already
+        received stay open, also when the router is closed again or garbage-collected. Streams not
+        yet received are always closed.
         """
 
 @typing.final
