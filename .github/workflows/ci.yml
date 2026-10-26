@@ -111,10 +111,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Sync uv project
         run: uv sync --all-extras --dev --no-install-project --frozen --python "$pythonLocation/bin/python"
+      # Exactly `just test-fake` on a fresh checkout: no build, no PYTHONPATH (conftest.py finds py-src).
       - name: pytest (fake)
         env:
           SONGBIRD_TEST_NATIVE: fake
-          PYTHONPATH: ${{ github.workspace }}/py-src
         run: |
           if [[ "${{ matrix.python-version }}" == *t ]]; then export PYTHON_GIL=0; fi
           uv run --no-sync pytest -ra

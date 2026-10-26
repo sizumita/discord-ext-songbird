@@ -33,7 +33,11 @@ The design contract is `docs/design.md`; deviations are recorded in `docs/deviat
 - `just build`: regenerate stubs, then `uv run --no-sync maturin build --release`.
 - `just fmt`: `cargo fmt --all` + `ruff format` + `ruff check --fix`.
 - `just check`: rustfmt check, `cargo clippy` (all features and `codec-minimal`, `-D warnings`),
-  `scripts/check_invariants.py`, `ruff check`, `ruff format --diff`, `ty check`.
+  `scripts/check_invariants.py`, `ruff check`, `ruff format --diff`, `ty check`. ty finds the package only
+  through the editable install's `.pth`, so `check` first runs `maturin develop` when this checkout is not
+  installed yet (an existing build, e.g. with test hooks, is kept).
+- Native build requirements: Rust stable plus libopus via pkg-config, or CMake (libopus_sys then builds its
+  bundled Opus). The fake test run needs neither.
 - `just stub-drift`: regenerate stubs from scratch and fail on any change or untracked file.
 - `python examples/record.py`: run a sample bot after setting `DISCORD_BOT_TOKEN` (the WebSocket bridge
   also needs `BRIDGE_URL`; quick starts read `CHANNEL_ID`).
@@ -57,13 +61,15 @@ Only fall back to plain text search when necessary.
 - Rust: `cargo test -p sbcore --all-features` (no libpython needed; unit tests live next to the code in
   `crates/sbcore/src/**`). Also run `cargo test -p sbcore --no-default-features --features codec-minimal`.
 - Python: `pytest` under `tests/` with `test_*.py` naming (pytest-asyncio, `asyncio_mode = "auto"`).
-  `SONGBIRD_TEST_NATIVE=fake` runs the suite on `tests/fakes/native_fake.py` without building
-  (`just test-fake`); `SONGBIRD_TEST_NATIVE=real` requires the extension built with
+  `SONGBIRD_TEST_NATIVE=fake` runs the suite on `tests/fakes/native_fake.py` without building or
+  installing anything (`just test-fake`; `tests/conftest.py` puts this checkout's `py-src` on discord's
+  package path); `SONGBIRD_TEST_NATIVE=real` requires the extension built with
   `--features test-hooks` (`just test-py`). Mark tests that need the Rust implementation
   `@pytest.mark.real_only` and fake-only behaviour `@pytest.mark.fake_only`.
 - Detached connections (`native._testing.detached_connection`) run without Discord: inject ticks and
   driver events, drive time with `Harness.step(ms)`, and pull playback with `MixerHarness`.
-- `scripts/check_invariants.py` must pass; `scripts/smoke.py` checks an installed release build.
+- `scripts/check_invariants.py` must pass (`tests/test_check_invariants.py` tests its rules; extend both
+  when adding a rule); `scripts/smoke.py` checks an installed release build.
 
 ## Commit & Pull Request Guidelines
 Git history shows short, descriptive subjects and often an emoji prefix followed by a colon (e.g., `:sparkles: Refactor ...`). Follow that style when possible, keep commits focused, and avoid generated artifacts. PRs should include a clear summary, steps to verify (commands run), and call out any API or behavior changes; update docs or stubs when APIs move.

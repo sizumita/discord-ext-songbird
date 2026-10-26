@@ -32,6 +32,26 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 MODE = os.environ.get("SONGBIRD_TEST_NATIVE", "auto").lower()
 
 
+def _use_source_tree(*, first: bool) -> None:
+    """Make ``py-src`` importable without an install, so the fake mode needs no build.
+
+    ``discord/__init__.py`` extends its ``__path__`` with every ``discord/`` directory on ``sys.path``
+    (``pkgutil.extend_path``), which is how ``discord.ext.songbird`` is normally found: through the
+    ``.pth`` that ``maturin develop`` writes, or ``PYTHONPATH=py-src``. A fresh checkout after
+    ``uv sync --no-install-project`` has neither, so add ``py-src/discord`` here. ``first`` puts it
+    ahead of any installed copy, so the fake run always tests this checkout."""
+    import discord
+
+    pkg = str(ROOT / "py-src" / "discord")
+    present = [p for p in discord.__path__ if os.path.realpath(p) == os.path.realpath(pkg)]
+    if first:
+        for p in present:
+            discord.__path__.remove(p)
+        discord.__path__.insert(0, pkg)
+    elif not present:
+        discord.__path__.append(pkg)
+
+
 def _songbird_dir() -> pathlib.Path | None:
     import discord.ext
 
@@ -56,6 +76,11 @@ def _install_fake() -> None:
     spec.loader.exec_module(mod)
     mod.install()
 
+
+if MODE == "fake":
+    _use_source_tree(first=True)
+elif MODE == "auto" and _songbird_dir() is None:
+    _use_source_tree(first=False)
 
 if MODE == "fake" or (MODE == "auto" and not _has_real_extension(_songbird_dir())):
     _install_fake()

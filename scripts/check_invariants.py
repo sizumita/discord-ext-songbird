@@ -1,15 +1,27 @@
 #!/usr/bin/env python3
-"""Static checks for the design invariants of discord-ext-songbird 0.6 (docs/design.md §1, §4, §5, §13).
+"""Static checks for the design invariants of discord-ext-songbird 0.6 (docs/design.md §1, §4, §5, §10, §13).
 
 Run from anywhere: ``python scripts/check_invariants.py``. Exits non-zero and lists every violation.
+``tests/test_check_invariants.py`` feeds the rules known-bad and known-good snippets.
 
 Checked:
 
 * G1 / I1  ``crates/sbcore`` has no pyo3-family dependency, direct or transitive (``Cargo.lock``).
 * I1       No struct/enum field or static in the binding crate holds ``Py<…>``, ``Bound``,
-           ``PyObject``, ``PyBuffer``, ``PyUntypedBuffer``, ``PyBackedBytes`` (allow-list:
+           ``Borrowed``, ``PyObject``, ``PyBuffer``, ``PyUntypedBuffer``, ``PyBackedBytes``,
+           ``PyBackedStr``, ``PyErr`` / ``PyResult<…>`` (an exception keeps its traceback, frames and
+           locals alive), ``PyClassInitializer``, ``PyRef`` or ``PyRefMut`` (allow-list:
            ``static EXC_TYPES`` in ``src/errors.rs``).
-* G2 / I2  No ``Python::attach``, ``try_attach`` or ``with_gil`` anywhere in Rust code.
+* G2 / I2  No attach entry point anywhere in Rust code: ``Python::attach*`` (incl.
+           ``attach_unchecked``), ``try_attach``, ``assume_attached``, ``with_gil``, and the raw
+           ``PyGILState_Ensure`` / ``PyEval_RestoreThread`` / ``PyEval_AcquireThread`` /
+           ``PyThreadState_Swap``.
+* §10 (4)  No ``broadcast`` / ``async_broadcast`` identifier anywhere in Rust code, tests included
+           (0.5 defect 4: a ring pinned by an idle receiver).
+* §10 (6)  Outside test-only code, ``with_capacity(…)`` takes only a constant expression (literals,
+           ``UPPER_CASE`` constants), ``x.min(CONST)``, ``existing.len()`` or an allow-listed bounded
+           argument (``CAPACITY_ALLOW``) — never a user-sized value (0.5 defect 6: eager allocation
+           aborting the process).
 * §4.4     No ``__traverse__`` / ``__clear__`` in the binding crate.
 * §5.6     Every ``#[pyclass(…)]`` is ``frozen``; the module is ``gil_used = false``.
 * I7       No public sbcore function returns a lock guard (``lock_checked`` is the documented
@@ -50,10 +62,28 @@ DROPPED_CRATES = {
     "uuid",
 }
 PY_HOLDING_TYPES = re.compile(
-    r"\b(Py\s*<|Bound\s*<|Borrowed\s*<|PyObject\b|PyBuffer\b|PyUntypedBuffer\b|PyBackedBytes\b|PyRef\s*<|PyRefMut\s*<)"
+    r"\b(Py\s*<|Bound\s*<|Borrowed\s*<|PyObject\b|PyBuffer\b|PyUntypedBuffer\b|PyBackedBytes\b|PyBackedStr\b"
+    r"|PyErr\b|PyResult\s*<|PyClassInitializer\s*<|PyRef\s*<|PyRefMut\s*<)"
 )
 LOCK_GUARD = re.compile(r"\b\w*(MutexGuard|RwLock\w*Guard|ReentrantMutexGuard|MappedMutexGuard)\b")
-ATTACH = re.compile(r"\bPython::attach\b|\btry_attach\b|\bwith_gil\b")
+ATTACH = re.compile(
+    r"\bPython\s*::\s*(?:attach\w*|try_attach|assume_attached|assume_gil_acquired|with_gil)\b"
+    r"|\b(?:try_attach|attach_unchecked|assume_attached|assume_gil_acquired|with_gil|acquire_gil)\b"
+    r"|\b(?:PyGILState_Ensure|PyEval_RestoreThread|PyEval_AcquireThread|PyEval_AcquireLock|PyThreadState_Swap)\b"
+)
+BROADCAST = re.compile(r"\b(?:async_)?broadcast\b")
+WITH_CAPACITY = re.compile(r"\bwith_capacity(?:_and_hasher)?\s*\(")
+# A capacity that cannot be user-sized (§10): literals and UPPER_CASE constants combined with
+# arithmetic, `x.min(CONST)` (bounded whatever `x` is), or the length of something already allocated.
+_CONST_TERM = r"\(*(?:\d[\d_]*(?:[iu](?:8|16|32|64|128|size))?|(?:\w+::)*[A-Z][A-Z0-9_]*)\)*"
+_CONST_EXPR = rf"{_CONST_TERM}(?:(?:[-+*/]|<<|>>){_CONST_TERM})*"
+SAFE_CAPACITY = re.compile(rf"{_CONST_EXPR}|.+\.min\({_CONST_EXPR}\)|(?:\w+\.)*\w+\.len\(\)")
+# (path, argument with whitespace removed) -> why the value is bounded.
+CAPACITY_ALLOW = {
+    # out_frames + prime + 8: one 20 ms tick at a `SampleRate` (a 4-variant enum, ≤ 48 kHz) plus priming.
+    ("crates/sbcore/src/dsp/resample.rs", "cap"): "one tick of output frames of a fixed SampleRate",
+}
+CFG_TEST = re.compile(r"#\[cfg\(\s*(?:test|all\([^()]*\btest\b[^()]*\))\s*\)\]")
 WAKE_OPS = re.compile(r"\b(pending|ready_word)\s*\.\s*(fetch_\w+|swap|store|load|compare_exchange\w*)\s*\(")
 NON_SEQCST = re.compile(r"\b(Relaxed|Acquire|Release|AcqRel)\b")
 
@@ -68,6 +98,19 @@ def rust_files(base: Path) -> Iterator[Path]:
     yield from sorted(p for p in base.rglob("*.rs") if "target" not in p.parts)
 
 
+RAW_OPEN = re.compile(r'r(#*)"')
+
+
+def raw_string_at(src: str, i: int) -> re.Match[str] | None:
+    """The opening of a raw string literal (``r"…"``, ``r#"…"#``, ``br"…"``) at ``src[i]``, if any."""
+    if src[i] != "r":
+        return None
+    k = i
+    while k > 0 and (src[k - 1].isalnum() or src[k - 1] == "_"):
+        k -= 1
+    return RAW_OPEN.match(src, i) if src[k:i] in ("", "b", "c") else None
+
+
 def strip_comments(src: str) -> str:
     """Removes // and /* */ comments while keeping string literals and line numbers intact."""
     out: list[str] = []
@@ -75,7 +118,13 @@ def strip_comments(src: str) -> str:
     in_str = False
     while i < n:
         c = src[i]
-        if in_str:
+        raw = None if in_str else raw_string_at(src, i)
+        if raw:
+            j = src.find('"' + raw.group(1), raw.end())
+            end = n if j < 0 else j + 1 + len(raw.group(1))
+            out.append(src[i:end])
+            i = end
+        elif in_str:
             out.append(c)
             if c == "\\" and i + 1 < n:
                 out.append(src[i + 1])
@@ -88,6 +137,11 @@ def strip_comments(src: str) -> str:
             in_str = True
             out.append(c)
             i += 1
+        elif c == "'" and i + 1 < n and src[i + 1] == "\\":  # escaped char literal like '\"'
+            j = src.find("'", i + 3)
+            end = n if j < 0 else j + 1
+            out.append(src[i:end])
+            i = end
         elif c == "'" and i + 2 < n and src[i + 2] == "'":  # char literal like '"'
             out.append(src[i : i + 3])
             i += 3
@@ -103,6 +157,115 @@ def strip_comments(src: str) -> str:
             out.append(c)
             i += 1
     return "".join(out)
+
+
+def blank_strings(src: str) -> str:
+    """Replaces the contents of string, raw-string and char literals with spaces (newlines kept), so a
+    word, type name or bracket inside a literal neither trips a rule nor unbalances a bracket scan."""
+    out: list[str] = []
+    i, n = 0, len(src)
+
+    def blank(a: int, b: int) -> None:
+        out.append("".join("\n" if ch == "\n" else " " for ch in src[a:b]))
+
+    while i < n:
+        c = src[i]
+        raw = raw_string_at(src, i)
+        if raw:
+            close = '"' + raw.group(1)
+            start = raw.end()
+            j = src.find(close, start)
+            end = n if j < 0 else j
+            out.append(src[i:start])
+            blank(start, end)
+            out.append(src[end : end + len(close)])
+            i = end + len(close)
+        elif c == '"':
+            j = i + 1
+            while j < n and src[j] != '"':
+                j += 2 if src[j] == "\\" else 1
+            out.append('"')
+            blank(i + 1, min(j, n))
+            out.append('"' if j < n else "")
+            i = j + 1
+        elif c == "'" and i + 1 < n and src[i + 1] == "\\":  # escaped char literal: '\n', '\'', '\u{7f}'
+            j = src.find("'", i + 3)
+            end = n if j < 0 else j
+            out.append("'")
+            blank(i + 1, end)
+            out.append("'" if j >= 0 else "")
+            i = end + 1
+        elif c == "'" and i + 2 < n and src[i + 2] == "'":  # char literal like '{'
+            out.append("' '")
+            i += 3
+        else:  # includes lifetimes and labels
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def strip_cfg_test(src: str) -> str:
+    """Blanks every item gated by ``#[cfg(test)]`` / ``#[cfg(all(test, …))]`` (line numbers kept).
+    Expects comments and literals already removed."""
+    out: list[str] = []
+    pos, n = 0, len(src)
+    for m in CFG_TEST.finditer(src):
+        if m.start() < pos:  # inside an item already removed
+            continue
+        j = m.end()
+        while True:  # further attributes on the same item
+            k = j
+            while k < n and src[k].isspace():
+                k += 1
+            if src.startswith("#[", k):
+                j = matching(src, k + 1)
+                continue
+            break
+        k = j
+        while k < n and src[k] not in "{;":
+            k = matching(src, k) if src[k] in "([" else k + 1
+        end = matching(src, k) if k < n and src[k] == "{" else min(k + 1, n)
+        out.append(src[pos : m.start()])
+        out.append("\n" * src.count("\n", m.start(), end))
+        pos = end
+    out.append(src[pos:])
+    return "".join(out)
+
+
+def code_of(src: str) -> str:
+    """Source with comments removed and literals blanked: what the rules scan."""
+    return blank_strings(strip_comments(src))
+
+
+def is_test_only(path: Path) -> bool:
+    """Files compiled only for tests: ``tests.rs``, ``*_tests.rs``, ``test_util.rs``, ``tests/`` trees
+    (declared under ``#[cfg(test)]``) and the ``test-hooks`` modules (``testing/``, ``testing.rs``),
+    which never ship in a release wheel."""
+    parts = path.relative_to(ROOT).parts
+    return (
+        path.name in ("tests.rs", "test_util.rs")
+        or path.name.endswith("_tests.rs")
+        or "tests" in parts[:-1]
+        or "testing" in parts[:-1]
+        or path.stem == "testing"
+    )
+
+
+def call_args(src: str, open_pos: int) -> list[str]:
+    """Top-level comma-separated arguments of the call whose ``(`` is at ``open_pos``."""
+    inner = src[open_pos + 1 : matching(src, open_pos) - 1]
+    args: list[str] = []
+    depth, start = 0, 0
+    for i, ch in enumerate(inner):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            args.append(inner[start:i])
+            start = i + 1
+    args.append(inner[start:])
+    return [a.strip() for a in args if a.strip()]
 
 
 def line_of(src: str, pos: int) -> int:
@@ -215,44 +378,73 @@ def check_binding_manifest() -> None:
 # ── source scans ─────────────────────────────────────────────────────────────────────────────────────
 
 
-def check_no_attach_and_placeholders() -> None:
+def scan_rust(label: str, text: str, *, production: bool) -> None:
+    """The source rules every Rust file obeys. ``text`` is the raw file; ``production`` is false for
+    test-only files (``is_test_only``), whose ``with_capacity`` calls are not checked."""
+    code = code_of(text)
+    for m in ATTACH.finditer(code):
+        fail(f"{label}:{line_of(code, m.start())}: `{m.group(0)}` is forbidden (I2: no attach from Rust)")
+    for m in re.finditer(r"\b(todo|unimplemented)\s*!\s*\(", code):
+        fail(f"{label}:{line_of(code, m.start())}: `{m.group(1)}!()` is forbidden")
+    for m in BROADCAST.finditer(code):
+        fail(
+            f"{label}:{line_of(code, m.start())}: `{m.group(0)}` is forbidden (§10, 0.5 defect 4: an idle "
+            f"receiver pins the ring; give each subscriber its own bounded queue)"
+        )
+    if not production:
+        return
+    prod = strip_cfg_test(code)
+    for m in WITH_CAPACITY.finditer(prod):
+        args = call_args(prod, m.end() - 1)
+        arg = re.sub(r"\s+", "", args[0]) if args else ""
+        if SAFE_CAPACITY.fullmatch(arg) or (label, arg) in CAPACITY_ALLOW:
+            continue
+        fail(
+            f"{label}:{line_of(prod, m.start())}: `with_capacity({arg})` is not provably bounded (§10, 0.5 "
+            f"defect 6): start at a constant or `x.min(CONST)` and grow lazily, or allow-list it in "
+            f"CAPACITY_ALLOW with the reason"
+        )
+
+
+def check_rust_sources() -> None:
     for path in [*rust_files(BINDING_SRC), *rust_files(SBCORE / "src")]:
-        src = strip_comments(path.read_text())
-        for m in ATTACH.finditer(src):
-            fail(f"{rel(path)}:{line_of(src, m.start())}: `{m.group(0)}` is forbidden (I2: no attach from Rust)")
-        for m in re.finditer(r"\b(todo|unimplemented)\s*!\s*\(", src):
-            fail(f"{rel(path)}:{line_of(src, m.start())}: `{m.group(1)}!()` is forbidden")
+        scan_rust(rel(path), path.read_text(), production=not is_test_only(path))
+
+
+def scan_binding(label: str, text: str) -> None:
+    """I1 / §4.4 for one binding-crate file (``text`` is the raw file)."""
+    item = re.compile(r"\b(struct|enum)\s+(\w+)")
+    static = re.compile(r"\bstatic\s+(?:mut\s+)?(\w+)\s*:")
+    src = code_of(text)
+    for word in ("__traverse__", "__clear__"):
+        if word in src:
+            fail(f"{label}: `{word}` is forbidden (§4.4: no native GC slots)")
+    for m in item.finditer(src):
+        # Find the body: the first `{` or `(` after the name, unless a `;` comes first (unit struct).
+        j = m.end()
+        while j < len(src) and src[j] not in "{(;":
+            j += 1
+        if j >= len(src) or src[j] == ";":
+            continue
+        body = src[j : matching(src, j)]
+        hit = PY_HOLDING_TYPES.search(body)
+        if hit:
+            fail(
+                f"{label}:{line_of(src, m.start())}: {m.group(1)} {m.group(2)} holds a Python "
+                f"object (`{hit.group(0).strip()}`) (I1)"
+            )
+    for m in static.finditer(src):
+        end = src.find("=", m.end())
+        semi = src.find(";", m.end())
+        stop = min(x for x in (end, semi) if x >= 0) if max(end, semi) >= 0 else len(src)
+        ty = src[m.end() : stop]
+        if PY_HOLDING_TYPES.search(ty) and not (label == "src/errors.rs" and m.group(1) == "EXC_TYPES"):
+            fail(f"{label}:{line_of(src, m.start())}: static {m.group(1)} holds a Python object (I1)")
 
 
 def check_binding_holds_no_python() -> None:
-    item = re.compile(r"\b(struct|enum)\s+(\w+)")
-    static = re.compile(r"\bstatic\s+(?:mut\s+)?(\w+)\s*:")
     for path in rust_files(BINDING_SRC):
-        src = strip_comments(path.read_text())
-        for word in ("__traverse__", "__clear__"):
-            if word in src:
-                fail(f"{rel(path)}: `{word}` is forbidden (§4.4: no native GC slots)")
-        for m in item.finditer(src):
-            # Find the body: the first `{` or `(` after the name, unless a `;` comes first (unit struct).
-            j = m.end()
-            while j < len(src) and src[j] not in "{(;":
-                j += 1
-            if j >= len(src) or src[j] == ";":
-                continue
-            body = src[j : matching(src, j)]
-            hit = PY_HOLDING_TYPES.search(body)
-            if hit:
-                fail(
-                    f"{rel(path)}:{line_of(src, m.start())}: {m.group(1)} {m.group(2)} holds a Python "
-                    f"object (`{hit.group(0).strip()}`) (I1)"
-                )
-        for m in static.finditer(src):
-            end = src.find("=", m.end())
-            semi = src.find(";", m.end())
-            stop = min(x for x in (end, semi) if x >= 0) if max(end, semi) >= 0 else len(src)
-            ty = src[m.end() : stop]
-            if PY_HOLDING_TYPES.search(ty) and not (path.name == "errors.rs" and m.group(1) == "EXC_TYPES"):
-                fail(f"{rel(path)}:{line_of(src, m.start())}: static {m.group(1)} holds a Python object (I1)")
+        scan_binding(rel(path), path.read_text())
 
 
 def check_pyclasses() -> None:
@@ -308,7 +500,7 @@ def main() -> int:
     check_sbcore_manifest()
     check_lockfile()
     check_binding_manifest()
-    check_no_attach_and_placeholders()
+    check_rust_sources()
     check_binding_holds_no_python()
     check_pyclasses()
     check_no_public_guards()

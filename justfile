@@ -16,7 +16,7 @@ fmt:
     uv run --no-sync ruff check --fix
 
 # Lints and type checks (what CI runs, minus the tests).
-check:
+check: _editable
     cargo fmt --all -- --check
     cargo clippy --workspace --all-features --all-targets -- -D warnings
     cargo clippy --workspace --no-default-features --features codec-minimal --all-targets -- -D warnings
@@ -24,6 +24,11 @@ check:
     uv run --no-sync ruff check
     uv run --no-sync ruff format --diff
     uv run --no-sync ty check
+
+# ty finds the package only through the editable install's .pth (pyproject [tool.ty.environment]), so
+# install it when this checkout's py-src is not importable yet; an existing build (e.g. with test hooks) is kept.
+_editable:
+    uv run --no-sync python -c "import importlib.util as u, pathlib, sys; s = u.find_spec('discord.ext.songbird'); sys.exit(s is None or pathlib.Path(s.origin).resolve().parent != pathlib.Path('py-src/discord/ext/songbird').resolve())" || uv run --no-sync maturin develop
 
 # Regenerate the native stubs from scratch (stub_gen writes only the flat native module).
 stubs:
@@ -51,7 +56,8 @@ test-rust:
     cargo test -p sbcore --all-features
     cargo test -p sbcore --no-default-features --features codec-minimal
 
-# Python tests against the pure-Python fake of the native module (no build needed).
+# Python tests against the pure-Python fake of the native module (no build needed: conftest.py puts
+# this checkout's py-src on discord's package path, as CI's python-fake job relies on).
 test-fake:
     SONGBIRD_TEST_NATIVE=fake uv run --no-sync pytest
 

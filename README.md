@@ -91,13 +91,16 @@ Set `DISCORD_BOT_TOKEN` (plus `BRIDGE_URL` for the bridge) and run e.g. `python 
 ## Development
 
 Requirements: Rust (stable), [uv](https://docs.astral.sh/uv/), [just](https://github.com/casey/just).
+The native build also needs Opus: either libopus found by pkg-config (`apt install libopus-dev
+pkg-config`, `brew install opus pkg-config`) or CMake, with which the bundled Opus source is built.
+`just test-fake` needs neither Rust nor Opus.
 
 ```bash
 uv sync --all-extras --dev --no-install-project   # dev dependencies
-just dev                                         # stubs + uv run --no-sync maturin develop
 just test-fake                                   # Python tests on the pure-Python fake (no build)
+just dev                                         # stubs + uv run --no-sync maturin develop
 just test                                        # Rust tests + fake + real-module tests (test hooks)
-just fmt && just check                           # format; clippy, invariants, ruff, ty
+just fmt && just check                           # format; clippy, invariants, ruff, ty (installs editable first if needed)
 ```
 
 The workspace has two crates: `crates/sbcore` (all logic; no pyo3 dependency, tested with
