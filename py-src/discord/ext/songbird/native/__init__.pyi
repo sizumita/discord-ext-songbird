@@ -1235,6 +1235,12 @@ class RouterSubscription:
     def close(self, close_streams: builtins.bool = True) -> None:
         r"""
         Closes the router; ``close_streams`` also closes every stream it created.
+        
+        Notes
+        -----
+        Idempotent; the first call decides. After ``close(close_streams=False)`` the streams already
+        received stay open, also when the router is closed again or garbage-collected. Streams not
+        yet received are always closed.
         """
 
 @typing.final

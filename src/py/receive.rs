@@ -293,6 +293,12 @@ impl RouterSubscription {
     }
 
     /// Closes the router; ``close_streams`` also closes every stream it created.
+    ///
+    /// Notes
+    /// -----
+    /// Idempotent; the first call decides. After ``close(close_streams=False)`` the streams already
+    /// received stay open, also when the router is closed again or garbage-collected. Streams not
+    /// yet received are always closed.
     #[pyo3(signature = (close_streams = true))]
     fn close(&self, close_streams: bool) {
         self.router.queue.close(close_streams);

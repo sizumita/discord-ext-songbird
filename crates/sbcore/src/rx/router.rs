@@ -136,15 +136,17 @@ impl RouterQueue {
 
     /// Closes the router; `close_streams` also closes every stream it created. Pending streams
     /// nobody received are always closed.
+    ///
+    /// The first close decides the fate of the streams already received: after
+    /// `close(close_streams=false)` the router forgets them, so a later `close(true)` (e.g. the
+    /// `RouterHandle` drop) does not close streams the caller chose to keep.
     pub fn close(&self, close_streams: bool) {
         let (notify, pending, created) = {
             let mut g = self.inner.lock();
             g.closed = true;
-            let created = if close_streams {
-                std::mem::take(&mut g.created)
-            } else {
-                Vec::new()
-            };
+            // Taken in both cases: with `close_streams == false` the weak handles are dropped.
+            let created = std::mem::take(&mut g.created);
+            let created = if close_streams { created } else { Vec::new() };
             (
                 std::mem::take(&mut g.armed),
                 std::mem::take(&mut g.items),
@@ -305,5 +307,31 @@ mod tests {
         drop(handle); // close(true): also the received stream
         assert!(q4.is_closed());
         drop(held);
+    }
+
+    /// Regression: `UserStreams.close(close_streams=False)` keeps the received streams open, also
+    /// once the router object is dropped (its `Drop` calls `close(true)`) or closed again.
+    #[test]
+    fn close_without_streams_survives_a_later_close_and_the_drop() {
+        let (h, _r) = hub();
+        let r = RouterQueue::new(token(&h));
+        let (s, q) = sub(&r, 1, 1);
+        r.push(s);
+        let kept = match r.try_pop_or_arm() {
+            Pop::Item(s) => s,
+            other => panic!("{other:?}"),
+        };
+        let (s, pending) = sub(&r, 2, 2);
+        r.push(s);
+        let handle = RouterHandle { id: 1, queue: r };
+        handle.queue.close(false);
+        assert!(pending.is_closed(), "never-received streams always close");
+        assert!(!q.is_closed());
+        handle.queue.close(true);
+        assert!(!q.is_closed(), "the first close decides");
+        drop(handle);
+        assert!(!q.is_closed(), "the drop must not close kept streams");
+        drop(kept);
+        assert!(q.is_closed());
     }
 }

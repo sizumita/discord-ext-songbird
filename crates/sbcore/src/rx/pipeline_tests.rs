@@ -1043,3 +1043,169 @@ fn disabled_receive_ignores_ticks() {
     assert!(drain(&sub).is_empty());
     assert_eq!(r.p.counts().ticks_real, 0);
 }
+
+// ── review regressions ──────────────────────────────────────────────────────────────────────────
+
+fn router_spec(chunk_ms: u32, close_on_leave: bool) -> RouterSpec {
+    RouterSpec {
+        format: PCM16_48K,
+        chunk_ms,
+        max_queue_ms: 2_000,
+        overflow: Overflow::DropOldest,
+        include: None,
+        ignore_bots: true,
+        close_on_leave,
+    }
+}
+
+fn pop_stream(rq: &RouterQueue) -> Option<Subscription> {
+    match rq.try_pop_or_arm() {
+        Pop::Item(s) => Some(s),
+        Pop::Empty => None,
+        Pop::Closed(r) => panic!("router closed: {r:?}"),
+    }
+}
+
+/// Lanes keep no reference to emitted chunks: once delivered, the subscriber's queue (and then
+/// the consumer) is the only owner, so `skip_to_live`/close/eviction free a chunk at once.
+#[test]
+fn delivered_chunks_are_owned_by_the_subscribers_only() {
+    let mut r = Rig::new();
+    let s1 = r.mixed(MixFilter::everyone(), PCM16_24K, 20);
+    let s2 = r.mixed(MixFilter::everyone(), PCM16_24K, 20);
+    r.timer();
+    r.idle(200);
+    let v1 = drain(&s1);
+    assert!(!v1.is_empty());
+    let last = v1.last().unwrap().chunk.clone();
+    assert_eq!(
+        Arc::strong_count(&last),
+        3,
+        "s1's copy, `last` and s2's queue"
+    );
+    assert_eq!(s2.queue.skip_to_live(true), v1.len() as u64 * 20);
+    drop(v1);
+    assert_eq!(Arc::strong_count(&last), 1, "no lane keeps the last chunk");
+}
+
+/// A reused subscription id must not leave the second stream open with no chunks forever.
+#[test]
+fn duplicate_subscription_id_closes_the_new_stream() {
+    let mut r = Rig::new();
+    let first = r.mixed(MixFilter::everyone(), PCM16_24K, 20);
+    let spec = SubSpec {
+        source: RxSource::User(A),
+        format: PCM16_24K,
+        chunk_ms: 20,
+        max_queue_ms: 2_000,
+        overflow: Overflow::DropOldest,
+    };
+    let dup = SubQueue::new(&spec, token(&r.hub));
+    r.p.apply(RxCmd::AddSub {
+        id: first.id,
+        spec,
+        queue: dup.clone(),
+    });
+    r.timer();
+    assert_eq!(dup.close_reason(), Some(CloseReason::InternalError));
+    assert!(!first.queue.is_closed());
+    let c = r.p.counts();
+    assert_eq!((c.subscriptions, c.lanes), (1, 1));
+}
+
+/// Bus ids wrap after 2³² buses; a wrapped id still in use must not overwrite that bus.
+#[test]
+fn wrapped_bus_ids_never_overwrite_a_live_bus() {
+    let mut r = Rig::new();
+    r.map(SA, A);
+    r.map(SB, B);
+    r.p.set_next_bus_id(u32::MAX);
+    let everyone = r.mixed(MixFilter::everyone(), PCM16_24K, 20);
+    r.timer();
+    r.p.set_next_bus_id(u32::MAX); // the counter wrapped onto the live bus
+    let only_b = r.mixed(filter_excluding(&[A]), PCM16_24K, 20);
+    r.timer();
+    let c = r.p.counts();
+    assert_eq!((c.buses, c.lanes), (2, 2));
+    let pa = voice(440.0, 0.3, 10);
+    let pb = voice(660.0, 0.3, 10);
+    for i in 0..10 {
+        let v = vec![r.packet(SA, &pa[i]), r.packet(SB, &pb[i])];
+        r.tick(v);
+    }
+    let (ve, vb) = (drain(&everyone), drain(&only_b));
+    assert!(ve.iter().any(|d| *d.chunk.meta.speakers == [A, B]));
+    assert!(vb.iter().all(|d| !d.chunk.meta.speakers.contains(&A)));
+    assert!(vb.iter().any(|d| *d.chunk.meta.speakers == [B]));
+    drop(everyone);
+    drop(only_b);
+    r.timer();
+    let c = r.p.counts();
+    assert_eq!((c.buses, c.lanes, c.converters), (0, 0, 0));
+}
+
+/// `close_on_leave=False`: a live stream survives the user's leave and is reused when they come
+/// back; a stream the consumer closed is forgotten on leave (bounded bookkeeping), so the returning
+/// user starts a new presence with a new stream.
+#[test]
+fn router_without_close_on_leave_forgets_dead_streams_on_leave() {
+    let mut r = Rig::new();
+    r.map(SA, A);
+    r.map(SB, B);
+    let rq = RouterQueue::new(token(&r.hub));
+    r.p.apply(RxCmd::AddRouter {
+        id: 1,
+        spec: router_spec(20, false),
+        queue: rq.clone(),
+    });
+    r.timer();
+    let pa = voice(440.0, 0.3, 40);
+    for p in pa.iter().take(5) {
+        let v = vec![r.packet(SA, p), r.packet(SB, p)];
+        r.tick(v);
+    }
+    let mut got: HashMap<u64, Subscription> = HashMap::new();
+    while let Some(s) = pop_stream(&rq) {
+        got.insert(s.queue.user_id().unwrap(), s);
+    }
+    assert_eq!(got.len(), 2);
+    // The consumer closes A's stream; B's stays open.
+    got.remove(&A).unwrap().close();
+    r.timer();
+    for u in [A, B] {
+        r.p.on_input(RxInput::UserLeft { user_id: u }, r.now);
+    }
+    assert!(!got[&B].queue.is_closed(), "close_on_leave=False keeps it");
+    r.idle(1_100); // SSRC state and mappings pruned
+    r.map(SA, A);
+    r.map(SB, B);
+    for p in pa.iter().skip(5).take(5) {
+        let v = vec![r.packet(SA, p), r.packet(SB, p)];
+        r.tick(v);
+    }
+    let again = pop_stream(&rq).expect("A starts a new presence");
+    assert_eq!(again.queue.user_id(), Some(A));
+    assert!(pop_stream(&rq).is_none(), "B is still on its first stream");
+    assert!(drain(&got[&B]).iter().any(|d| d.chunk.meta.speaking));
+    assert_eq!(r.p.counts().router_streams, 3);
+}
+
+/// `close_all` (tick-panic recovery) drops consumers but keeps bot flags queued before it.
+#[test]
+fn close_all_keeps_pending_bot_flags() {
+    let mut r = Rig::new();
+    r.map(SA, A);
+    r.map(SB, B);
+    r.p.apply(RxCmd::SetBots(vec![(B, true)]));
+    r.p.close_all(CloseReason::InternalError);
+    let mix = r.mixed(MixFilter::everyone(), PCM16_24K, 20); // ignore_bots
+    r.timer();
+    let pa = voice(440.0, 0.3, 10);
+    for p in &pa {
+        let v = vec![r.packet(SA, p), r.packet(SB, p)];
+        r.tick(v);
+    }
+    let v = drain(&mix);
+    assert!(v.iter().any(|d| d.chunk.meta.speaking));
+    assert!(v.iter().all(|d| !d.chunk.meta.speakers.contains(&B)));
+}

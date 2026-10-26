@@ -384,12 +384,18 @@ impl RxPipeline {
     /// Closes every subscription and router queue with `r` and drops all consumer state (lanes,
     /// converters, buses, decoders). Mappings survive.
     pub fn close_all(&mut self, r: CloseReason) {
+        let mut bots = Vec::new();
         for cmd in self.pending.drain(..) {
             match cmd {
                 RxCmd::AddSub { queue, .. } => queue.close(r),
                 RxCmd::AddRouter { queue, .. } => queue.close(false),
-                _ => {}
+                // Bot flags are connection state, not consumer state: keep them.
+                RxCmd::SetBots(list) => bots.push(list),
+                RxCmd::RemoveSub(_) | RxCmd::SetFilter(..) | RxCmd::RemoveRouter(_) => {}
             }
+        }
+        for list in bots {
+            self.set_bots(list);
         }
         for s in self.subs.values() {
             s.queue.close(r);
@@ -508,21 +514,29 @@ impl RxPipeline {
                 RxCmd::RemoveRouter(id) => {
                     self.routers.remove(&id);
                 }
-                RxCmd::SetBots(list) => {
-                    for (u, bot) in list {
-                        if bot {
-                            self.bots.insert(u);
-                        } else {
-                            self.bots.remove(&u);
-                        }
-                    }
-                }
+                RxCmd::SetBots(list) => self.set_bots(list),
             }
         }
         // Keep the allocation unless commands arrived meanwhile (they cannot: `&mut self`).
         if self.pending.is_empty() {
             self.pending = cmds;
         }
+    }
+
+    fn set_bots(&mut self, list: Vec<(u64, bool)>) {
+        for (u, bot) in list {
+            if bot {
+                self.bots.insert(u);
+            } else {
+                self.bots.remove(&u);
+            }
+        }
+    }
+
+    /// Sets the next bus id (tests: id wrap-around).
+    #[cfg(test)]
+    pub(crate) fn set_next_bus_id(&mut self, id: u32) {
+        self.next_bus_id = id;
     }
 
     /// Registers a subscription on its lane. `covering`: start with the chunk containing that tick
@@ -534,7 +548,12 @@ impl RxPipeline {
         queue: Arc<SubQueue>,
         covering: Option<u64>,
     ) -> bool {
-        if queue.is_closed() || self.subs.contains_key(&id) {
+        if queue.is_closed() {
+            return false;
+        }
+        if self.subs.contains_key(&id) {
+            // A reused id (a caller bug): never leave a stream that will get no chunks open.
+            queue.close(CloseReason::InternalError);
             return false;
         }
         let (source, mixed) = match &spec.source {
@@ -629,8 +648,13 @@ impl RxPipeline {
         if let Some(id) = self.bus_ids.get(f) {
             return *id;
         }
-        let id = self.next_bus_id;
-        self.next_bus_id = self.next_bus_id.wrapping_add(1);
+        // Ids wrap after 2³² buses; skip ids still in use (at most `MAX_SUBS_PER_CONN × 2`) so a
+        // live bus is never overwritten.
+        let mut id = self.next_bus_id;
+        while self.buses.contains_key(&id) {
+            id = id.wrapping_add(1);
+        }
+        self.next_bus_id = id.wrapping_add(1);
         self.bus_ids.insert(f.clone(), id);
         self.buses.insert(
             id,
@@ -837,11 +861,21 @@ impl RxPipeline {
     fn on_user_left(&mut self, user: u64, now: Instant) {
         self.speaking.user_left(user, self.tick_index, &mut self.ev);
         for r in self.routers.values_mut() {
-            if r.spec.close_on_leave
-                && let Some(w) = r.routed.remove(&user)
-                && let Some(q) = w.upgrade()
+            if r.spec.close_on_leave {
+                if let Some(w) = r.routed.remove(&user)
+                    && let Some(q) = w.upgrade()
+                {
+                    q.close(CloseReason::UserLeft);
+                }
+            } else if r
+                .routed
+                .get(&user)
+                .is_some_and(|w| w.upgrade().is_none_or(|q| q.is_closed()))
             {
-                q.close(CloseReason::UserLeft);
+                // The stream is gone (closed by the consumer, or never created): forget the user,
+                // so `routed` stays bounded by live streams plus present users, and a returning
+                // user starts a new presence.
+                r.routed.remove(&user);
             }
         }
         self.classify_seen.remove(&user);
@@ -1262,6 +1296,11 @@ impl RxPipeline {
                     finished.push(*id);
                 }
             }
+        }
+        // The subscribers own the chunks now: a lane keeps no reference, so `skip_to_live`, an
+        // eviction or a close frees a chunk at once (§10 R9) instead of one tick later.
+        for l in self.lanes.values_mut() {
+            l.emitted.clear();
         }
         for id in finished {
             let old = self.subs.get_mut(&id).and_then(|s| {

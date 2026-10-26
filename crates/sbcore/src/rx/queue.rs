@@ -194,7 +194,6 @@ pub struct SubQueue {
 struct AfterPush {
     notify: bool,
     freed: Option<Arc<ChunkData>>,
-    left: u64,
 }
 
 impl SubQueue {
@@ -243,11 +242,10 @@ impl SubQueue {
         let timeline = chunk.meta.timeline_ms;
         let after = {
             let mut g = self.inner.lock();
-            let mut after = self.push_locked(&mut g, chunk, dur, timeline);
-            after.left = g.items.len() as u64;
+            let after = self.push_locked(&mut g, chunk, dur, timeline);
+            self.sync_queued(&g);
             after
         };
-        self.queued.store(after.left, Ordering::Release);
         drop(after.freed);
         if after.notify {
             self.token.notify();
@@ -264,7 +262,6 @@ impl SubQueue {
         let mut after = AfterPush {
             notify: false,
             freed: None,
-            left: 0,
         };
         if g.closed.is_some() {
             after.freed = Some(chunk);
@@ -313,6 +310,12 @@ impl SubQueue {
         after
     }
 
+    /// Mirrors the queue length into `queued` (under L4, so the lock-free snapshot is never stale
+    /// after concurrent pushes and pops).
+    fn sync_queued(&self, g: &SubInner) {
+        self.queued.store(g.items.len() as u64, Ordering::Release);
+    }
+
     fn count_drop(&self, ms: u64) {
         self.dropped_chunks.fetch_add(1, Ordering::AcqRel);
         self.dropped_ms.fetch_add(ms, Ordering::AcqRel);
@@ -331,7 +334,7 @@ impl SubQueue {
     }
 
     fn pop(&self, arm: bool) -> Pop<Delivered> {
-        let (res, budget, left) = {
+        let (res, budget) = {
             let mut g = self.inner.lock();
             let res = match g.items.pop_front() {
                 Some(d) => Pop::Item(d),
@@ -345,9 +348,9 @@ impl SubQueue {
                     }
                 },
             };
-            (res, g.take_budget_if_done(), g.items.len() as u64)
+            self.sync_queued(&g);
+            (res, g.take_budget_if_done())
         };
-        self.queued.store(left, Ordering::Release);
         if matches!(res, Pop::Item(_)) {
             self.delivered.fetch_add(1, Ordering::AcqRel);
         }
@@ -358,7 +361,7 @@ impl SubQueue {
     /// Moves up to `max` chunks into `out`. Returns the close reason only when nothing was moved
     /// and the queue is closed and drained (`Overflow` once, then `Closed`, as for pops).
     pub fn drain(&self, max: usize, out: &mut Vec<Delivered>) -> Option<CloseReason> {
-        let (res, budget, moved, left) = {
+        let (res, budget, moved) = {
             let mut g = self.inner.lock();
             let n = max.min(g.items.len());
             let before = out.len();
@@ -373,9 +376,9 @@ impl SubQueue {
                 },
                 _ => None,
             };
-            (res, g.take_budget_if_done(), moved, g.items.len() as u64)
+            self.sync_queued(&g);
+            (res, g.take_budget_if_done(), moved)
         };
-        self.queued.store(left, Ordering::Release);
         self.delivered.fetch_add(moved as u64, Ordering::AcqRel);
         drop(budget);
         res
@@ -392,9 +395,9 @@ impl SubQueue {
             if reset_clock {
                 g.origin = None;
             }
+            self.sync_queued(&g);
             (freed, g.take_budget_if_done())
         };
-        self.queued.store(0, Ordering::Release);
         let ms = freed.iter().map(dur_of).sum();
         drop(freed);
         drop(budget);
@@ -429,12 +432,11 @@ impl SubQueue {
             } else {
                 VecDeque::new()
             };
+            // Under L4: `is_closed()` and `close_reason()` never disagree once this returns.
+            self.closed_flag.store(true, Ordering::Release);
+            self.sync_queued(&g);
             (std::mem::take(&mut g.armed), freed, g.take_budget_if_done())
         };
-        self.closed_flag.store(true, Ordering::Release);
-        if clear {
-            self.queued.store(0, Ordering::Release);
-        }
         drop(freed);
         drop(budget);
         if notify {
@@ -855,6 +857,38 @@ mod tests {
         }
         producer.join().unwrap();
         assert_eq!(got, N);
+    }
+
+    /// The lock-free `queued_chunks()` mirror is updated under L4: once concurrent pushes and pops
+    /// are done it equals the real queue length (no stale store from a racing thread).
+    #[test]
+    fn queued_snapshot_is_exact_after_concurrent_push_and_pop() {
+        let (h, _r) = hub();
+        for round in 0..300u64 {
+            let q = SubQueue::new(&spec(60_000, Overflow::DropOldest), token(&h));
+            const N: u64 = 64;
+            let producer = {
+                let q = q.clone();
+                std::thread::spawn(move || {
+                    for i in 0..N {
+                        q.push(chunk(i * 20, 20));
+                    }
+                })
+            };
+            let mut got = 0;
+            while got < N {
+                if let Pop::Item(_) = q.try_pop() {
+                    got += 1;
+                    assert!(q.queued_chunks() <= N);
+                }
+            }
+            producer.join().unwrap();
+            assert_eq!(q.queued_chunks(), 0, "round {round}");
+            assert_eq!(q.stats().queued_chunks, 0);
+            q.close(CloseReason::Closed);
+            assert!(q.is_closed());
+            assert_eq!(q.close_reason(), Some(CloseReason::Closed));
+        }
     }
 
     #[test]
