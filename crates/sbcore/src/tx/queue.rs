@@ -840,14 +840,20 @@ impl PcmQueue {
         false
     }
 
-    /// Arms the reader-gone wake-up (`aclose(drain=True)`); `true` ⇒ already ended.
+    /// Arms the reader-gone wake-up (`aclose(drain=True)`); `true` ⇒ already ended. A closed
+    /// connection counts as ended: its tracks go with the Driver at teardown, after the
+    /// housekeeper (which would ring this wake-up) has stopped.
     pub fn arm_end(&self) -> bool {
-        if self.st.reader_gone.load(Ordering::Acquire) {
+        let ended = || {
+            self.st.reader_gone.load(Ordering::Acquire)
+                || self.st.end_flags.load(Ordering::Acquire) & END_CONN_CLOSED != 0
+        };
+        if ended() {
             return true;
         }
         let mut g = lock_checked(&self.inner);
         g.end_waiting = true;
-        self.st.reader_gone.load(Ordering::Acquire)
+        ended()
     }
 
     /// Wall time of the pull with count `p` (index `p − 1`), from the pull epoch (§7.5).
@@ -1036,6 +1042,14 @@ impl PcmQueue {
         self.st.end_flags.load(Ordering::Acquire) != 0
     }
 
+    /// The owner (`native.Playback`) dropped its handle: abort, unless a close was already
+    /// requested (a `close(drain=True)` in progress completes; its track ends on its own).
+    pub fn abandon(&self) {
+        if self.st.end_flags.load(Ordering::Acquire) == 0 {
+            LiveSource::close(self, CloseMode::Abort);
+        }
+    }
+
     pub fn wake_id(&self) -> WakeId {
         self.wake.as_ref().map_or(WAKE_CONN, WakeToken::id)
     }
@@ -1051,9 +1065,11 @@ impl PcmQueue {
         {
             let mut g = lock_checked(&self.inner);
             self.sync_track(&mut g);
+            // Same rule as `close()`: a drain-closed track that is not playing (paused, idle or
+            // never written) can never drain, so it is stopped.
             let stop = match g.closed {
                 Some(CloseMode::Abort) => true,
-                Some(CloseMode::Drain) => g.queued_frames == 0,
+                Some(CloseMode::Drain) => !g.track_playing,
                 None => false,
             };
             if stop && !g.stop_sent {
@@ -1459,6 +1475,8 @@ impl LiveSource for PcmQueue {
             if !up && self.lim.when_disconnected == DisconnectPolicy::Discard {
                 self.abort_locked(&mut g, &mut after);
                 g.anchor = None;
+                // Like clear(): the next accepted write starts a turn (prebuffer gate re-armed).
+                g.fresh_turn = true;
                 g.generation += 1;
                 self.st.generation.store(g.generation, Ordering::Release);
             }
@@ -1490,7 +1508,11 @@ impl LiveSource for PcmQueue {
             {
                 after.ring = true;
             }
-            if (mode == CloseMode::Abort || nothing_to_drain) && !g.stop_sent {
+            // Without an attached track the stop is left to `attach_track` (it would be lost).
+            if (mode == CloseMode::Abort || nothing_to_drain)
+                && !g.stop_sent
+                && self.track.get().is_some()
+            {
                 g.stop_sent = true;
                 after.stop = true;
             }
@@ -1503,6 +1525,11 @@ impl LiveSource for PcmQueue {
             .end_flags
             .fetch_or(END_CONN_CLOSED | END_ABORT, Ordering::AcqRel);
         LiveSource::close(self, CloseMode::Abort);
+        // `arm_end` now reports the stream as ended; wake a waiter armed before this.
+        let ring = std::mem::take(&mut lock_checked(&self.inner).end_waiting);
+        if ring {
+            self.ring();
+        }
     }
 }
 

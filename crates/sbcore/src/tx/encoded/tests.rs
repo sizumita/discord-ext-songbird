@@ -198,3 +198,97 @@ fn ring_limits_and_space_wakeups() {
         HouseStatus::Finished
     );
 }
+
+#[test]
+fn tiny_decoded_pieces_wait_for_segment_space_instead_of_stopping() {
+    // A codec with tiny packets fills the internal queue's segment bound (48 000 / 32 + 64 = 1 564
+    // segments) long before its frame cap: the pusher must wait for the mixer, not give up.
+    let _s = SERIAL.lock();
+    let mut r = erig(64 << 10).unwrap();
+    let mut p = r.p.take().unwrap();
+    let done = AtomicBool::new(false);
+    let pushed = std::thread::scope(|sc| {
+        let h = sc.spawn(|| {
+            set_role(Role::Decode);
+            let pusher = Pusher {
+                shared: &r.shared,
+                rs: None,
+                stereo: Vec::new(),
+                out48: Vec::new(),
+            };
+            let mut ok = true;
+            for _ in 0..2_000 {
+                if pusher.push48(&[0.1, 0.1]).is_err() {
+                    ok = false;
+                    break;
+                }
+            }
+            done.store(true, Ordering::Release);
+            ok
+        });
+        let t = Instant::now();
+        while !done.load(Ordering::Acquire) {
+            assert!(t.elapsed() < Duration::from_secs(10), "pusher stuck");
+            std::thread::sleep(Duration::from_millis(5));
+            if let Ok(pkt) = p.format.next_packet() {
+                let _ = p.decoder.decode(&pkt);
+            }
+            let _ = LiveSource::housekeep(&*r.shared, Instant::now(), &EventHub::default());
+        }
+        h.join().unwrap()
+    });
+    assert!(pushed, "the pusher gave up on a full segment table");
+    assert_eq!(r.shared.pcm().stats().written_ms, 2_000 * 1_000 / 48_000);
+    LiveSource::close(&*r.shared, CloseMode::Abort);
+}
+
+#[test]
+fn bad_packets_are_counted_in_a_row() {
+    let mut b = BadPackets::default();
+    for _ in 0..MAX_BAD_PACKETS_IN_A_ROW {
+        assert!(b.bad());
+    }
+    b.good();
+    for _ in 0..MAX_BAD_PACKETS_IN_A_ROW {
+        assert!(b.bad(), "a decoded packet resets the run");
+    }
+    assert!(!b.bad());
+}
+
+#[test]
+fn connection_close_wakes_writers() {
+    let _s = SERIAL.lock();
+    let r = erig(64 << 10).unwrap();
+    let mut ready = Vec::new();
+    r._hub.take_ready(&mut ready);
+    r.shared.conn_closed();
+    ready.clear();
+    r._hub.take_ready(&mut ready);
+    assert_eq!(ready, vec![r.shared.wake_id().0]);
+    assert!(r.shared.arm_space(10));
+    assert!(matches!(
+        r.shared.write(&[0]),
+        Err(CoreError::StreamClosed(CloseReason::ConnectionClosed))
+    ));
+}
+
+#[test]
+fn abandon_after_finish_lets_the_stream_play_out() {
+    let _s = SERIAL.lock();
+    // Unfinished: dropping the handle aborts.
+    let r = erig(64 << 10).unwrap();
+    r.shared.abandon();
+    assert!(r.shared.is_closed());
+    // Finished: the decoded audio still plays out and the track ends on its own.
+    let mut r = erig(64 << 10).unwrap();
+    let samples = vec![1_000i16; 4_800];
+    r.shared.write(&wav(48_000, 1, &samples)).unwrap();
+    r.shared.finish();
+    r.shared.abandon();
+    wait_until("decoded", || r.shared.pcm().is_closed());
+    assert!(!r.shared.closed.load(Ordering::Acquire), "not aborted");
+    let (ticks, errors) = r.play_out(100);
+    assert_eq!((ticks, errors), (5, 0));
+    assert_eq!(r.shared.pcm().stats().played_ms, 100);
+    assert!(!r.log.calls().contains(&"stop"));
+}

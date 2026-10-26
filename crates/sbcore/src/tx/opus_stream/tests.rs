@@ -226,3 +226,52 @@ fn clear_and_close() {
     assert!(q.reader_gone());
     assert_eq!(q.housekeep_at(Instant::now()), HouseStatus::Finished);
 }
+
+#[test]
+fn a_close_before_attach_is_applied_when_the_track_attaches() {
+    set_role(Role::Harness);
+    let (hub, _bell) = test_hub();
+    let spec = OpusStreamSpec {
+        max_packets: 10,
+        volume: 1.0,
+    };
+    let muted = Arc::new(AtomicBool::new(false));
+    // Never sent (paused), drain-closed before the attach: it can never drain, so it stops.
+    let q = OpusQueue::new(&spec, hub.alloc().unwrap(), muted.clone()).unwrap();
+    LiveSource::close(&*q, CloseMode::Drain);
+    let log = Rec::default();
+    q.attach_track(Box::new(log.clone()));
+    assert_eq!(log.calls(), vec!["stop"]);
+    // Closed by T5 before the attach.
+    let q = OpusQueue::new(&spec, hub.alloc().unwrap(), muted.clone()).unwrap();
+    q.conn_closed();
+    let log = Rec::default();
+    q.attach_track(Box::new(log.clone()));
+    assert_eq!(log.calls(), vec!["stop"]);
+    // Sent, then drain-closed before the attach: it plays out, no stop.
+    let q = OpusQueue::new(&spec, hub.alloc().unwrap(), muted).unwrap();
+    q.send(&opus_packets(1, 960)[0]).unwrap();
+    LiveSource::close(&*q, CloseMode::Drain);
+    let log = Rec::default();
+    q.attach_track(Box::new(log.clone()));
+    assert_eq!(log.calls(), vec!["play"]);
+}
+
+#[test]
+fn abandon_aborts_an_open_stream_but_lets_a_drain_finish() {
+    let mut r = orig(10);
+    let pk = opus_packets(2, 960);
+    r.q.send(&pk[0]).unwrap();
+    r.q.abandon();
+    assert!(r.next().is_none());
+    assert_eq!(r.log.calls(), vec!["play", "stop"]);
+    let mut r = orig(10);
+    r.q.send(&pk[0]).unwrap();
+    r.q.send(&pk[1]).unwrap();
+    LiveSource::close(&*r.q, CloseMode::Drain);
+    r.q.abandon();
+    assert_eq!(r.log.calls(), vec!["play"], "the drain continues");
+    assert!(r.next().is_some());
+    assert!(r.next().is_some());
+    assert!(r.next().is_none());
+}

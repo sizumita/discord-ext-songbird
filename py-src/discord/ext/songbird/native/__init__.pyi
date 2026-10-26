@@ -724,7 +724,8 @@ class EncodedSink:
     
     Notes
     -----
-    Dropping the object closes it (abort).
+    Dropping the object closes it (abort), unless ``finish()`` (or ``close(drain=True)``) was
+    already called: the decoded audio then plays out and the track ends on its own.
     """
     @property
     def wake_id(self) -> builtins.int: ...
@@ -900,7 +901,8 @@ class OpusSink:
     
     Notes
     -----
-    Dropping the object closes it (abort).
+    Dropping the object closes it (abort), unless ``close(drain=True)`` was already called (the
+    drain then completes).
     """
     @property
     def buffered_ms(self) -> builtins.int: ...
@@ -939,7 +941,8 @@ class Playback:
     
     Notes
     -----
-    Starts paused (nothing is sent until the first write). Dropping the object closes it (abort).
+    Starts paused (nothing is sent until the first write). Dropping the object closes it (abort),
+    unless ``close(drain=True)`` was already called (the drain then completes).
     """
     @property
     def volume(self) -> builtins.float:

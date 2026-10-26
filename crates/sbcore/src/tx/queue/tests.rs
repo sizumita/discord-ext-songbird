@@ -986,3 +986,95 @@ fn mixer_pull_does_not_allocate() {
     r.house();
     assert!(r.q.inner.lock().dead.is_empty());
 }
+
+/// A queue with no track attached yet (W2 attaches right after `driver.play`).
+fn unattached(spec: PlaybackSpec) -> (Arc<PcmQueue>, Arc<WakeHub>, UnixStream) {
+    set_role(Role::Harness);
+    let (hub, bell) = test_hub();
+    let (clock, _) = Clock::manual();
+    let q = PcmQueue::new(
+        9,
+        &spec,
+        hub.alloc().unwrap(),
+        clock,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    (q, hub, bell)
+}
+
+#[test]
+fn a_close_before_attach_is_applied_when_the_track_attaches() {
+    // Never written (paused), drain-closed before the attach: it can never drain, so it stops.
+    let (q, _hub, _bell) = unattached(spec(PCM16_24K));
+    LiveSource::close(&*q, CloseMode::Drain);
+    let log = Rec::default();
+    q.attach_track(Box::new(log.clone()));
+    assert_eq!(log.calls(), vec!["stop"]);
+    // Closed by T5 before the attach.
+    let (q, _hub, _bell) = unattached(spec(PCM16_24K));
+    q.conn_closed();
+    let log = Rec::default();
+    q.attach_track(Box::new(log.clone()));
+    assert_eq!(log.calls(), vec!["stop"]);
+    // Written, then drain-closed before the attach: it plays out (EOF once empty), no stop.
+    let (q, _hub, _bell) = unattached(spec(PCM16_24K));
+    q.write(WriteData::Pcm(&[1, 0, 2, 0]), WriteMeta::default())
+        .unwrap();
+    LiveSource::close(&*q, CloseMode::Drain);
+    let log = Rec::default();
+    q.attach_track(Box::new(log.clone()));
+    assert_eq!(log.calls(), vec!["play"]);
+    assert!(!PcmProvider::should_end(&*q));
+}
+
+#[test]
+fn connection_close_wakes_and_resolves_an_end_waiter() {
+    let r = Rig::new(spec(PCM16_24K));
+    r.write(&r.audio(40)).unwrap();
+    LiveSource::close(&*r.q, CloseMode::Drain);
+    assert!(!r.q.arm_end(), "draining: the reader is still there");
+    let _ = r.ready();
+    // T5: the housekeeper stops and the reader goes with the Driver later.
+    r.q.conn_closed();
+    assert_eq!(r.ready(), vec![r.q.wake_id().0]);
+    assert!(r.q.arm_end());
+}
+
+#[test]
+fn link_down_discard_starts_a_new_turn() {
+    let mut s = spec(PCM16_24K);
+    s.when_disconnected = DisconnectPolicy::Discard;
+    s.prebuffer_ms = 100;
+    let r = Rig::new(s);
+    r.write(&r.audio(200)).unwrap();
+    assert_eq!(
+        r.pull().1.consumed,
+        480,
+        "the gate opened at prebuffer_frames"
+    );
+    LiveSource::on_link(&*r.q, false);
+    LiveSource::on_link(&*r.q, true);
+    // The next reply prebuffers again, as after clear().
+    r.write(&r.audio(40)).unwrap();
+    assert_eq!(r.pull().1.consumed, 0);
+}
+
+#[test]
+fn abandon_aborts_an_open_stream_but_lets_a_drain_finish() {
+    let r = Rig::new(spec(PCM16_24K));
+    r.write(&r.audio(40)).unwrap();
+    r.q.abandon();
+    assert!(PcmProvider::should_end(&*r.q));
+    assert_eq!(r.log(), vec!["play", "stop"]);
+    let mut r = Rig::new(spec(PCM16_24K));
+    r.write(&r.audio(40)).unwrap();
+    LiveSource::close(&*r.q, CloseMode::Drain);
+    r.q.abandon();
+    assert_eq!(r.log(), vec!["play"], "the drain continues");
+    assert_eq!(r.q.stats().buffered_ms, 40);
+    r.tick();
+    r.tick();
+    assert!(PcmProvider::should_end(&*r.q));
+    assert_eq!(r.q.stats().played_ms, 40);
+}

@@ -186,6 +186,20 @@ impl EncodedShared {
         self.closed.load(Ordering::Acquire) || self.pcm.is_closed()
     }
 
+    /// Whether `finish()` (or `close(drain=True)`) was called.
+    pub fn is_finished(&self) -> bool {
+        lock_checked(&self.ring.inner).finished
+    }
+
+    /// The owner (`native.EncodedSink`) dropped its handle: abort, unless the input was already
+    /// complete (`finish()` / `close(drain=True)`: the decoded audio still plays out and the
+    /// track ends on its own, as for a file) or the stream is closed.
+    pub fn abandon(&self) {
+        if !self.is_finished() && !self.is_closed() {
+            LiveSource::close(self, CloseMode::Abort);
+        }
+    }
+
     /// The internal decoded-audio queue (the songbird track reads it).
     #[allow(dead_code)] // called by W2's ConnShared::open_* / play (phase-2 integration)
     pub(crate) fn pcm(&self) -> &Arc<PcmQueue> {
@@ -229,6 +243,16 @@ impl EncodedShared {
             let mut g = lock_checked(&self.space_lock);
             let _ = self.space.wait_for(&mut g, WAIT);
         }
+    }
+
+    /// Waits (bounded) for the next housekeeping tick or `close()`; `false` once closed.
+    fn wait_tick(&self) -> bool {
+        if self.closed.load(Ordering::Acquire) || self.pcm.is_closed() {
+            return false;
+        }
+        let mut g = lock_checked(&self.space_lock);
+        let _ = self.space.wait_for(&mut g, WAIT);
+        !(self.closed.load(Ordering::Acquire) || self.pcm.is_closed())
     }
 }
 
@@ -286,6 +310,8 @@ impl LiveSource for EncodedShared {
         self.conn_closed.store(true, Ordering::Release);
         self.close_ring();
         self.pcm.conn_closed();
+        // Wake writers waiting for ring space: they now get StreamClosed("connection_closed").
+        self.token.notify();
     }
 }
 
@@ -440,26 +466,51 @@ impl Pusher<'_> {
             if frames == 0 {
                 continue;
             }
-            if !self.shared.wait_space(frames) {
-                return Err(Outcome::Closed);
-            }
-            let boxed: Box<[i16]> = piece
-                .get(..frames as usize * 2)
-                .unwrap_or(&[])
-                .iter()
-                .map(|s| f32_sample_to_i16(*s))
-                .collect();
-            match self.shared.pcm.write_samples(boxed) {
-                Ok(_) => {}
-                Err(CoreError::PlaybackFull { .. }) => {
-                    // Only this thread writes the internal queue, so space cannot shrink; treat a
-                    // spurious full as closed-ish and stop rather than spin.
+            loop {
+                if !self.shared.wait_space(frames) {
                     return Err(Outcome::Closed);
                 }
-                Err(_) => return Err(Outcome::Closed),
+                let boxed: Box<[i16]> = piece
+                    .get(..frames as usize * 2)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|s| f32_sample_to_i16(*s))
+                    .collect();
+                match self.shared.pcm.write_samples(boxed) {
+                    Ok(_) => break,
+                    // Frames fit (only this thread writes), but the queue's segment bound did not
+                    // (a codec with tiny packets): wait for the mixer to consume, then retry.
+                    Err(CoreError::PlaybackFull { .. }) => {
+                        if !self.shared.wait_tick() {
+                            return Err(Outcome::Closed);
+                        }
+                    }
+                    Err(_) => return Err(Outcome::Closed),
+                }
             }
         }
         Ok(())
+    }
+}
+
+/// Consecutive undecodable packets tolerated before an encoded stream fails (a long stream with
+/// occasional corrupt frames, e.g. an MP3 joined mid-stream, keeps playing).
+const MAX_BAD_PACKETS_IN_A_ROW: u32 = 64;
+
+/// Counts consecutive undecodable packets.
+#[derive(Debug, Default)]
+struct BadPackets(u32);
+
+impl BadPackets {
+    /// A packet failed to decode; `false` once the limit is exceeded.
+    fn bad(&mut self) -> bool {
+        self.0 += 1;
+        self.0 <= MAX_BAD_PACKETS_IN_A_ROW
+    }
+
+    /// A packet decoded.
+    fn good(&mut self) {
+        self.0 = 0;
     }
 }
 
@@ -515,7 +566,7 @@ fn decode_loop(shared: &Arc<EncodedShared>) -> Outcome {
         out48: Vec::new(),
     };
     let mut sbuf: Option<SampleBuffer<f32>> = None;
-    let mut bad_packets = 0u32;
+    let mut bad_packets = BadPackets::default();
     loop {
         if shared.closed.load(Ordering::Acquire) {
             return Outcome::Closed;
@@ -542,11 +593,13 @@ fn decode_loop(shared: &Arc<EncodedShared>) -> Outcome {
             continue;
         }
         let decoded = match decoder.decode(&pkt) {
-            Ok(d) => d,
+            Ok(d) => {
+                bad_packets.good();
+                d
+            }
             Err(SymphError::DecodeError(_)) | Err(SymphError::IoError(_)) => {
-                // A corrupt packet: skip it, but give up on a stream of them.
-                bad_packets += 1;
-                if bad_packets > 64 {
+                // A corrupt packet: skip it, but give up on a run of them.
+                if !bad_packets.bad() {
                     return closed_or(Outcome::Failed);
                 }
                 continue;

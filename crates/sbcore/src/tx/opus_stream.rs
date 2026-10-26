@@ -285,6 +285,14 @@ impl OpusQueue {
         self.end_flags.load(Ordering::Acquire) != 0
     }
 
+    /// The owner (`native.OpusSink`) dropped its handle: abort, unless a close was already
+    /// requested (a `close(drain=True)` in progress completes).
+    pub fn abandon(&self) {
+        if !self.is_closed() {
+            LiveSource::close(self, CloseMode::Abort);
+        }
+    }
+
     /// Whether the reader holding this queue was dropped.
     pub fn reader_gone(&self) -> bool {
         self.reader_gone.load(Ordering::Acquire)
@@ -299,9 +307,10 @@ impl OpusQueue {
         let stop = {
             let mut g = lock_checked(&self.inner);
             self.sync_track(&mut g);
+            // Same rule as `close()`: a drain-closed track that is not playing can never drain.
             let stop = match g.closed {
                 Some(CloseMode::Abort) => true,
-                Some(CloseMode::Drain) => g.packets.is_empty(),
+                Some(CloseMode::Drain) => !g.track_playing,
                 None => false,
             } && !g.stop_sent;
             g.stop_sent |= stop;
@@ -452,7 +461,10 @@ impl LiveSource for OpusQueue {
             } else {
                 VecDeque::new()
             };
-            let stop = (mode == CloseMode::Abort || !g.track_playing) && !g.stop_sent;
+            // Without an attached track the stop is left to `attach_track` (it would be lost).
+            let stop = (mode == CloseMode::Abort || !g.track_playing)
+                && !g.stop_sent
+                && self.track.get().is_some();
             g.stop_sent |= stop;
             (old, stop, std::mem::take(&mut g.space_waiting))
         };

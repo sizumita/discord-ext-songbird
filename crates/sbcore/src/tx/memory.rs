@@ -47,6 +47,15 @@ fn too_big(what: &'static str, value: u64, max: u64) -> CoreError {
     })
 }
 
+/// `LimitExceeded` if `frames` of `channels`-channel i16 would exceed `MAX_SOURCE_BYTES`.
+pub(crate) fn check_resampled_size(frames: u64, channels: u8) -> Result<(), CoreError> {
+    let bytes = frames.saturating_mul(u64::from(channels)).saturating_mul(2);
+    if bytes > MAX_SOURCE_BYTES as u64 {
+        return Err(too_big("source_bytes", bytes, MAX_SOURCE_BYTES as u64));
+    }
+    Ok(())
+}
+
 /// What the eager probe found.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProbeInfo {
@@ -320,6 +329,11 @@ impl MemPcm {
             ));
         }
         let n = data.len() / enc.sample_width();
+        let mut rs = StreamResampler::new(rate_hz, SampleRate::Hz48000, ch)?;
+        let frames = (n / ch) as u64;
+        // The stored 48 kHz result obeys the same cap as any source (§10 T10), checked before the
+        // sample buffers are allocated: upsampling can multiply the input size by up to 6.
+        check_resampled_size(rs.expected_output_frames(frames), channels)?;
         let mut input: Vec<f32> = Vec::new();
         input.try_reserve_exact(n)?;
         match enc {
@@ -336,8 +350,6 @@ impl MemPcm {
                 input.extend(chunks.iter().map(|c| f32::from_le_bytes(*c)));
             }
         }
-        let mut rs = StreamResampler::new(rate_hz, SampleRate::Hz48000, ch)?;
-        let frames = (n / ch) as u64;
         let expected = usize::try_from(rs.expected_output_frames(frames))
             .unwrap_or(usize::MAX)
             .saturating_add(4096)

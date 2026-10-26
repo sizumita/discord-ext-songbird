@@ -233,3 +233,22 @@ fn done_source_records_eof_and_drop() {
     drop(src);
     assert_ne!(flags.hints() & DROPPED, 0);
 }
+
+#[test]
+fn resampled_size_is_capped_before_allocating() {
+    let max = MAX_SOURCE_BYTES as u64;
+    assert!(check_resampled_size(max / 4, 2).is_ok());
+    assert!(matches!(
+        check_resampled_size(max / 4 + 1, 2),
+        Err(CoreError::Limit(_))
+    ));
+    assert!(check_resampled_size(max / 2, 1).is_ok());
+    assert!(check_resampled_size(u64::MAX, 2).is_err());
+    // 1 s at 44.1 kHz stereo is far below the cap and still accepted.
+    let data: Vec<u8> = tone(44_100, 2, 1_000.0, 0.5, 1.0)
+        .iter()
+        .flat_map(|s| s.to_le_bytes())
+        .collect();
+    let m = MemPcm::from_any_rate(44_100, 2, Encoding::F32Le, &data).unwrap();
+    assert_eq!(m.frames(), 48_000);
+}

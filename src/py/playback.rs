@@ -36,7 +36,8 @@ fn close_mode(drain: bool) -> CloseMode {
 ///
 /// Notes
 /// -----
-/// Starts paused (nothing is sent until the first write). Dropping the object closes it (abort).
+/// Starts paused (nothing is sent until the first write). Dropping the object closes it (abort),
+/// unless ``close(drain=True)`` was already called (the drain then completes).
 #[gen_stub_pyclass]
 #[pyclass(module = "discord.ext.songbird.native", frozen, weakref)]
 pub struct Playback {
@@ -59,7 +60,8 @@ impl Playback {
 
 impl Drop for Playback {
     fn drop(&mut self) {
-        LiveSource::close(&*self.q, CloseMode::Abort);
+        // Abort, unless a drain close was already requested (it completes on its own).
+        self.q.abandon();
     }
 }
 
@@ -279,7 +281,8 @@ impl Playback {
 ///
 /// Notes
 /// -----
-/// Dropping the object closes it (abort).
+/// Dropping the object closes it (abort), unless ``finish()`` (or ``close(drain=True)``) was
+/// already called: the decoded audio then plays out and the track ends on its own.
 #[gen_stub_pyclass]
 #[pyclass(module = "discord.ext.songbird.native", frozen, weakref)]
 pub struct EncodedSink {
@@ -296,7 +299,8 @@ impl EncodedSink {
 
 impl Drop for EncodedSink {
     fn drop(&mut self) {
-        LiveSource::close(&*self.enc, CloseMode::Abort);
+        // Abort, unless the input is complete (`finish()`): the decoded audio still plays out.
+        self.enc.abandon();
     }
 }
 
@@ -353,7 +357,8 @@ impl EncodedSink {
 ///
 /// Notes
 /// -----
-/// Dropping the object closes it (abort).
+/// Dropping the object closes it (abort), unless ``close(drain=True)`` was already called (the
+/// drain then completes).
 #[gen_stub_pyclass]
 #[pyclass(module = "discord.ext.songbird.native", frozen, weakref)]
 pub struct OpusSink {
@@ -370,7 +375,8 @@ impl OpusSink {
 
 impl Drop for OpusSink {
     fn drop(&mut self) {
-        LiveSource::close(&*self.q, CloseMode::Abort);
+        // Abort, unless a drain close was already requested (it completes on its own).
+        self.q.abandon();
     }
 }
 
