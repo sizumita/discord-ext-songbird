@@ -178,6 +178,7 @@ class TrackHandle:
         TimeoutError
             songbird did not answer within ``timeout`` (the mixer is parked while nothing plays).
         """
+        self._pump.check_loop()  # before the seek starts: a foreign-loop call must not seek
         conn = self._pump.conn
         op = conn.start_track_seek(self._native, seconds, _op_timeout_ms(timeout))
         result = await self._pump.wait_op(op)
@@ -193,12 +194,14 @@ class TrackHandle:
         TimeoutError
             songbird did not answer within ``timeout`` (the mixer is parked while nothing plays).
         """
+        self._pump.check_loop()
         conn = self._pump.conn
         op = conn.start_track_info(self._native, _op_timeout_ms(timeout))
         return await self._pump.wait_op(op)
 
     async def wait_ended(self) -> TrackEnd:
         """Wait until the track ends — on every termination path (end, error, stop, disconnect)."""
+        self._pump.check_loop()
         if not self._native.ended:
             await self._pump.wait_track(self._native)
         reason = self._native.end_reason
@@ -271,6 +274,27 @@ class TrackQueue:
 
         Its buffer and decode thread are opened, and ``feed`` is pumped, only when the entry becomes
         current; until then it holds no buffer and no thread.
+
+        Parameters
+        ----------
+        feed : AsyncIterable[bytes] or asyncio.StreamReader
+            Encoded bytes (see ``supported_codecs()``), pumped by ``EncodedStream.feed_from``.
+        volume : float, default 1.0
+            ``0.0..=4.0``.
+        loops : int or None, default 0
+            Must be 0: a live stream cannot loop (anything else raises ``TrackError``, as
+            ``TrackHandle.set_loops`` does).
+        paused : bool, default False
+            Start paused when the entry becomes current.
+        max_buffer_bytes : int, default 1 MiB
+            Encoded-byte buffer, ``64 KiB..=16 MiB``.
+
+        Raises
+        ------
+        TrackError
+            ``loops`` is not 0.
+        LimitExceeded
+            Beyond 10 000 pending entries, or an option out of range.
         """
         t = self._conn.enqueue_stream(volume, loops, paused, max_buffer_bytes)
         self._feeds[t] = feed

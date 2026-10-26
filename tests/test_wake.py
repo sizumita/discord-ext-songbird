@@ -137,3 +137,57 @@ async def test_waiting_from_another_loop_raises(connected_vc: Any) -> None:
     t.join(5)
     assert errors and isinstance(errors[0], RuntimeError)
     stream.close()
+
+
+async def test_another_loop_raises_even_when_no_wait_is_needed(connected_vc: Any, testing: Any) -> None:
+    """The loop check comes before every fast path: a foreign-loop await fails deterministically
+    instead of only under backpressure, and it consumes, writes or seeks nothing."""
+    import threading
+
+    from conftest import inject_ticks
+
+    vc = connected_vc
+    stream = vc.listen_mixed(songbird.PCM16_24K)
+    events = vc.events()
+    pb = vc.open_playback(songbird.PCM16_24K)
+    opus = vc.open_opus_stream()
+    encoded = vc.open_encoded_stream()
+    track = vc.play(songbird.OpusPackets([b"\xf8\xff\xfe"] * 10))
+    ended = vc.play(songbird.OpusPackets([b"\xf8\xff\xfe"]))
+    ended.stop()
+    testing.inject_map(vc._conn, 101, 7_000_000_000_000_001)  # a UserMapped event
+    inject_ticks(vc, testing, 2, voiced=False)
+    assert stream.queued_ms == 40
+    calls: dict[str, Any] = {
+        "read": lambda: stream.read(),
+        "anext": lambda: anext(stream),
+        "events": lambda: anext(events),
+        "write": lambda: pb.write(bytes(960)),
+        "drain": lambda: pb.drain(),
+        "wait_idle": lambda: pb.wait_idle(),
+        "opus_send": lambda: opus.send(b"\xf8\xff\xfe"),
+        "encoded_write": lambda: encoded.write(b"x"),
+        "seek": lambda: track.seek(0.5),
+        "info": lambda: track.info(),
+        "wait_ended": lambda: ended.wait_ended(),
+    }
+    errors: dict[str, BaseException | None] = {}
+
+    def other_loop() -> None:
+        for name, make in calls.items():
+            try:
+                asyncio.run(make())
+                errors[name] = None
+            except BaseException as e:
+                errors[name] = e
+
+    t = threading.Thread(target=other_loop)
+    t.start()
+    t.join(10)
+    assert {k: type(e).__name__ for k, e in errors.items()} == dict.fromkeys(calls, "RuntimeError")
+    assert stream.queued_ms == 40, "nothing was read"
+    assert events.read_nowait() is not None, "no event was consumed"
+    assert pb.written_ms == 0 and opus.buffered_ms == 0
+    assert "seek" not in testing.track_log(track._native), "a foreign-loop seek() must not seek"
+    for s in (stream, events, pb, opus, encoded):
+        s.close()

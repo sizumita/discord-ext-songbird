@@ -73,9 +73,10 @@ class AudioStream(AsyncIterator[AudioChunk]):
     """Bounded, continuous, cancel-safe receive stream: one chunk per ``chunk_ms``, whether or not
     anyone speaks.
 
-    Ends (``StopAsyncIteration``) after :meth:`close` or connection close, once the queued chunks
-    are drained. Under ``overflow="error"``, ``__anext__`` raises :class:`StreamOverflow` once after
-    the queued chunks, then stops.
+    Ends (``StopAsyncIteration``) after a close by the connection, the user's leave or the router,
+    once the queued chunks are drained; :meth:`close` ends it at once and discards what is still
+    queued. Under ``overflow="error"``, ``__anext__`` raises :class:`StreamOverflow` once after the
+    queued chunks, then stops.
 
     Created by ``SongbirdClient.listen*``; never instantiate it directly.
 
@@ -119,7 +120,8 @@ class AudioStream(AsyncIterator[AudioChunk]):
 
     @property
     def closed(self) -> bool:
-        """Whether the stream is closed (queued chunks may still be readable)."""
+        """Whether the stream is closed (after a close by the connection, queued chunks may still
+        be readable)."""
         return self._sub.closed
 
     @property
@@ -190,6 +192,7 @@ class AudioStream(AsyncIterator[AudioChunk]):
             return await self._next()
 
     async def _next(self) -> native.AudioChunk:
+        self._pump.check_loop()
         while True:
             chunk = self._sub.try_recv()
             if chunk is not None:
@@ -258,14 +261,18 @@ class AudioStream(AsyncIterator[AudioChunk]):
     # ── closing ──────────────────────────────────────────────────────────────────────────────────
 
     def close(self) -> None:
-        """Idempotent and safe from any thread; unregisters at the next tick and frees queued chunks."""
+        """Idempotent and safe from any thread; unregisters at the next tick and frees queued chunks,
+        so iteration ends at once (read until :meth:`read_nowait` returns ``None`` first to keep
+        them). A stream already closed by the connection keeps its queued chunks readable."""
         self._sub.close()
 
     async def aclose(self) -> None:
         """:meth:`close`."""
+        self._pump.check_loop()
         self.close()
 
     async def __aenter__(self) -> Self:
+        self._pump.check_loop()
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -286,13 +293,17 @@ class UserStreams(AsyncIterator[AudioStream]):
 
     @property
     def dropped(self) -> int:
-        """Streams discarded because the router queue (64) overflowed."""
+        """Users who got no stream: refused because the connection's 64-stream cap (shared with
+        explicit ``listen_*`` streams) or its ``max_receive_mb`` budget was used up (each logged as
+        a warning; the user is not retried until they leave and return), or discarded because 64
+        new streams waited unread in this router."""
         return self._router.dropped
 
     def __aiter__(self) -> Self:
         return self
 
     async def __anext__(self) -> AudioStream:
+        self._pump.check_loop()
         while True:
             try:
                 sub = self._router.try_next()
@@ -313,9 +324,11 @@ class UserStreams(AsyncIterator[AudioStream]):
 
     async def aclose(self, *, close_streams: bool = True) -> None:
         """:meth:`close`."""
+        self._pump.check_loop()
         self.close(close_streams=close_streams)
 
     async def __aenter__(self) -> Self:
+        self._pump.check_loop()
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -325,8 +338,8 @@ class UserStreams(AsyncIterator[AudioStream]):
 class EventStream(AsyncIterator[Any]):
     """Bounded (drop-oldest) voice event queue; a ``VoiceEvent.Lagged`` reports drops.
 
-    Ends after ``Disconnected(will_retry=False)``, which is always the last event. Created by
-    ``SongbirdClient.events``.
+    Ends after ``Disconnected(will_retry=False)``, which is always the last event, or at once after
+    :meth:`close`. Created by ``SongbirdClient.events``.
     """
 
     def __init__(self, sub: native.EventSubscription, pump: _Pump) -> None:
@@ -342,6 +355,7 @@ class EventStream(AsyncIterator[Any]):
         return self
 
     async def __anext__(self) -> Any:
+        self._pump.check_loop()
         while True:
             try:
                 ev = self._sub.try_recv()
@@ -370,14 +384,17 @@ class EventStream(AsyncIterator[Any]):
         return self._sub.read_nowait()
 
     def close(self) -> None:
-        """Idempotent and safe from any thread."""
+        """Idempotent and safe from any thread; frees the queued events, so iteration ends at once.
+        A stream the connection already closed keeps its events, ending with ``Disconnected``."""
         self._sub.close()
 
     async def aclose(self) -> None:
         """:meth:`close`."""
+        self._pump.check_loop()
         self.close()
 
     async def __aenter__(self) -> Self:
+        self._pump.check_loop()
         return self
 
     async def __aexit__(self, *exc: object) -> None:

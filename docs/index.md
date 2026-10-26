@@ -184,7 +184,7 @@ this loop (raw PCM in binary frames, a `"clear"` text frame as the interruption 
 1. Every stream, playback and event stream is an async context manager. Every `close()` is
    synchronous, idempotent and safe from any thread; dropping an unclosed object closes it.
 2. Awaiting is bound to the event loop that ran `connect()`; awaiting from another loop raises
-   `RuntimeError`. The synchronous methods (`read_nowait`, `write_nowait`, `clear`, `close`,
+   `RuntimeError` before anything is done, even when no wait would be needed. The synchronous methods (`read_nowait`, `write_nowait`, `clear`, `close`,
    properties) work from any thread.
 3. In a task that reads audio from a network connection, use `write_nowait` and treat
    `PlaybackFull` as an overrun; never `await write()` there, or backpressure delays handling of

@@ -136,6 +136,8 @@ impl TrackQueue {
 
     /// Adds a pending entry (`LimitExceeded` beyond `MAX_QUEUE_ENTRIES`). Nothing is handed to
     /// songbird (and a lazy `Encoded` entry allocates nothing) until the entry becomes current.
+    /// A live source (a lazy encoded stream) cannot loop: any `loops` but `Some(0)` is a
+    /// `TrackError`, as `update_pending` and `TrackHandle.set_loops` report it.
     pub fn enqueue(
         &self,
         src: SourceSpec,
@@ -144,6 +146,9 @@ impl TrackQueue {
     ) -> Result<TrackRef, CoreError> {
         check("volume", opts.volume, VOLUME)?;
         loop_state(opts.loops)?;
+        if src.kind().is_live() && opts.loops != Some(0) {
+            return Err(CoreError::Track("live sources cannot loop".into()));
+        }
         let track = {
             let mut st = lock_checked(&self.state);
             // Checked under the queue lock: T8's `close_all` drains under it after T0 set
@@ -551,6 +556,25 @@ mod tests {
             !q.update_pending(&other, PendingChange::Paused(true))
                 .unwrap()
         );
+    }
+
+    /// `enqueue_stream(loops=…)` used to be accepted and ignored while `set_loops` on the same
+    /// entry raised: a live entry rejects every `loops` but 0 at enqueue, as later.
+    #[test]
+    fn live_entries_cannot_loop_at_enqueue_either() {
+        let (q, reg, _) = setup();
+        for loops in [None, Some(2)] {
+            let opts = PlayOpts {
+                loops,
+                ..PlayOpts::default()
+            };
+            assert!(matches!(
+                q.enqueue(spec(), opts, &reg),
+                Err(CoreError::Track(ref m)) if m.contains("cannot loop")
+            ));
+        }
+        assert!(q.is_empty());
+        assert!(q.enqueue(spec(), PlayOpts::default(), &reg).is_ok());
     }
 
     #[test]

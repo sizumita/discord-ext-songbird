@@ -209,6 +209,7 @@ class PlaybackStream:
         self._pb.write(data, tag, at_ms)
 
     async def _write(self, attempt: Callable[[], None], nbytes: int, timeout: float | None) -> None:
+        self._pump.check_loop()
         async with asyncio.timeout(timeout):
             spins = 0
             while True:
@@ -281,6 +282,7 @@ class PlaybackStream:
             ``False`` on timeout or when the stream or connection closes. While the link is down or
             the client is self-muted it keeps waiting (the audio plays afterwards).
         """
+        self._pump.check_loop()
         try:
             async with asyncio.timeout(timeout):
                 while True:
@@ -298,6 +300,7 @@ class PlaybackStream:
         """Wait until playback is idle: everything written has played and no new audio arrived for
         ``idle_ms``. Useful when the source has no explicit end-of-segment signal. Returns at once
         if nothing is playing."""
+        self._pump.check_loop()
         while not self._pb.closed and not self._pb.arm_idle():
             if self._pump.is_closed:
                 return
@@ -323,6 +326,7 @@ class PlaybackStream:
     async def aclose(self, *, drain: bool = False, timeout: float | None = None) -> None:
         """Close; with ``drain=True`` first let the buffered audio play (at most ``timeout`` s,
         default ``buffered_ms + 2 s``), then stop."""
+        self._pump.check_loop()
         if not drain:
             self.close()
             return
@@ -338,6 +342,7 @@ class PlaybackStream:
             self._pb.close(False)
 
     async def __aenter__(self) -> Self:
+        self._pump.check_loop()
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -366,6 +371,7 @@ class EncodedStream:
         LimitExceeded
             The write is larger than the whole buffer (checked before anything is copied).
         """
+        self._pump.check_loop()
         n = memoryview(data).nbytes
         async with asyncio.timeout(timeout):
             spins = 0
@@ -409,6 +415,7 @@ class EncodedStream:
         finish : bool, default True
             Call :meth:`finish` at the end of ``src``.
         """
+        self._pump.check_loop()
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
         total = 0
@@ -447,6 +454,7 @@ class EncodedStream:
         playing. Once nothing has played for 2 s (self-muted, the voice link down, the track
         paused) the stream is closed (stopped) instead.
         """
+        self._pump.check_loop()
         if not drain:
             self.close()
             return
@@ -455,6 +463,7 @@ class EncodedStream:
         await _wait_drained(self.track, timeout, self.close, lambda: self._sink.played_ms)
 
     async def __aenter__(self) -> Self:
+        self._pump.check_loop()
         return self
 
     async def __aexit__(self, exc_type: type[BaseException] | None, *exc: object) -> None:
@@ -483,6 +492,7 @@ class OpusPacketStream:
 
     async def send(self, packet: Buffer, *, timeout: float | None = None) -> None:
         """Queue one packet, waiting while the queue is full."""
+        self._pump.check_loop()
         async with asyncio.timeout(timeout):
             spins = 0
             while True:
@@ -526,6 +536,7 @@ class OpusPacketStream:
 
         A paused stream with packets left cannot drain and is stopped at once.
         """
+        self._pump.check_loop()
         if not drain:
             self.close()
             return
@@ -534,6 +545,7 @@ class OpusPacketStream:
         await _wait_drained(self.track, deadline, self.close)
 
     async def __aenter__(self) -> Self:
+        self._pump.check_loop()
         return self
 
     async def __aexit__(self, exc_type: type[BaseException] | None, *exc: object) -> None:

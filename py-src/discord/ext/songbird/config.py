@@ -19,7 +19,8 @@ class VoiceConfig:
     ----------
     receive : bool, default True
         ``False`` disables receive decoding entirely (songbird ``DecodeMode::Pass``); ``listen_*``
-        then raise :class:`ReceiveDisabled`.
+        then raise :class:`ReceiveDisabled`. ``events()`` still reports ``UserMapped`` and
+        ``UserLeft``; ``SpeakingStarted``/``SpeakingStopped`` need received audio and never fire.
     playout_buffer_ms : int, default 60
         songbird jitter buffer, ``20..=200``, a multiple of 20.
     playout_spike_ms : int, default 60

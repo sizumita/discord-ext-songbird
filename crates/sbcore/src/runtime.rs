@@ -241,8 +241,25 @@ impl Drop for LiveCounter {
     }
 }
 
-/// Every counter plus `songbird_live_tasks` (= `SCHEDULER.live_tasks()`, 0 before the scheduler
-/// exists). `total_tasks()` is deliberately not reported (§11.3). Never starts a runtime.
+/// Tasks alive on `rt` (spawned and not yet finished; 0 before the runtime exists).
+fn alive_tasks(rt: &OnceLock<Runtime>) -> u64 {
+    rt.get().map_or(0, |rt| {
+        u64::try_from(rt.metrics().num_alive_tasks()).unwrap_or(u64::MAX)
+    })
+}
+
+/// Tasks alive on the NET runtime (0 before it exists): what a never-Poisoned Driver leaks.
+pub fn net_alive_tasks() -> u64 {
+    alive_tasks(&NET)
+}
+
+/// Every counter, `songbird_live_tasks` (= `SCHEDULER.live_tasks()`, 0 before the scheduler
+/// exists), and the tasks alive on each runtime: `net_alive_tasks` (songbird's Idle task and the
+/// core, events, idle-mixer, WS and UDP tasks of every Driver) and `rx_alive_tasks` (ConnWorkers,
+/// connect futures, track ops). Only the task counts see a Driver that was never
+/// Poisoned: our own counters drop when `OwnedDriver::teardown` returns, `Dispatch` clones go with
+/// `RemoveGlobalEvents`, and a parked mixer is not a live one (§11.3). `total_tasks()` is
+/// deliberately not reported. Never starts a runtime.
 pub fn live_counts() -> Vec<(&'static str, u64)> {
     let mut out: Vec<(&'static str, u64)> = LIVE_TABLE
         .iter()
@@ -252,6 +269,8 @@ pub fn live_counts() -> Vec<(&'static str, u64)> {
         "songbird_live_tasks",
         SCHEDULER.get().map_or(0, Scheduler::live_tasks),
     ));
+    out.push(("net_alive_tasks", alive_tasks(&NET)));
+    out.push(("rx_alive_tasks", alive_tasks(&RX)));
     out
 }
 
@@ -299,6 +318,8 @@ mod tests {
             "TrackFlags",
             "DecodeThread",
             "songbird_live_tasks",
+            "net_alive_tasks",
+            "rx_alive_tasks",
         ] {
             assert!(names.contains(&n), "missing {n}");
         }

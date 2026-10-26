@@ -204,19 +204,43 @@ async def test_seek_validation(connected_vc: HarnessClient) -> None:
         pb.track.set_loops(2)
 
 
-@pytest.mark.fake_only
-async def test_track_ops(connected_vc: HarnessClient) -> None:
+async def test_track_ops(connected_vc: HarnessClient, testing: Any) -> None:
+    """``info()``/``seek()`` results cross the binding as ``TrackInfo``, seconds, ``TimeoutError``
+    and ``TrackError``. A detached connection answers from its fake track control as songbird's
+    live mixer would, or never (``set_ops_answered(False)``) as its parked mixer does."""
     vc = connected_vc
-    t = vc.play(OpusPackets([SILENT_FRAME] * 10), volume=0.5)
-    op = asyncio.create_task(t.info())
-    await pump_settle()
-    vc.harness.step(20)
-    info = await asyncio.wait_for(op, 2)
-    assert info.volume == 0.5 and info.playing == "play"
-    seek = asyncio.create_task(t.seek(0.1))
-    await pump_settle()
-    vc.harness.step(20)
-    assert await asyncio.wait_for(seek, 2) == pytest.approx(0.1)
+
+    async def op(coro: Any) -> Any:
+        task = asyncio.create_task(coro)
+        await pump_settle()
+        vc.harness.step(20)
+        return await asyncio.wait_for(task, 2)
+
+    t = vc.play(OpusPackets([SILENT_FRAME] * 10), volume=0.5, loops=2)
+    info = await op(t.info())
+    assert isinstance(info, songbird.TrackInfo)
+    assert (info.playing, info.volume, info.loops, info.position_ms) == ("play", 0.5, 2, 0)
+    pos = await op(t.seek(1.5))
+    assert isinstance(pos, float) and pos == pytest.approx(1.5)  # seconds, not ms
+    assert (await op(t.info())).position_ms == 1_500
+    assert testing.track_log(t._native)[-1] == "seek"
+    t.pause()
+    t.set_volume(1.25)
+    t.set_loops(None)
+    info = await op(t.info())
+    assert (info.playing, info.volume, info.loops) == ("pause", 1.25, None)
+    pb = vc.open_playback()
+    pb.volume = 0.25  # a live PCM source applies its volume in its decoder
+    assert (await op(pb.track.info())).volume == pytest.approx(0.25)
+    testing.set_ops_answered(vc._conn, False)
+    with pytest.raises(TimeoutError):
+        await op(t.info(timeout=0.05))
+    with pytest.raises(TimeoutError):
+        await op(t.seek(0.0, timeout=0.05))
+    testing.set_ops_answered(vc._conn, True)
+    t.stop()
+    with pytest.raises(TrackError):  # songbird's handle of an ended track
+        await op(t.info())
 
 
 async def test_queue(connected_vc: HarnessClient) -> None:
@@ -304,6 +328,24 @@ async def test_enqueue_stream_is_fed_only_when_current(connected_vc: HarnessClie
         await pump_settle()
     await asyncio.wait_for(fed.wait(), 2)
     assert not stream.pending  # it became the current entry (it may already have finished)
+
+
+async def test_enqueue_stream_cannot_loop(connected_vc: HarnessClient) -> None:
+    """``enqueue_stream(loops=…)`` was accepted and ignored while ``set_loops`` on the same entry
+    raised: a live stream rejects any ``loops`` but 0 up front."""
+    vc = connected_vc
+
+    async def feed() -> AsyncIterator[bytes]:
+        yield wav_bytes(40)
+
+    for loops in (2, None):
+        with pytest.raises(TrackError):
+            vc.queue.enqueue_stream(feed(), loops=loops)
+    assert len(vc.queue) == 0
+    entry = vc.queue.enqueue_stream(feed(), loops=0)
+    with pytest.raises(TrackError):
+        entry.set_loops(2)
+    entry.stop()
 
 
 async def test_play_limits(connected_vc: HarnessClient) -> None:

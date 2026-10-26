@@ -54,8 +54,10 @@ chunk = stream.read_nowait()              # any thread; None if nothing is queue
 ms = stream.skip_to_live()                # drop the backlog; the next chunk has start_ms == 0
 ```
 
-Iteration ends after `close()` or when the connection closes, once queued chunks are drained.
-Cancelling a pending read never loses a chunk.
+When the connection closes (or the stream's user leaves, or `listen_users` closes it), iteration
+ends once the queued chunks are read. `close()` ends it at once: it discards whatever is still
+queued (read until `read_nowait()` returns `None` first to keep it). Cancelling a pending read never
+loses a chunk.
 
 ### Overflow
 
@@ -159,4 +161,22 @@ about 0.2 ms to wake the event loop.
 ## Receive off
 
 `VoiceConfig(receive=False)` turns decryption and decoding off entirely (`listen_*` raise
-`ReceiveDisabled`) — the cheapest setting for music bots.
+`ReceiveDisabled`) — the cheapest setting for music bots. `vc.events()` still reports
+`UserMapped` and `UserLeft`, which come from Discord's voice WebSocket, so a bot can still notice
+listeners leaving. `SpeakingStarted`/`SpeakingStopped` are detected from received audio and never
+fire with receive off.
+
+## Limits
+
+Per connection: 64 open receive streams (explicit `listen_user`/`listen_mixed` streams and the
+streams `listen_users` creates count together), 64 `listen_users` routers and 16 event streams, and
+every stream's queue bound (`max_queue_ms` in its format) together within
+`VoiceConfig.max_receive_mb` (64 MiB by default). An explicit `listen_*` or `events()` beyond a
+limit raises `LimitExceeded`.
+
+`listen_users` cannot raise when someone starts speaking. A stream it cannot create (the stream cap
+or the budget is used up) is skipped: it is counted in `UserStreams.dropped`, a warning is logged
+(`discord.ext.songbird.native.rx.pipeline`), and that user gets no stream until they leave the
+channel and come back. Size `max_queue_ms` for the number of speakers you expect: the 10 s of
+48 kHz mono in `examples/record.py` reserves about 1 MB per user, and a channel with more than 64
+speakers (fewer if other streams are open) leaves the later ones unrecorded.

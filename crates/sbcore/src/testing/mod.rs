@@ -41,6 +41,14 @@ pub fn track_log(t: &TrackRef) -> Vec<&'static str> {
     }
 }
 
+/// songbird's `TrackEvent::Error` for a track (`PlayMode::Errored(e)`, which the Dispatch resolves
+/// authoritatively): the track ends `"error"` with `message`, reported like any other end. `false`
+/// if it had already ended. A detached connection has no mixer that could fail a track itself.
+pub fn fail_track(t: &TrackRef, message: &str) -> bool {
+    t.flags
+        .resolve(crate::tracks::flags::TrackEndReason::Error, Some(message))
+}
+
 /// Allocations on the calling thread while a counting guard is active (§13.1). `MixerHarness::pull`
 /// holds the guard around the mixer callbacks only.
 pub fn alloc_count() -> u64 {

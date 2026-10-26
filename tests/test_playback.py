@@ -539,7 +539,14 @@ async def test_write_retries_never_starve_the_loop(kind: str) -> None:
     t = asyncio.create_task(other_task())
     await asyncio.sleep(0)
     before = ticks
-    pump: Any = None  # never reached: arm_space always reports space
+
+    class _LoopOnlyPump:
+        """Only the loop check is reached: arm_space always reports space, so nothing waits."""
+
+        def check_loop(self) -> None:
+            pass
+
+    pump: Any = _LoopOnlyPump()
     if kind == "playback":
         await asyncio.wait_for(PlaybackStream(sink, pump, FMT).write(b"\0\0"), 2)
     elif kind == "encoded":

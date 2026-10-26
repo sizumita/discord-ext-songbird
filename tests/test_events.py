@@ -99,3 +99,30 @@ async def test_event_stream_limits(connected_vc: HarnessClient) -> None:
         s.close()
     with pytest.raises(TypeError):
         vc.events(kinds=[int])
+
+
+async def test_receive_off_still_reports_users(world: Any, testing: Any) -> None:
+    """``receive=False`` only stops audio: mappings and leaves (WebSocket events) are still
+    reported, so a music bot can follow listeners with ``events()``. Speaking events need audio."""
+    import asyncio
+
+    from conftest import connect_detached
+    from discord.ext import songbird
+
+    vc = await connect_detached(world, config=songbird.VoiceConfig(receive=False))
+    try:
+        pkt = voice_packets(testing)[0]
+        async with vc.events(kinds=[VoiceEvent.UserMapped, VoiceEvent.UserLeft]) as users, vc.events() as everything:
+            testing.inject_map(vc._conn, 101, A)
+            for _ in range(3):
+                testing.inject_tick(vc._conn, [(101, pkt)], [])
+                vc.harness.step(20)
+            testing.inject_user_left(vc._conn, A)
+            vc.harness.step(20)
+            got = [await asyncio.wait_for(anext(users), 2) for _ in range(2)]
+            rest = drain(everything)
+        assert isinstance(got[0], VoiceEvent.UserMapped) and (got[0].user_id, got[0].ssrc) == (A, 101)
+        assert isinstance(got[1], VoiceEvent.UserLeft) and got[1].user_id == A
+        assert not [e for e in rest if isinstance(e, VoiceEvent.SpeakingStarted | VoiceEvent.SpeakingStopped)]
+    finally:
+        await vc.disconnect()

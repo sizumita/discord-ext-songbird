@@ -8,8 +8,10 @@ Source compatibility with 0.5 was not kept; this page maps every 0.5 API to its 
 
 - Version 0.6.0, still `requires-python >= 3.14` (CPython 3.14 and free-threaded 3.14t).
 - `discord.py>=2.7.1,<3` is now a declared runtime dependency.
-- `pyarrow`, `arro3-*`, `ty`, `audioop-lts` and `typing-extensions` are no longer installed. Install
-  the extras `discord-ext-songbird[arrow]` or `[arro3]` if you use the Arrow helpers.
+- `pyarrow`, `arro3-*`, `ty`, `audioop-lts` and `typing-extensions` are no longer direct
+  dependencies. `pyarrow`, `arro3-*`, `ty` and `typing-extensions` are no longer installed; install
+  the extras `discord-ext-songbird[arrow]` or `[arro3]` if you use the Arrow helpers. `audioop-lts`
+  is still installed, as a dependency of discord.py itself (on Python ≥ 3.13).
 - The build backend is maturin only; the PyPy classifier is gone.
 
 ## The client

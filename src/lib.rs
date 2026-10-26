@@ -85,12 +85,14 @@ pub fn disable_after_fork() {
     runtime::FORKED.store(true, Ordering::Release);
 }
 
-/// Live instance counts of every tracked native type, plus ``songbird_live_tasks``.
+/// Live instance counts of every tracked native type, plus ``songbird_live_tasks`` and the tasks
+/// alive on each runtime (``net_alive_tasks``, ``rx_alive_tasks``).
 ///
 /// Returns
 /// -------
 /// dict[str, int]
-///     Used by the leak tests; never starts a runtime.
+///     Used by the leak tests; never starts a runtime. Only the task counts see a songbird Driver
+///     that was never Poisoned (its core, events and parked-mixer tasks).
 #[gen_stub_pyfunction]
 #[pyfunction]
 #[pyo3(name = "_debug_live_counts")]

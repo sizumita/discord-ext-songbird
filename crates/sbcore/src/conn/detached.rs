@@ -6,10 +6,14 @@
 //! (`set_detached_auto_connect(false)`, which `testing::Harness` does), and tests inject driver
 //! events through the same `apply()`/`RxSender` paths the `Dispatch` uses.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use super::gateway::{DiscKind, DiscReason, GwInput};
+use super::ops::{OpResult, TrackInfoData};
 use super::shared::ConnShared;
+use crate::error::CoreError;
 use crate::rx::raw::RxSender;
 use crate::testing::registry;
 use crate::tracks::flags::TrackRef;
@@ -20,17 +24,81 @@ use crate::tx::TrackControl;
 /// `track_log` and `Harness::{step, parked}` see exactly what this connection parked.
 pub(crate) struct DetachedState {
     auto_connect: AtomicBool,
+    ops_answered: AtomicBool,
 }
 
 impl DetachedState {
     pub(crate) fn new() -> Self {
         DetachedState {
             auto_connect: AtomicBool::new(true),
+            ops_answered: AtomicBool::new(true),
         }
     }
 
     pub(crate) fn auto_connect(&self) -> bool {
         self.auto_connect.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ops_answered(&self) -> bool {
+        self.ops_answered.load(Ordering::Acquire)
+    }
+}
+
+/// songbird's side of an `info()` op on a detached track: answered from its `FakeTrackControl`
+/// as a live mixer would, or, when `answered` is off, never (a parked mixer), so the op times out
+/// after `timeout` exactly like a real one. `None` for a track without a fake control (not started).
+pub(super) fn info_op(
+    t: &TrackRef,
+    answered: bool,
+    timeout: Duration,
+) -> Option<impl Future<Output = OpResult> + Send + 'static> {
+    let fake = t.fake.get()?.clone();
+    let track = t.clone();
+    Some(async move {
+        if !answered {
+            return unanswered(timeout).await;
+        }
+        if track.flags.ended().is_some() {
+            // songbird's handle of an ended track: `ControlError::Finished`.
+            return OpResult::Err(CoreError::Track("track has ended".into()));
+        }
+        OpResult::Info(TrackInfoData {
+            playing: if fake.is_paused() { "pause" } else { "play" },
+            // A live PCM source applies its volume in its decoder, as `start_track_info` reports.
+            volume: track.source_volume().unwrap_or_else(|| fake.volume()),
+            position_ms: u64::try_from(fake.position().as_millis()).unwrap_or(u64::MAX),
+            play_time_ms: 0,
+            loops: fake.loops(),
+        })
+    })
+}
+
+/// songbird's side of a `seek()` op on a detached track (see [`info_op`]).
+pub(super) fn seek_op(
+    t: &TrackRef,
+    pos: Duration,
+    answered: bool,
+    timeout: Duration,
+) -> Option<impl Future<Output = OpResult> + Send + 'static> {
+    let fake = t.fake.get()?.clone();
+    let track = t.clone();
+    Some(async move {
+        if !answered {
+            return unanswered(timeout).await;
+        }
+        if track.flags.ended().is_some() {
+            return OpResult::Err(CoreError::Track("track has ended".into()));
+        }
+        fake.seek(pos);
+        OpResult::Seeked(pos)
+    })
+}
+
+/// A parked mixer never answers a track command: the op's own timeout ends it.
+async fn unanswered(timeout: Duration) -> OpResult {
+    match tokio::time::timeout(timeout, std::future::pending::<OpResult>()).await {
+        Ok(r) => r,
+        Err(_) => OpResult::TimedOut,
     }
 }
 
@@ -72,6 +140,12 @@ impl ConnShared {
         self.det.auto_connect.store(on, Ordering::Release);
     }
 
+    /// Detached connections: whether track `info()`/`seek()` ops are answered (default `true`,
+    /// like a live mixer). With `false` they time out, as on songbird's parked mixer.
+    pub fn set_detached_ops_answered(&self, on: bool) {
+        self.det.ops_answered.store(on, Ordering::Release);
+    }
+
     /// Feeds one state-machine input through `apply()` (§4.6), exactly as the binding or the
     /// `Dispatch` would.
     pub fn inject_gateway(&self, input: GwInput) {
@@ -88,7 +162,8 @@ impl ConnShared {
         self.dispatch().inner().driver_disconnect(kind, reason);
     }
 
-    /// The sender `Dispatch` uses for receive inputs (`None` with `receive=False`).
+    /// The sender `Dispatch` uses for receive inputs (also open with `receive=False`, which only
+    /// stops audio: control inputs still flow).
     pub fn rx_sender(&self) -> Option<RxSender> {
         self.rx_sender_ref().cloned()
     }

@@ -196,7 +196,7 @@ class AudioFile:
     def from_path(cls, path: builtins.str | os.PathLike | pathlib.Path, *, max_bytes: builtins.int = 268435456) -> AudioFile:
         r"""
         Reads a file (blocking; the thread state is detached). On the event loop prefer
-        ``await AudioFile.load(...)``.
+        ``await discord.ext.songbird.load_audio_file(path)``, which runs this in a worker thread.
         
         Parameters
         ----------
@@ -1491,12 +1491,14 @@ class WakeBell:
 
 def _debug_live_counts() -> builtins.dict[builtins.str, builtins.int]:
     r"""
-    Live instance counts of every tracked native type, plus ``songbird_live_tasks``.
+    Live instance counts of every tracked native type, plus ``songbird_live_tasks`` and the tasks
+    alive on each runtime (``net_alive_tasks``, ``rx_alive_tasks``).
     
     Returns
     -------
     dict[str, int]
-        Used by the leak tests; never starts a runtime.
+        Used by the leak tests; never starts a runtime. Only the task counts see a songbird Driver
+        that was never Poisoned (its core, events and parked-mixer tasks).
     """
 
 def _disable_after_fork() -> None:

@@ -397,11 +397,86 @@ fn fake_control_records_calls_and_stop_resolves() {
     assert_eq!(track.flags.ended(), Some(TrackEndReason::Stopped));
     d.step(20);
     assert!(!d.conn.tracks_need_poll());
-    // Seek/info need a songbird handle.
+    // songbird's handle of an ended track answers ops with an error (`ControlError::Finished`).
+    let op = d
+        .conn
+        .start_track_info(&track, Duration::from_millis(10))
+        .unwrap();
     assert!(matches!(
-        d.conn.start_track_info(&track, Duration::from_millis(10)),
-        Err(CoreError::Track(_))
+        wait_op(&d.conn, op)[..],
+        [OpResult::Err(CoreError::Track(_))]
     ));
+    d.conn.close(CloseReason::Cleanup);
+}
+
+/// The results of op `id` once it has finished (ops run on the RX runtime).
+fn wait_op(conn: &ConnShared, id: u32) -> Vec<OpResult> {
+    let mut got = Vec::new();
+    assert!(wait_until(Duration::from_secs(5), || {
+        let mut out = Vec::new();
+        conn.take_op_results(&mut out);
+        got.extend(out.into_iter().filter(|(i, _)| *i == id).map(|(_, r)| r));
+        !got.is_empty()
+    }));
+    got
+}
+
+/// Detached `info()`/`seek()` answer from the fake control as a live mixer would (the binding's
+/// result conversion is exercised from Python on the real module), and time out like a parked
+/// mixer once answering is off.
+#[test]
+fn detached_track_ops_answer_or_time_out() {
+    let _serial = TEST_LOCK.lock();
+    let d = D::new(RawVoiceSettings::default());
+    let (track, done) = d.conn.tracks.register(TrackKind::File);
+    let (input, _dropped) = guard_input(done);
+    let opts = PlayOpts {
+        volume: 0.5,
+        loops: Some(2),
+        paused: true,
+    };
+    d.conn.start_track(&track, input, opts).unwrap();
+    let info = |conn: &ConnShared| {
+        let op = conn
+            .start_track_info(&track, Duration::from_secs(1))
+            .unwrap();
+        match wait_op(conn, op).pop() {
+            Some(OpResult::Info(i)) => i,
+            other => panic!("{other:?}"),
+        }
+    };
+    let i = info(&d.conn);
+    assert_eq!(
+        (i.playing, i.volume, i.loops, i.position_ms),
+        ("pause", 0.5, Some(2), 0)
+    );
+    track.resume().unwrap();
+    track.set_volume(1.5).unwrap();
+    track.set_loops(None).unwrap();
+    let op = d
+        .conn
+        .start_track_seek(&track, Duration::from_millis(1_250), Duration::from_secs(1))
+        .unwrap();
+    assert!(matches!(
+        wait_op(&d.conn, op)[..],
+        [OpResult::Seeked(p)] if p == Duration::from_millis(1_250)
+    ));
+    let i = info(&d.conn);
+    assert_eq!(
+        (i.playing, i.volume, i.loops, i.position_ms),
+        ("play", 1.5, None, 1_250)
+    );
+    assert_eq!(track.fake_log(), vec!["play", "seek"]);
+    // A parked mixer never answers: the op's own timeout resolves it.
+    d.conn.set_detached_ops_answered(false);
+    let started = Instant::now();
+    let op = d
+        .conn
+        .start_track_seek(&track, Duration::ZERO, Duration::from_millis(50))
+        .unwrap();
+    assert!(matches!(wait_op(&d.conn, op)[..], [OpResult::TimedOut]));
+    assert!(started.elapsed() >= Duration::from_millis(50));
+    assert_eq!(track.fake_log(), vec!["play", "seek"], "not seeked");
     d.conn.close(CloseReason::Cleanup);
 }
 
@@ -491,4 +566,54 @@ fn injected_connect_failure_schedules_a_rejoin() {
     ));
     assert_eq!(d.conn.status().state, "reconnecting");
     d.conn.close(CloseReason::Cleanup);
+}
+
+/// `receive=False` only stops audio (no VoiceTick handler, `DecodeMode::Pass`): the WebSocket
+/// events still reach the pipeline through the `Dispatch`, so `UserMapped`/`UserLeft` are reported
+/// (§8.5, §9.3). Speaking events need ticks, so there are none.
+#[test]
+fn receive_off_still_reports_user_mapped_and_left() {
+    use songbird::events::{EventContext, EventHandler};
+    use songbird::model::SpeakingState;
+    use songbird::model::id::UserId;
+    use songbird::model::payload::{ClientDisconnect, Speaking};
+
+    let _serial = TEST_LOCK.lock();
+    let mut d = D::new(RawVoiceSettings {
+        receive: false,
+        ..RawVoiceSettings::default()
+    });
+    let events = d.conn.subscribe_events(16, KindMask::ALL).unwrap();
+    let dispatch = d.conn.dispatch().clone();
+    let speaking = Speaking {
+        delay: None,
+        speaking: SpeakingState::MICROPHONE,
+        ssrc: 5,
+        user_id: Some(UserId(42)),
+    };
+    let left = ClientDisconnect {
+        user_id: UserId(42),
+    };
+    runtime::rx().block_on(async {
+        dispatch
+            .act(&EventContext::SpeakingStateUpdate(speaking))
+            .await;
+        dispatch.act(&EventContext::ClientDisconnect(left)).await;
+    });
+    d.step(20);
+    let got = drain(&events);
+    assert!(
+        matches!(
+            got[..],
+            [
+                EventData::UserMapped {
+                    user_id: 42,
+                    ssrc: 5
+                },
+                EventData::UserLeft { user_id: 42 }
+            ]
+        ),
+        "{got:?}"
+    );
+    d.conn.close(CloseReason::Requested);
 }

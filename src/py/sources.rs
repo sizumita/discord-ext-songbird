@@ -115,7 +115,7 @@ impl AudioFile {
     }
 
     /// Reads a file (blocking; the thread state is detached). On the event loop prefer
-    /// ``await AudioFile.load(...)``.
+    /// ``await discord.ext.songbird.load_audio_file(path)``, which runs this in a worker thread.
     ///
     /// Parameters
     /// ----------

@@ -27,6 +27,7 @@ from conftest import (
     HarnessClient,
     World,
     connect_detached,
+    flush_native_logs,
     inject_ticks,
     pump_settle,
     run_isolated,
@@ -132,58 +133,89 @@ def _counts() -> dict[str, int]:
     return {k: v for k, v in native._debug_live_counts().items() if v is not None}
 
 
+#: Tasks alive on the native runtimes. Only these see a songbird Driver that was never Poisoned:
+#: ``OwnedDriver`` drops when the teardown returns, ``Dispatch`` clones go with the global-event
+#: removal, and a parked mixer is not a live one (§11.3).
+TASK_COUNTS = ("net_alive_tasks", "rx_alive_tasks")
+
+
+def _settled(baseline: dict[str, int], now: dict[str, int]) -> bool:
+    return all(now.get(k, 0) <= v for k, v in baseline.items())
+
+
+async def _real_driver_cycle() -> dict[str, int]:
+    """One SongbirdClient with a real Driver stuck connecting to a listener that never answers,
+    every kind of stream and a track open, then disconnected. Returns the counts while open."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    listener.setblocking(False)
+    port = listener.getsockname()[1]
+    accepted: list[socket.socket] = []
+
+    client = FakeClient()
+    guild = FakeGuild(client)
+    guild.endpoint = f"127.0.0.1:{port}"
+    channel = guild.add_channel(20)
+    cfg = songbird.VoiceConfig(driver_timeout_s=60.0)
+    task = asyncio.create_task(channel.connect(cls=SongbirdClient.with_config(cfg), timeout=60, reconnect=False))
+    async with asyncio.timeout(10):
+        while (vc := client._connection._get_voice_client(GUILD_ID)) is None or vc._conn is None:
+            await asyncio.sleep(0.005)
+        while vc.status.state != "connecting":
+            await asyncio.sleep(0.005)
+    try:
+        accepted.append(listener.accept()[0])
+    except BlockingIOError:
+        pass
+    stream = vc.listen_mixed()
+    pb = vc.open_playback()
+    events = vc.events()
+    track = vc.play(RawPcm(bytes(4_800), songbird.PCM16_24K))
+    during = _counts()
+    refs = [weakref.ref(o) for o in (vc, vc._conn, stream, pb, events, track)]
+    await vc.disconnect()
+    with pytest.raises(ConnectFailed) as ei:
+        await task
+    assert ei.value.reason == "requested"
+    del ei  # its traceback holds connect()'s frames, and with them the client
+    assert [op.channel_id for op in guild.op4].count(None) == 1
+    # Poison waits behind the pending connection attempt: end it now rather than after 60 s.
+    for s in accepted:
+        s.close()
+    listener.close()
+    del vc, stream, pb, events, track, task
+    collect()
+    assert all(r() is None for r in refs)
+    return during
+
+
+async def _wait_settled(baseline: dict[str, int], timeout: float) -> dict[str, int]:
+    deadline = time.monotonic() + timeout
+    while not _settled(baseline, now := _counts()) and time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+    return now
+
+
 @pytest.mark.real_only
 async def test_full_lifecycle_returns_to_baseline() -> None:
-    """Five cycles with a real Driver stuck connecting to a listener that never answers."""
+    """Five cycles with a real Driver stuck connecting: every native counter and every task of the
+    NET and RX runtimes (songbird's core, events and parked-mixer tasks among them) returns to its
+    baseline, so a Driver that is never Poisoned cannot pass."""
+    # Warm-up: songbird keeps one process-wide task once its first Driver has run, and process-wide
+    # helper tasks may start lazily. Both belong in the baseline.
+    before = _counts()
+    await _real_driver_cycle()
+    await _wait_settled({k: v for k, v in before.items() if k not in TASK_COUNTS}, 61)
+    await asyncio.sleep(0.5)
     baseline = _counts()
     for _ in range(5):
-        listener = socket.socket()
-        listener.bind(("127.0.0.1", 0))
-        listener.listen()
-        listener.setblocking(False)
-        port = listener.getsockname()[1]
-        accepted: list[socket.socket] = []
-
-        client = FakeClient()
-        guild = FakeGuild(client)
-        guild.endpoint = f"127.0.0.1:{port}"
-        channel = guild.add_channel(20)
-        cfg = songbird.VoiceConfig(driver_timeout_s=60.0)
-        task = asyncio.create_task(channel.connect(cls=SongbirdClient.with_config(cfg), timeout=60, reconnect=False))
-        async with asyncio.timeout(10):
-            while (vc := client._connection._get_voice_client(GUILD_ID)) is None or vc._conn is None:
-                await asyncio.sleep(0.005)
-            while vc.status.state != "connecting":
-                await asyncio.sleep(0.005)
-        try:
-            accepted.append(listener.accept()[0])
-        except BlockingIOError:
-            pass
-        stream = vc.listen_mixed()
-        pb = vc.open_playback()
-        events = vc.events()
-        track = vc.play(RawPcm(bytes(4_800), songbird.PCM16_24K))
-        refs = [weakref.ref(o) for o in (vc, vc._conn, stream, pb, events, track)]
-        await vc.disconnect()
-        with pytest.raises(ConnectFailed) as ei:
-            await task
-        assert ei.value.reason == "requested"
-        del ei  # its traceback holds connect()'s frames, and with them the client
-        assert [op.channel_id for op in guild.op4].count(None) == 1
-        for s in accepted:
-            s.close()
-        listener.close()
-        del vc, stream, pb, events, track, task
-        collect()
-        assert all(r() is None for r in refs)
-    deadline = time.monotonic() + 61
-    while time.monotonic() < deadline:
-        now = _counts()
-        if all(now.get(k, 0) <= v for k, v in baseline.items()):
-            break
-        await asyncio.sleep(0.1)
-    now = _counts()
-    assert all(now.get(k, 0) <= v for k, v in baseline.items()), (baseline, now)
+        during = await _real_driver_cycle()
+        # Not vacuous: the cycle really ran a Driver with its songbird tasks.
+        assert during["OwnedDriver"] > baseline["OwnedDriver"], (baseline, during)
+        assert during["net_alive_tasks"] >= baseline["net_alive_tasks"] + 3, (baseline, during)
+    now = await _wait_settled(baseline, 61)
+    assert _settled(baseline, now), (baseline, now)
 
 
 @pytest.mark.real_only
@@ -331,7 +363,11 @@ async def test_connect_close_cycles_return_to_baseline(testing: Any, caplog: pyt
     ``weakref`` dies and every ``_debug_live_counts()`` entry returns to its baseline (§13.4).
     Normal closes log no errors."""
     caplog.set_level(logging.WARNING, logger="discord.ext.songbird")
+    # Warm-up: anything started once per process (a helper task) belongs in the baseline.
+    refs, _ = await _leak_cycle("disconnect", testing, asyncio.Event())
+    del refs
     collect()
+    await asyncio.sleep(0.2)
     baseline = _counts()
     for i in range(100):
         gate = asyncio.Event()
@@ -341,12 +377,17 @@ async def test_connect_close_cycles_return_to_baseline(testing: Any, caplog: pyt
         collect()
         alive = [r() for r in refs if r() is not None]
         assert not alive, (CLOSE_PATHS[i % len(CLOSE_PATHS)], alive)
+
+    def back(now: dict[str, int]) -> bool:
+        # Instance counters exactly; runtime tasks at most (one of an earlier test may still finish).
+        return all(now[k] <= baseline.get(k, 0) if k in TASK_COUNTS else now[k] == baseline.get(k, 0) for k in now)
+
     deadline = time.monotonic() + 10  # decode threads exit on their own once their stream closed
-    while (now := _counts()) != {k: baseline.get(k, 0) for k in now} and time.monotonic() < deadline:
+    while not back(now := _counts()) and time.monotonic() < deadline:
         await asyncio.sleep(0.01)
         collect()
-    assert now == {k: baseline.get(k, 0) for k in now}, (baseline, now)
+    assert back(now), (baseline, now)
     assert not [o for o in gc.get_objects() if isinstance(o, (SongbirdClient, native.Connection))]
-    await asyncio.sleep(0.5)  # let the songbird-log thread forward what the native side logged
+    flush_native_logs()  # everything the native side logged has reached `logging`
     errors = [r for r in caplog.records if r.levelno >= logging.ERROR and r.name.startswith("discord.ext.songbird")]
     assert not errors, [f"{r.name}: {r.getMessage()}" for r in errors[:5]]

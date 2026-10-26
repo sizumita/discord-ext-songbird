@@ -42,7 +42,7 @@ async def echo(vc: songbird.SongbirdClient, user: Any, stop: asyncio.Event, *, d
 
         async def stopper() -> None:
             await stop.wait()
-            mic.close()  # ends the `async for` below once the queued chunks are read
+            mic.close()  # ends the `async for` below at once (still-queued chunks are discarded)
 
         async with asyncio.TaskGroup() as tg:
             st = tg.create_task(stopper())

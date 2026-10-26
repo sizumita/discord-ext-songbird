@@ -845,6 +845,7 @@ class _Track:
         self.lazy_stream: tuple[int, float] | None = None  # (max_buffer_bytes, volume) of enqueue_stream
         self.sink: Any = None
         self.taken = False
+        self.position_ms = 0  # of the last seek (nothing plays in the fake)
         _live("TrackFlags", 1)
 
     def __del__(self) -> None:
@@ -1080,6 +1081,8 @@ class RawPcm:
             raise TypeError("audio must be a bytes-like object, not str")
         _check_chunk_format(data, fmt)
         raw = _buffer_bytes(data, fmt.encoding, ("source_bytes", 1 << 30))
+        if len(raw) % fmt.frame_bytes:
+            raise _invalid("data length is not a whole number of frames")
         frames = len(raw) // fmt.frame_bytes
         self._fmt = fmt
         self._frames = frames
@@ -1109,6 +1112,8 @@ class RawPcm:
                 raise TypeError("audio must be a bytes-like object, not str")
             raw = _buffer_bytes(data, encoding, ("source_bytes", 1 << 30))
         width = _WIDTH[encoding]
+        if len(raw) % (width * channels):
+            raise _invalid("data length is not a whole number of frames")
         frames = len(raw) // (width * channels)
         stored = sample_rate if sample_rate in _RATES else 48_000
         self = cls.__new__(cls)
@@ -1409,12 +1414,17 @@ class _SubQueue:
                 self.armed = True
             return None
 
-    def close(self, reason: str) -> None:
+    def close(self, reason: str, *, clear: bool = False) -> None:
+        """First close wins. ``clear`` (an explicit ``close()`` or the subscription's drop) frees the
+        queued chunks, as the real ``close_and_clear``; a close by the connection, a router or a
+        leave keeps them readable."""
         notify = False
         with self.lock:
             if self.closed is None:
                 self.closed = reason
                 notify = True
+                if clear:
+                    self.items.clear()
         if notify:
             self.conn.wake.notify(self.wake_id)
 
@@ -1499,10 +1509,10 @@ class ReceiveSubscription:
         return self._q.stats()
 
     def close(self) -> None:
-        self._q.close("closed")
+        self._q.close("closed", clear=True)
 
     def read_batch(self, max_chunks: int = 50) -> ChunkBatch | None:
-        _check_int("max_chunks", max_chunks, 1, 10_000)
+        _check_int("max_chunks", max_chunks, 1, 6_000)
         rows: list[AudioChunk] = []
         while len(rows) < max_chunks:
             c = self._q.pop(arm=False)
@@ -1514,7 +1524,7 @@ class ReceiveSubscription:
     def __del__(self) -> None:
         q = getattr(self, "_q", None)
         if q is not None:
-            q.close("closed")
+            q.close("closed", clear=True)
 
 
 def _mix_filter(include: Any, exclude: Any, ignore_bots: bool, policy: str, floor_release_ms: int) -> dict[str, Any]:
@@ -1535,7 +1545,7 @@ class _RouterQueue:
         self.spec = spec
         self.wake_id = conn.wake.alloc()
         self.items: deque[ReceiveSubscription] = deque()
-        self.streams: dict[int, _SubQueue] = {}
+        self.streams: dict[int, _SubQueue | None] = {}  # None: refused until the user leaves
         self.armed = False
         self.closed = False
         self.dropped = 0
@@ -1553,7 +1563,7 @@ class _RouterQueue:
             self.items.append(sub)
             notify, self.armed = self.armed, False
         if dropped is not None:
-            dropped._q.close("closed")
+            dropped._q.close("closed", clear=True)  # its subscription is dropped
         if notify:
             self.conn.wake.notify(self.wake_id)
 
@@ -1567,7 +1577,8 @@ class _RouterQueue:
             streams = list(self.streams.values())
         if close_streams:
             for q in streams:
-                q.close("closed")
+                if q is not None:
+                    q.close("closed")
         for s in pending:
             s._q.close("closed")
         self.conn.wake.notify(self.wake_id)
@@ -1650,11 +1661,16 @@ class _EventQueue:
                 self.armed = True
             return None
 
-    def close(self) -> None:
+    def close(self, *, clear: bool = False) -> None:
+        """First close wins; ``clear`` (the subscriber's ``close()`` or drop) frees the queued
+        events, a close by the connection (T6) keeps them readable."""
         with self.lock:
             if self.closed:
                 return
             self.closed = True
+            if clear:
+                self.items.clear()
+                self.lag = 0
         self.conn.wake.notify(self.wake_id)
 
 
@@ -1679,12 +1695,12 @@ class EventSubscription:
         return self._q.pop(arm=False)
 
     def close(self) -> None:
-        self._q.close()
+        self._q.close(clear=True)
 
     def __del__(self) -> None:
         q = getattr(self, "_q", None)
         if q is not None:
-            q.close()
+            q.close(clear=True)
 
 
 # ── send: PcmQueue ─────────────────────────────────────────────────────────────────────────────────
@@ -2486,6 +2502,7 @@ class _Conn:
         self.track_seq = 0
         self.ops: dict[int, Any] = {}
         self.op_results: list[tuple[int, Any]] = []
+        self.ops_answered = True  # _testing.set_ops_answered
         self.next_op = 1
         # Live-source inputs not yet taken by a MixerHarness (playback id → queue).
         self.parked: dict[int, _PcmQueue] = {}
@@ -2889,10 +2906,18 @@ class _Conn:
         if not self.ops:
             return
         for op_id, (kind, t, arg) in list(self.ops.items()):
-            if kind == "info":
-                playing = "end" if t.ended else ("pause" if t.paused else "play")
-                res: Any = TrackInfo(playing, t.volume, 0, 0, t.loops)
+            res: Any
+            if not self.ops_answered:  # songbird's parked mixer: the op times out
+                res = TimeoutError("track op timed out")
+            elif t.ended is not None:  # songbird's handle of an ended track
+                res = _errors().TrackError("track has ended")
+            elif kind == "info":
+                # A live PCM source applies its volume in its decoder (the real `source_volume`).
+                vol = next((q.volume for q in self.playbacks if q.track is t), t.volume)
+                res = TrackInfo("pause" if t.paused else "play", vol, t.position_ms, 0, t.loops)
             else:
+                t.position_ms = round(arg * 1000)
+                t.record("seek")
                 res = float(arg)
             self.op_results.append((op_id, res))
         self.ops.clear()
@@ -2907,6 +2932,8 @@ class _Conn:
             kind = item[0]
             if kind == "tick":
                 _, voices, silent, arrived = item
+                if not self.settings.receive:
+                    continue  # no audio with receive off; mappings and leaves still apply
                 if self.tick_index - expected > 5 and not any(v[1] is not None for v in voices):
                     self.counters["ticks_skipped"] += 1
                     continue
@@ -3013,7 +3040,12 @@ class _Conn:
                     q = self._new_sub(
                         ("user", uid), spec["fmt"], spec["chunk_ms"], spec["max_queue_ms"], spec["overflow"]
                     )
-                except Exception:
+                except Exception as e:
+                    # As the real pipeline: counted, logged, and not retried until the user leaves.
+                    r.streams[uid] = None
+                    with r.lock:
+                        r.dropped += 1
+                    _emit_log(30, "sbcore::rx::pipeline", f"listen_users: no stream for user {uid}: {e}")
                     continue
                 r.streams[uid] = q
                 r.push(ReceiveSubscription(q))
@@ -3318,8 +3350,10 @@ class Connection:
     def subscribe_user(
         self, uid: int, fmt: AudioFormat, chunk_ms: int = 20, max_queue_ms: int = 2_000, overflow: str = "drop_oldest"
     ) -> ReceiveSubscription:
-        f = self._rx_check(fmt, chunk_ms, max_queue_ms, overflow)
         _check_int("user_id", uid, 0, 2**64 - 1)
+        if uid == 0:
+            raise ValueError("user_id must be non-zero")
+        f = self._rx_check(fmt, chunk_ms, max_queue_ms, overflow)
         with self._c.lock:
             self._sync_timeline()
             return ReceiveSubscription(self._c._new_sub(("user", uid), f, chunk_ms, max_queue_ms, overflow))
@@ -3525,6 +3559,8 @@ class Connection:
             raise _errors().ConnectionClosed(c.close_reason or "closed")
         opts = self._opts(volume, loops, paused)
         _check_int("max_buffer_bytes", max_buffer_bytes, 64 << 10, 16 << 20)
+        if loops != 0:
+            raise _errors().TrackError("live sources cannot loop")
         with c.lock:
             t = _Track(c, "encoded_stream", opts=opts)
             t.lazy_stream = (max_buffer_bytes, volume)
@@ -3600,6 +3636,9 @@ class Connection:
                 s.close()
 
     def set_bitrate(self, bps: int | None) -> None:
+        c = self._c
+        if c.closing:
+            raise _errors().ConnectionClosed(c.close_reason or "closed")
         if bps is not None:
             _check_int("bitrate", bps, 6_000, 510_000)
 
@@ -3754,6 +3793,8 @@ def _debug_live_counts() -> dict[str, int]:
     with _LIVE_LOCK:
         out = dict(_LIVE)
     out["songbird_live_tasks"] = 0
+    out["net_alive_tasks"] = 0  # no runtimes in the fake
+    out["rx_alive_tasks"] = 0
     return out
 
 
@@ -3807,7 +3848,7 @@ def _detached_connection(
 
 def _rx_push(conn: Connection, item: tuple[Any, ...]) -> None:
     c = conn._c
-    if c.closing or not c.settings.receive:
+    if c.closing:  # receive off: the channel stays open for mappings and leaves; ticks are ignored
         return
     if len(c.rx_in) >= 50:
         raise _limit("tick_channel", 51, 0, 50)
@@ -4005,6 +4046,14 @@ def _track_log(track: NativeTrack) -> list[str]:
     return list(track._t.log)
 
 
+def _set_ops_answered(conn: Connection, on: bool) -> None:
+    conn._c.ops_answered = bool(on)
+
+
+def _fail_track(track: NativeTrack, message: str) -> bool:
+    return track._t.resolve("error", message)  # reported by the next housekeeping step
+
+
 def _alloc_count() -> int:
     return 0
 
@@ -4023,6 +4072,8 @@ _testing.__dict__.update(
         "encode_opus": _encode_opus,
         "rtp_wrap": _rtp_wrap,
         "track_log": _track_log,
+        "set_ops_answered": _set_ops_answered,
+        "fail_track": _fail_track,
         "alloc_count": _alloc_count,
         "FAKE": True,
     }

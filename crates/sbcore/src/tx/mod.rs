@@ -93,14 +93,20 @@ impl TrackControl for songbird::tracks::TrackHandle {
 }
 
 /// Test double for detached connections (§13.2): records calls; `stop()` resolves the flags as a
-/// Dispatch `End(Stop)` would. It also keeps the pause state songbird would see (the log is
-/// bounded, so the state cannot be derived from it).
+/// Dispatch `End(Stop)` would. It also keeps the state songbird would report in `TrackInfo`: the
+/// pause state (the log is bounded, so it cannot be derived from it), the track volume, loops and
+/// the position of the last seek (detached `info()`/`seek()` answer from it).
 #[cfg(feature = "test-hooks")]
 #[derive(Debug)]
 pub struct FakeTrackControl {
     log: Mutex<Vec<&'static str>>,
     flags: Arc<TrackFlags>,
     paused: std::sync::atomic::AtomicBool,
+    /// `f32` bits of the songbird track volume.
+    volume: AtomicU32,
+    /// `None` = infinite.
+    loops: Mutex<Option<u32>>,
+    position_ms: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -119,10 +125,43 @@ impl FakeTrackControl {
             log: Mutex::new(Vec::new()),
             flags,
             paused: std::sync::atomic::AtomicBool::new(paused),
+            volume: AtomicU32::new(1.0f32.to_bits()),
+            loops: Mutex::new(Some(0)),
+            position_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// The recorded calls (`"pause"`, `"play"`, `"stop"`), oldest first.
+    /// The songbird track volume (`play(volume=)`, `set_volume`).
+    pub fn volume(&self) -> f32 {
+        f32::from_bits(self.volume.load(Ordering::Acquire))
+    }
+
+    pub fn set_volume(&self, v: f32) {
+        self.volume.store(v.to_bits(), Ordering::Release);
+    }
+
+    /// Remaining loops (`None` = infinite).
+    pub fn loops(&self) -> Option<u32> {
+        *self.loops.lock()
+    }
+
+    pub fn set_loops(&self, l: Option<u32>) {
+        *self.loops.lock() = l;
+    }
+
+    /// The position songbird would report: that of the last seek (nothing plays detached).
+    pub fn position(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.position_ms.load(Ordering::Acquire))
+    }
+
+    /// A seek songbird would perform: records `"seek"` and moves the position.
+    pub fn seek(&self, to: std::time::Duration) {
+        let ms = u64::try_from(to.as_millis()).unwrap_or(u64::MAX);
+        self.position_ms.store(ms, Ordering::Release);
+        self.record("seek");
+    }
+
+    /// The recorded calls (`"pause"`, `"play"`, `"stop"`, `"seek"`), oldest first.
     pub fn log(&self) -> Vec<&'static str> {
         self.log.lock().clone()
     }

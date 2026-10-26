@@ -261,7 +261,10 @@ class _Pump:
 
     # ── waits (loop thread only) ─────────────────────────────────────────────────────────────────
 
-    def _check_loop(self) -> None:
+    def check_loop(self) -> None:
+        """Raise ``RuntimeError`` unless called on the pump's event loop. Every awaitable of the
+        library calls this first, before any fast path, so awaiting from another loop fails
+        deterministically rather than only when it would have to wait (§9.10 rule 2)."""
         try:
             running = asyncio.get_running_loop()
         except RuntimeError:
@@ -274,7 +277,7 @@ class _Pump:
 
     async def wait(self, wake_id: int) -> None:
         """Wait until ``wake_id`` is rung (or the connection closes). The caller re-polls."""
-        self._check_loop()
+        self.check_loop()
         if self._closed:
             return
         fut: asyncio.Future[None] = self._loop.create_future()
@@ -294,7 +297,7 @@ class _Pump:
 
     async def wait_status(self, predicate: Callable[[native.ConnectionStatus], bool]) -> native.ConnectionStatus:
         """Wait until ``predicate(status)`` holds or the connection is closed; returns the status."""
-        self._check_loop()
+        self.check_loop()
         while True:
             st = self._conn.status()
             if predicate(st) or st.state == "closed" or self._closed:
@@ -311,7 +314,7 @@ class _Pump:
 
     async def wait_op(self, op_id: int) -> Any:
         """Wait for the result of a native op (``TrackInfo``, ``float``) or raise its exception."""
-        self._check_loop()
+        self.check_loop()
         if self._closed:
             raise ConnectionClosed(self._close_reason())
         fut: asyncio.Future[Any] = self._loop.create_future()
@@ -324,7 +327,7 @@ class _Pump:
 
     async def wait_track(self, track: native.NativeTrack) -> None:
         """Wait until ``track.ended`` (level-triggered on ``WAKE_TRACKS``)."""
-        self._check_loop()
+        self.check_loop()
         while not track.ended and not self._closed:
             fut: asyncio.Future[None] = self._loop.create_future()
             futs = self._track_waiters.setdefault(track, [])

@@ -77,7 +77,11 @@ async def test_default_format_is_discord_native(connected_vc: HarnessClient, tes
     assert len(chunks) == 6
     assert all(len(c) == native_fmt.bytes_for(20) == 3_840 and c.format == native_fmt for c in chunks)
     async with vc.listen_users() as users:
-        assert users is not None
+        inject_ticks(vc, testing, 2, ssrc=SSRC_A)
+        routed = await anext(users)
+        routed_chunks = drain(routed)
+    assert (routed.format, routed.chunk_ms) == (native_fmt, 20)
+    assert routed_chunks and all(len(c) == 3_840 and c.format == native_fmt for c in routed_chunks)
     with pytest.raises(TypeError):
         vc.listen_mixed(24_000)  # type: ignore
 

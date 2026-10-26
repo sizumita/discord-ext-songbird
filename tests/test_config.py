@@ -112,6 +112,33 @@ def test_all_exports_exist() -> None:
     assert songbird.__version__ == songbird.native.VERSION
 
 
+def test_documented_names_are_in_all() -> None:
+    """Every name the README, the user docs and the examples use from the package is in
+    ``__all__`` (``from discord.ext.songbird import *``, doc tools), not only importable."""
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    files = [root / "README.md", *(root / "docs").glob("*.md"), *(root / "examples").glob("*.py")]
+    used: set[str] = set()
+    for path in files:
+        if path.name == "design.md":  # the design document also names internals
+            continue
+        text = path.read_text(encoding="utf-8")
+        used.update(re.findall(r"\bsongbird\.([A-Za-z_]\w*)", text))
+        for m in re.finditer(r"from discord\.ext\.songbird import (?:\(([^)]*)\)|([^\n]+))", text):
+            names = m.group(1) if m.group(1) is not None else m.group(2).split("#")[0]
+            used.update(n for n in re.findall(r"[A-Za-z_]\w*", names) if n != "as")
+    # Submodules (and logger-name fragments such as ``discord.ext.songbird.songbird``) are not names.
+    modules = {"native", "songbird", "errors", "streams", "tracks", "playback", "client", "config", "formats"}
+    assert "load_audio_file" in used
+    missing = sorted(used - modules - set(songbird.__all__))
+    assert not missing, missing
+    namespace: dict[str, object] = {}
+    exec("from discord.ext.songbird import *", namespace)
+    assert callable(namespace["load_audio_file"])
+
+
 # ── errors ────────────────────────────────────────────────────────────────────────────────────────
 
 

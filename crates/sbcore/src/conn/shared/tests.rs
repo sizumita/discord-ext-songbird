@@ -130,11 +130,29 @@ fn real_driver_lifecycle_tears_everything_down() {
     };
     assert!(wait_until(Duration::from_secs(15), quiet));
     let base = (0, 0, 0, 0);
+    // Songbird's own tasks are the only oracle that sees a Driver which was never Poisoned (our
+    // counters drop when `teardown` returns, `Dispatch` clones go with `RemoveGlobalEvents`, a
+    // parked mixer is not a live one). Only Drivers spawn on NET, and every test that creates one
+    // holds TEST_LOCK. Besides the Idle task, songbird keeps one process-wide task once its first
+    // Driver has run: warm that up, then wait for earlier Drivers' tasks to wind down.
+    let warm = VoiceSettings::validate(RawVoiceSettings::default()).unwrap();
+    OwnedDriver::new(build_config(&warm, true)).teardown();
+    assert!(wait_until(Duration::from_secs(15), || {
+        runtime::net_alive_tasks() <= 2
+    }));
+    let net_base = runtime::net_alive_tasks();
     let (b, peer) = bell();
     let conn = ConnShared::new(params(Clock::Real, RawVoiceSettings::default()), b).unwrap();
     assert_eq!(conn.status().state, "idle");
     assert!(!conn.is_detached());
     assert_eq!(live(&live::OWNED_DRIVER), base.1 + 1);
+    // The Driver's core and events tasks and its parked mixer's forwarder run on NET.
+    assert!(
+        wait_until(Duration::from_secs(2), || runtime::net_alive_tasks()
+            >= net_base + 3),
+        "{} vs {net_base}",
+        runtime::net_alive_tasks()
+    );
     assert!(wait_until(Duration::from_secs(2), || live(
         &live::CONN_WORKER
     ) == base.2 + 1));
@@ -191,8 +209,9 @@ fn real_driver_lifecycle_tears_everything_down() {
         Err(CoreError::ConnectionClosed(CloseReason::Requested))
     ));
 
-    // Mixer-side teardown dropped the input; the events task exited on Poison (Dispatch count),
-    // and the worker exited on the shutdown flag.
+    // Mixer-side teardown dropped the input, the events task dropped its Dispatch clones
+    // (`RemoveGlobalEvents`; this does not prove Poison, the NET task count below does), and the
+    // worker exited on the shutdown flag.
     assert!(wait_until(Duration::from_secs(11), || input_dropped
         .load(Ordering::Acquire)));
     drop(conn);
@@ -201,6 +220,13 @@ fn real_driver_lifecycle_tears_everything_down() {
             && live(&live::CONN_WORKER) == base.2
             && live(&live::DISPATCH) == base.3
     }));
+    // Poison reached songbird: its core runner, events runner and the parked mixer are gone.
+    assert!(
+        wait_until(Duration::from_secs(11), || runtime::net_alive_tasks()
+            <= net_base),
+        "songbird tasks still alive after teardown: {} vs {net_base}",
+        runtime::net_alive_tasks()
+    );
 }
 
 #[test]

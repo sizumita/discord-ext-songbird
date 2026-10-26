@@ -1137,6 +1137,9 @@ impl RxPipeline {
         }
     }
 
+    /// Opens `listen_users`' stream for `user`. A refusal (the per-connection subscription cap,
+    /// which router streams share, the `max_receive_mb` budget, wake ids) is counted in
+    /// `UserStreams.dropped` and logged, and the user gets no stream until it leaves (§8.9).
     fn create_routed(&mut self, rid: u64, user: u64, tick: u64) {
         let Some(r) = self.routers.get_mut(&rid) else {
             return;
@@ -1150,20 +1153,16 @@ impl RxPipeline {
         let slot = match &worker {
             Some(w) => match w.reserve_sub() {
                 Ok(slot) => Some(slot),
-                Err(_) => {
-                    rq.count_dropped();
-                    return;
-                }
+                Err(e) => return refuse_routed(&rq, user, &e),
             },
             None if self.subs.len() >= MAX_SUBS_PER_CONN => {
-                rq.count_dropped();
-                return;
+                return refuse_routed(&rq, user, &"subscriptions limit reached");
             }
             None => None,
         };
-        let Ok(token) = rq.alloc_token() else {
-            rq.count_dropped();
-            return;
+        let token = match rq.alloc_token() {
+            Ok(token) => token,
+            Err(e) => return refuse_routed(&rq, user, &e),
         };
         let queue = SubQueue::new(&spec, token);
         let id = ROUTER_SUB_ID_BIT | self.next_router_sub;
@@ -1179,18 +1178,15 @@ impl RxPipeline {
                         w.register_queue(&queue);
                         Subscription::new(id, queue.clone(), Arc::downgrade(w), guard)
                     }
-                    Err(_) => {
-                        rq.count_dropped();
-                        return;
-                    }
+                    Err(e) => return refuse_routed(&rq, user, &e),
                 }
             }
             None => Subscription::detached(id, queue.clone()),
         };
         drop(slot);
         if !self.add_sub(id, &spec, queue.clone(), Some(tick)) {
-            rq.count_dropped();
-            return; // `sub` drops here and closes
+            // `sub` drops here and closes.
+            return refuse_routed(&rq, user, &"the stream could not be registered");
         }
         if let Some(r) = self.routers.get_mut(&rid) {
             r.routed.insert(user, Arc::downgrade(&queue));
@@ -1319,4 +1315,14 @@ impl RxPipeline {
             }
         }
     }
+}
+
+/// A stream a router could not create for `user`: counted in `UserStreams.dropped` and logged
+/// (once per presence: the user is marked routed and not retried until it leaves).
+fn refuse_routed(rq: &RouterQueue, user: u64, why: &dyn std::fmt::Display) {
+    rq.count_dropped();
+    ::log::warn!(
+        "listen_users: no stream for user {user}: {why}; counted in UserStreams.dropped, not \
+         retried until the user leaves"
+    );
 }

@@ -235,8 +235,9 @@ pub enum DriverEvent {
 
 /// Sends one input on the connection's tick channel, exactly where `Dispatch` sends it. A full
 /// channel raises `LimitExceeded("tick_channel")` (call `Harness::step` to drain it) instead of
-/// silently dropping like `Dispatch`; a closed channel (connection closed, or receive disabled)
-/// drops the input like `Dispatch` does.
+/// silently dropping like `Dispatch`; a closed channel (connection closed) drops the input like
+/// `Dispatch` does. With receive disabled the channel stays open: the pipeline still takes control
+/// inputs (mappings, leaves) and ignores ticks.
 fn send_rx(conn: &ConnShared, input: RxInput) -> Result<(), CoreError> {
     let Some(tx) = conn.rx_sender_ref() else {
         return Ok(());

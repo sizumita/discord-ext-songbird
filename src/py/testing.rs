@@ -325,6 +325,22 @@ fn track_log(track: PyRef<'_, NativeTrack>) -> Vec<&'static str> {
     hooks::track_log(track.track_ref())
 }
 
+/// songbird's ``TrackEvent::Error`` for ``track``: it ends ``"error"`` with ``message`` (``False`` if
+/// it had already ended).
+#[pyfunction]
+fn fail_track(track: PyRef<'_, NativeTrack>, message: &str) -> bool {
+    hooks::fail_track(track.track_ref(), message)
+}
+
+/// Whether a detached connection answers track ``info()``/``seek()`` ops from the fake control
+/// (default ``True``, like songbird's live mixer). ``False``: they time out, as on a parked mixer.
+#[pyfunction]
+fn set_ops_answered(py: Python<'_>, conn: PyRef<'_, Connection>, on: bool) -> PyResult<()> {
+    ensure_not_forked(py)?;
+    conn.shared().set_detached_ops_answered(on);
+    Ok(())
+}
+
 /// Allocations on the calling thread while the counting guard is active (the mixer callbacks of
 /// ``MixerHarness.pull``).
 #[pyfunction]
@@ -337,7 +353,8 @@ fn alloc_count() -> u64 {
 pub mod testing_module {
     #[pymodule_export]
     use super::{
-        Harness, MixerHarness, alloc_count, detached_connection, encode_opus, inject_driver_event,
-        inject_map, inject_tick, inject_user_left, inject_voice_tick_rtp, rtp_wrap, track_log,
+        Harness, MixerHarness, alloc_count, detached_connection, encode_opus, fail_track,
+        inject_driver_event, inject_map, inject_tick, inject_user_left, inject_voice_tick_rtp,
+        rtp_wrap, set_ops_answered, track_log,
     };
 }

@@ -396,6 +396,19 @@ def inject_ticks(vc: HarnessClient, testing: Any, ticks: int, *, ssrc: int = SSR
         vc.harness.step(20)
 
 
+def flush_native_logs() -> None:
+    """Forward every native log record logged so far, deterministically: stopping the
+    ``songbird-log`` thread makes it finish its batch and drain the ring before it exits; then it is
+    started again."""
+    import threading
+
+    from discord.ext.songbird import _log
+
+    _log.stop(timeout=5)
+    assert not any(t.name == "songbird-log" and t.is_alive() for t in threading.enumerate())
+    _log.start()
+
+
 def drain(stream: Any) -> list[Any]:
     """Every chunk/event currently queued (``read_nowait`` until ``None``)."""
     out = []

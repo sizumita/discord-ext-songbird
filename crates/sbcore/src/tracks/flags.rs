@@ -405,7 +405,15 @@ impl TrackRef {
         {
             return Ok(());
         }
-        self.control(|h| h.set_volume(v).map_err(control_err), |_| {})
+        self.control(
+            |h| h.set_volume(v).map_err(control_err),
+            |_| {
+                #[cfg(feature = "test-hooks")]
+                if let Some(f) = self.fake.get() {
+                    f.set_volume(v);
+                }
+            },
+        )
     }
 
     /// `None` loops forever; `TrackError` for live sources.
@@ -413,7 +421,15 @@ impl TrackRef {
         if self.flags.kind.is_live() {
             return Err(CoreError::Track("live sources cannot loop".into()));
         }
-        self.control(|h| set_track_loops(h, loops), |_| {})
+        self.control(
+            |h| set_track_loops(h, loops),
+            |_| {
+                #[cfg(feature = "test-hooks")]
+                if let Some(f) = self.fake.get() {
+                    f.set_loops(loops);
+                }
+            },
+        )
     }
 
     /// The `FakeTrackControl` call log of a detached track (`"pause"`, `"play"`, `"stop"`).

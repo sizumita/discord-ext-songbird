@@ -7,7 +7,7 @@ import time
 from typing import Any
 
 import pytest
-from conftest import run_isolated
+from conftest import flush_native_logs, run_isolated
 from discord.ext import songbird
 from discord.ext.songbird import _log, native
 
@@ -71,23 +71,55 @@ def test_log_wait_contract() -> None:
     assert native._log_dropped() >= 0
 
 
+def _voice_session(testing: Any, channel_id: int, *, session: str = "s", token: str = "t") -> None:
+    """A detached connection's join → voice state → voice server → close, which the native side
+    logs at DEBUG (``sbcore::conn::shared``)."""
+    conn, harness = testing.detached_connection(1, 2, songbird.VoiceConfig().to_native())
+    conn.request_join(channel_id, False, False)
+    conn.on_voice_state(session, channel_id)
+    conn.on_voice_server(token, "wss://example.discord.media/")
+    harness.step(100)
+    conn.close("requested")
+
+
 @pytest.mark.real_only
-async def test_token_never_logged(testing: Any, caplog: pytest.LogCaptureFixture) -> None:
+def test_token_never_logged(testing: Any, caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.DEBUG, logger="discord.ext.songbird")
     songbird.set_log_levels(library="DEBUG", songbird="DEBUG")
     try:
-        conn, harness = testing.detached_connection(1, 2, songbird.VoiceConfig().to_native())
-        conn.request_join(3, False, False)
-        conn.on_voice_state("session-SECRET-SESSION", 3)
-        conn.on_voice_server("SECRET-TOKEN-123", "wss://example.discord.media/")
-        harness.step(100)
-        conn.close("requested")
-        time.sleep(0.6)
+        _voice_session(testing, 3, session="session-SECRET-SESSION", token="SECRET-TOKEN-123")
     finally:
         songbird.set_log_levels()
+    flush_native_logs()
+    # Not vacuous: the session was logged, through the real forwarder, under the right names.
+    recs = [r for r in caplog.records if r.name == "discord.ext.songbird.native.conn.shared"]
+    msgs = [r.getMessage() for r in recs]
+    assert any("voice server update" in m for m in msgs), msgs
+    assert any("closed" in m for m in msgs), msgs
+    assert all(r.rust_target == "sbcore::conn::shared" for r in recs)  # type: ignore
+    assert all(r.levelno in (logging.DEBUG, logging.INFO) for r in recs)
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "SECRET-TOKEN-123" not in text
     assert "SECRET-SESSION" not in text
+
+
+@pytest.mark.real_only
+def test_rust_side_filtering_real(testing: Any, caplog: pytest.LogCaptureFixture) -> None:
+    """``set_log_levels`` filters in Rust: a session logged while the library is at INFO leaves no
+    DEBUG record, the same session at DEBUG does (and, the ring being FIFO, once the later
+    session's records have been forwarded the earlier one's would have been too)."""
+    caplog.set_level(logging.DEBUG, logger="discord.ext.songbird")
+    songbird.set_log_levels()  # library="INFO"
+    _voice_session(testing, 4)
+    songbird.set_log_levels(library="DEBUG")
+    try:
+        _voice_session(testing, 3)
+    finally:
+        songbird.set_log_levels()
+    flush_native_logs()
+    msgs = [r.getMessage() for r in caplog.records if r.name.startswith("discord.ext.songbird.native")]
+    assert any("Some(3)" in m for m in msgs), msgs
+    assert not any("Some(4)" in m for m in msgs), msgs
 
 
 def test_forwarder_exits_at_shutdown() -> None:

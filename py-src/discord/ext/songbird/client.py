@@ -564,6 +564,12 @@ class SongbirdClient(discord.VoiceProtocol):
             ``1..=4096``.
         kinds : iterable of VoiceEvent variant classes or None
             Only these kinds (``None`` = all).
+
+        Notes
+        -----
+        With ``VoiceConfig(receive=False)``, ``UserMapped`` and ``UserLeft`` are still reported (they
+        come from the voice WebSocket); ``SpeakingStarted``/``SpeakingStopped`` need received audio
+        and never fire.
         """
         conn, pump = self._require()
         return self._adopt(EventStream(conn.subscribe_events(max_queue, kind_mask(kinds)), pump))

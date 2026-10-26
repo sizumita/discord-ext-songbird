@@ -223,8 +223,10 @@ impl ConnShared {
         let worker = WorkerShared::new(settings.max_receive_bytes);
         let overflow = Arc::new(Mutex::new(VecDeque::new()));
         let (tx, rx_in) = tokio::sync::mpsc::channel(TICK_CHANNEL_CAP);
-        // Without receive, nothing feeds the pipeline: the channel is closed from the start.
-        let rx_tx = if settings.receive { Some(tx) } else { None };
+        // Open with receive off too: no VoiceTick handler is registered, but the WebSocket events
+        // (SpeakingStateUpdate, ClientDisconnect) still reach the pipeline as control inputs, so
+        // `UserMapped`/`UserLeft` keep working (§8.5, §9.3).
+        let rx_tx = Some(tx);
         let driver = (!detached).then(|| OwnedDriver::new(build_config(&settings, reconnect)));
         let gw = GatewayState::new(GatewayParams::new(
             guild_id,
@@ -711,6 +713,12 @@ impl ConnShared {
     /// parked one times out (`OpResult::TimedOut`).
     pub fn start_track_info(&self, t: &TrackRef, timeout: Duration) -> Result<u32, CoreError> {
         self.ensure_open()?;
+        #[cfg(feature = "test-hooks")]
+        if let Some(fut) = super::detached::info_op(t, self.det.ops_answered(), timeout) {
+            let id = self.ops.start(&self.wake, fut)?;
+            self.fail_ops_if_closed();
+            return Ok(id);
+        }
         let h = Self::songbird_handle(t)?;
         // A live PCM source applies its volume in its decoder (its songbird track stays at 1.0).
         let track = t.clone();
@@ -752,6 +760,12 @@ impl ConnShared {
         check("seconds", pos.as_secs_f64(), SEEK_S)?;
         if t.flags.kind.is_live() {
             return Err(CoreError::Track("live sources cannot seek".into()));
+        }
+        #[cfg(feature = "test-hooks")]
+        if let Some(fut) = super::detached::seek_op(t, pos, self.det.ops_answered(), timeout) {
+            let id = self.ops.start(&self.wake, fut)?;
+            self.fail_ops_if_closed();
+            return Ok(id);
         }
         let h = Self::songbird_handle(t)?;
         let id = self.ops.start(&self.wake, async move {
@@ -1123,6 +1137,11 @@ impl ConnShared {
         #[cfg(feature = "test-hooks")]
         if self.detached {
             let _ctl = self.park(track, input, None, opts.paused);
+            if let Some(f) = track.fake.get() {
+                // What songbird's `TrackState` would start with (detached `info()`).
+                f.set_volume(opts.volume);
+                f.set_loops(opts.loops);
+            }
             return Ok(());
         }
         let t = songbird::tracks::Track::new(input)
