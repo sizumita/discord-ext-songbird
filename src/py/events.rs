@@ -217,6 +217,11 @@ impl EventSubscription {
 
 impl Drop for EventSubscription {
     fn drop(&mut self) {
+        // §4.10: in a forked child, never take a lock a vanished parent thread may hold (the
+        // connection's emitters). The queue is simply freed with its last reference.
+        if sbcore::runtime::check_not_forked().is_err() {
+            return;
+        }
         self.queue.close();
     }
 }
@@ -268,6 +273,9 @@ impl EventSubscription {
 
     /// Idempotent; any thread.
     fn close(&self) {
-        self.queue.close();
+        // A no-op after fork() (§4.10, see Drop).
+        if sbcore::runtime::check_not_forked().is_ok() {
+            self.queue.close();
+        }
     }
 }

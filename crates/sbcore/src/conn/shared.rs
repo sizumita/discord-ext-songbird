@@ -3,52 +3,63 @@
 //! Every method is synchronous and non-blocking (O(1) or O(input)); no lock is held across an
 //! `.await`, a syscall or another blocking wait (I7). `native.Connection` holds the only long-lived
 //! strong `Arc`; songbird handlers and tasks hold `Weak<ConnShared>` (I4).
-#![allow(dead_code, unused_variables)] // phase-0 skeleton
+//!
+//! State-machine inputs go through [`ConnShared::apply`] (§4.6): one pure step under L2, the batch
+//! enqueued under L2 → L2q in step order, and one executor at a time running the batches in order
+//! after every lock is released.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use smallvec::SmallVec;
+use songbird::constants::DEFAULT_BITRATE;
+use songbird::driver::Bitrate;
+use songbird::tracks::TrackHandle;
 use tokio::task::AbortHandle;
 
+use super::LogLimiter;
+use super::admission::{Admission, Reservation};
 use super::dispatch::Dispatch;
-use super::driver::OwnedDriver;
-use super::gateway::{ActionBatch, GatewayState, GwInput, StatusSnapshot};
-use super::ops::{OpRegistry, OpResult};
-use super::settings::ConnParams;
-#[cfg(feature = "test-hooks")]
-use super::worker::ConnWorker;
-use super::worker::WorkerShared;
+use super::driver::{OwnedDriver, build_config, connect_deadline};
+use super::gateway::{
+    ActionBatch, ConnectFailure, GatewayParams, GatewayState, GwAction, GwInput, StatusSnapshot,
+};
+use super::ops::{OpRegistry, OpResult, TrackInfoData};
+use super::settings::{BITRATE_BPS, ConnParams, VoiceSettings};
+use super::worker::{ConnWorker, WorkerCmd, WorkerShared};
 use crate::clock::Clock;
 use crate::ctrl::{Control, CtrlQueue};
 use crate::error::{CloseReason, CoreError};
-use crate::events::{EventHub, EventQueue, KindMask};
-use crate::runtime::LiveCounter;
-use crate::rx::queue::{SubSpec, Subscription};
+use crate::events::{EventData, EventHub, EventQueue, KindMask};
+use crate::limits::{
+    MAX_LIVE_SOURCES_PER_CONN, MAX_PLAYING_TRACKS_PER_CONN, MAX_SUBS_PER_CONN, SEEK_S,
+    TICK_CHANNEL_CAP, TICK_MS, VOLUME, check,
+};
+use crate::runtime::{self, LiveCounter, live};
+use crate::rx::pipeline::{RxConfig, RxPipeline};
+use crate::rx::queue::{RxCmd, RxSource, SubQueue, SubSpec, Subscription};
 use crate::rx::raw::RxSender;
-use crate::rx::router::{RouterHandle, RouterSpec};
+use crate::rx::router::{RouterHandle, RouterQueue, RouterSpec};
 use crate::sync::lock_checked;
-use crate::tracks::flags::{PlayOpts, TrackRef};
+use crate::tracks::flags::{PlayOpts, TrackEndReason, TrackKind, TrackRef, loop_state};
 use crate::tracks::queue::TrackQueue;
 use crate::tracks::registry::TrackRegistry;
-use crate::tx::LiveSource;
-use crate::tx::encoded::{EncodedShared, EncodedSpec};
-use crate::tx::opus_stream::{OpusQueue, OpusStreamSpec};
+use crate::tx::encoded::{EncodedShared, EncodedSpec, spawn_encoded};
+use crate::tx::opus_stream::{OpusQueue, OpusStreamSpec, opus_stream_input};
 use crate::tx::queue::{PcmQueue, PlaybackSpec};
+use crate::tx::reader::live_pcm_input;
 use crate::tx::source::SourceSpec;
-use crate::wake::{Doorbell, WakeHub};
+use crate::tx::{CloseMode, LiveSource, TrackControl, next_source_id};
+use crate::wake::{Doorbell, WAKE_CONN, WAKE_OPS, WAKE_TRACKS, WakeHub};
 
 pub use super::registry::{registry_snapshot, shutdown_all};
 
-/// Bot flags set from Python (`set_users_bot`) and users still awaiting classification.
-#[derive(Debug, Default)]
-pub(crate) struct BotTable {
-    bots: HashSet<u64>,
-    known: HashSet<u64>,
-}
+/// Rate limit for the DEBUG line of unlisted (phase, input) pairs.
+static UNLISTED_LOG: LogLimiter = LogLimiter::new(10);
 
 /// Connection-level counters (§11.3: `connects`, `rejoins`, `stale_connects_dropped`, …).
 #[derive(Debug, Default)]
@@ -58,18 +69,26 @@ pub(crate) struct ConnStats {
     stale_connects_dropped: AtomicU64,
     gw_unlisted_inputs: AtomicU64,
     dispatch_reinstalls: AtomicU64,
-    heartbeat_misses: AtomicU64,
-    panics: AtomicU64,
+}
+
+/// What the executor did (ordering tests, §4.6).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Exec {
+    Connect(u64),
+    Link { seq: u64, up: bool },
 }
 
 /// Everything one voice connection owns (§4.3).
 pub struct ConnShared {
+    me: Weak<ConnShared>,
     guild_id: NonZeroU64,
     user_id: NonZeroU64,
     reconnect: bool,
-    receive: bool,
-    /// L1.
+    settings: VoiceSettings,
+    /// L1. `None` once torn down, and always for detached test connections.
     driver: Mutex<Option<OwnedDriver>>,
+    detached: bool,
     /// L2.
     gw: Mutex<GatewayState>,
     /// L2q.
@@ -81,30 +100,80 @@ pub struct ConnShared {
     tracks: Arc<TrackRegistry>,
     queue: TrackQueue,
     worker: Arc<WorkerShared>,
+    /// The tick-channel sender (the `Dispatch` holds a clone); the test hooks inject through it.
+    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
     rx_tx: Option<RxSender>,
     dispatch: Dispatch,
     /// L10: live sources, pruned on insert, closed at T5.
     sources: Mutex<Vec<Weak<dyn LiveSource>>>,
-    /// L10: connect/op tasks only (the ConnWorker exits on the shutdown flag, T6/T7).
+    /// L10: connect tasks (op tasks live in `ops`). The ConnWorker exits on the shutdown flag.
     tasks: Mutex<Vec<AbortHandle>>,
     ops: OpRegistry,
-    /// L10.
-    bots: Mutex<BotTable>,
+    /// Users first seen by the receive pipeline, awaiting bot classification (W3 pushes).
     unclassified: Arc<Mutex<Vec<u64>>>,
     closing: Arc<AtomicBool>,
     send_muted: Arc<AtomicBool>,
     /// The creating process; teardown is skipped in any other process (§4.10).
     pid: u32,
     clock: Clock,
+    /// Timeline origin (§8.8) and housekeeping tick origin.
+    t0: Instant,
+    next_sub_id: AtomicU64,
     stats: ConnStats,
+    /// Race-free I6 admissions (free-threaded callers): `MAX_PLAYING_TRACKS_PER_CONN`,
+    /// `MAX_LIVE_SOURCES_PER_CONN`, `MAX_SUBS_PER_CONN` (subscriptions and routers).
+    playing_adm: Admission,
+    live_adm: Admission,
+    subs_adm: Admission,
+    routers_adm: Admission,
+    #[cfg(feature = "test-hooks")]
+    pub(super) det: super::detached::DetachedState,
+    #[cfg(test)]
+    exec_log: Mutex<Vec<Exec>>,
+    /// Makes the next `execute` panic (executor unwind-safety test).
+    #[cfg(test)]
+    panic_next_execute: AtomicBool,
     _live: LiveCounter,
+}
+
+impl std::fmt::Debug for ConnShared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnShared")
+            .field("guild_id", &self.guild_id)
+            .field("state", &self.status().state)
+            .field("closing", &self.is_closed())
+            .finish()
+    }
 }
 
 impl ConnShared {
     /// Builds the Driver, the Dispatch and the ConnWorker (spawned on the RX runtime) and registers
     /// the connection. The doorbell is dropped (closed) on failure.
     pub fn new(p: ConnParams, bell: Doorbell) -> Result<Arc<Self>, CoreError> {
-        Err(CoreError::Internal("unimplemented"))
+        let (conn, worker) = Self::build(p, bell, false, std::process::id())?;
+        runtime::rx().spawn(worker.run());
+        Ok(conn)
+    }
+
+    /// `new` with the ConnWorker returned instead of spawned (worker tests with a real Driver).
+    #[cfg(test)]
+    pub(crate) fn new_unspawned(
+        p: ConnParams,
+        bell: Doorbell,
+    ) -> Result<(Arc<Self>, ConnWorker), CoreError> {
+        Self::build(p, bell, false, std::process::id())
+    }
+
+    /// `new` as if created by process `pid` (fork tests: a foreign pid behaves like a forked child).
+    #[cfg(test)]
+    pub(crate) fn new_with_pid(
+        p: ConnParams,
+        bell: Doorbell,
+        pid: u32,
+    ) -> Result<Arc<Self>, CoreError> {
+        let (conn, worker) = Self::build(p, bell, false, pid)?;
+        runtime::rx().spawn(worker.run());
+        Ok(conn)
     }
 
     /// A full connection with **no songbird Driver** and the worker returned to the caller instead
@@ -114,7 +183,130 @@ impl ConnShared {
         p: ConnParams,
         bell: Doorbell,
     ) -> Result<(Arc<Self>, ConnWorker), CoreError> {
-        Err(CoreError::Internal("unimplemented"))
+        Self::build(p, bell, true, std::process::id())
+    }
+
+    fn build(
+        p: ConnParams,
+        bell: Doorbell,
+        detached: bool,
+        pid: u32,
+    ) -> Result<(Arc<Self>, ConnWorker), CoreError> {
+        runtime::check_not_forked()?;
+        let ConnParams {
+            guild_id,
+            user_id,
+            reconnect,
+            settings,
+            clock,
+        } = p;
+        let wake = WakeHub::new(bell);
+        let closing = Arc::new(AtomicBool::new(false));
+        let events = EventHub::new();
+        let ctrl = CtrlQueue::new(wake.clone());
+        let tracks = Arc::new(TrackRegistry::new(closing.clone()));
+        let worker = WorkerShared::new(settings.max_receive_bytes);
+        let overflow = Arc::new(Mutex::new(VecDeque::new()));
+        let (tx, rx_in) = tokio::sync::mpsc::channel(TICK_CHANNEL_CAP);
+        // Without receive, nothing feeds the pipeline: the channel is closed from the start.
+        let rx_tx = if settings.receive { Some(tx) } else { None };
+        let driver = (!detached).then(|| OwnedDriver::new(build_config(&settings, reconnect)));
+        let gw = GatewayState::new(GatewayParams::new(
+            guild_id,
+            user_id,
+            reconnect,
+            settings.rejoin_attempts,
+            settings.auto_recover,
+        ));
+        let t0 = clock.now();
+        let conn = Arc::new_cyclic(|me: &Weak<ConnShared>| {
+            let dispatch = Dispatch::new(
+                me.clone(),
+                rx_tx.clone(),
+                Arc::downgrade(&tracks),
+                overflow.clone(),
+            );
+            let mut driver = driver;
+            if let Some(d) = driver.as_mut() {
+                d.install_dispatch(&dispatch, settings.receive);
+                if let Some(b) = settings.bitrate {
+                    d.set_bitrate(Bitrate::Bits(b));
+                }
+            }
+            ConnShared {
+                me: me.clone(),
+                guild_id,
+                user_id,
+                reconnect,
+                settings,
+                driver: Mutex::new(driver),
+                detached,
+                gw: Mutex::new(gw),
+                pending: Mutex::new(VecDeque::new()),
+                executing: AtomicBool::new(false),
+                wake,
+                events,
+                ctrl,
+                tracks,
+                queue: TrackQueue::new(),
+                worker,
+                rx_tx,
+                dispatch,
+                sources: Mutex::new(Vec::new()),
+                tasks: Mutex::new(Vec::new()),
+                ops: OpRegistry::new(),
+                unclassified: Arc::new(Mutex::new(Vec::new())),
+                closing,
+                send_muted: Arc::new(AtomicBool::new(false)),
+                pid,
+                clock,
+                t0,
+                next_sub_id: AtomicU64::new(1),
+                stats: ConnStats::default(),
+                playing_adm: Admission::new(),
+                live_adm: Admission::new(),
+                subs_adm: Admission::new(),
+                routers_adm: Admission::new(),
+                #[cfg(feature = "test-hooks")]
+                det: super::detached::DetachedState::new(),
+                #[cfg(test)]
+                exec_log: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                panic_next_execute: AtomicBool::new(false),
+                _live: LiveCounter::new(&live::CONN_SHARED),
+            }
+        });
+        conn.queue
+            .attach(Arc::downgrade(&conn.tracks), Arc::downgrade(&conn.worker));
+        let worker = ConnWorker::new(
+            Arc::downgrade(&conn),
+            conn.worker.clone(),
+            conn.new_pipeline(),
+            rx_in,
+            overflow,
+            conn.clock.clone(),
+        );
+        super::registry::register(&conn);
+        Ok((conn, worker))
+    }
+
+    /// A fresh receive pipeline (creation, and rebuild after a caught worker panic).
+    pub(crate) fn new_pipeline(&self) -> RxPipeline {
+        let s = &self.settings;
+        RxPipeline::new(
+            RxConfig {
+                enabled: s.receive,
+                hangover_ms: s.hangover_ms,
+                voice_threshold_dbfs: s.voice_threshold_dbfs,
+                max_decoded_users: s.max_decoded_users,
+                decode_state_timeout: s.decode_state_timeout,
+                stall_timeout: s.stall_timeout,
+                t0: self.t0,
+            },
+            self.events.clone(),
+            self.ctrl.clone(),
+            self.unclassified.clone(),
+        )
     }
 
     // ── gateway ──────────────────────────────────────────────────────────────────────────────────
@@ -137,6 +329,7 @@ impl ConnShared {
 
     /// `BeginRejoin` (from `reconnect()`).
     pub fn begin_rejoin(&self) {
+        self.stats.rejoins.fetch_add(1, Ordering::Relaxed);
         self.apply(GwInput::BeginRejoin);
     }
 
@@ -147,6 +340,11 @@ impl ConnShared {
 
     /// Forwards discord.py's `on_voice_state_update` for our own user.
     pub fn on_voice_state(&self, session_id: &str, channel_id: Option<u64>) {
+        // Secrets: the session id is logged only as a length.
+        ::log::debug!(
+            "voice state update: channel={channel_id:?} session_len={}",
+            session_id.len()
+        );
         self.apply(GwInput::VoiceState {
             session_id: session_id.into(),
             channel: channel_id,
@@ -155,6 +353,11 @@ impl ConnShared {
 
     /// Forwards discord.py's `on_voice_server_update` (`endpoint=None`: server reallocating).
     pub fn on_voice_server(&self, token: &str, endpoint: Option<&str>) {
+        // Secrets: the token is never logged; the endpoint only as a host.
+        ::log::debug!(
+            "voice server update: host={:?}",
+            endpoint.and_then(super::gateway::normalize_endpoint)
+        );
         self.apply(GwInput::VoiceServer {
             token: token.into(),
             endpoint: endpoint.map(Into::into),
@@ -176,7 +379,7 @@ impl ConnShared {
 
     /// Receive timeline position (20 ms ticks since the connection was created).
     pub fn timeline_ms(&self) -> u64 {
-        0
+        self.worker.timeline_ms()
     }
 
     // ── signalling to Python ─────────────────────────────────────────────────────────────────────
@@ -186,31 +389,96 @@ impl ConnShared {
         self.wake.take_ready(out);
     }
 
-    /// Pending control slots (at most `max`).
+    /// Pending control slots (at most `max`; the others stay pending).
     pub fn take_controls(&self, max: usize, out: &mut Vec<Control>) {
-        self.ctrl.take(out);
+        self.ctrl.take_up_to(max, out);
     }
 
     /// Users first seen since the last call, awaiting bot classification (`ClassifyUsers`).
     pub fn take_unclassified_users(&self) -> Vec<u64> {
-        Vec::new()
+        std::mem::take(&mut *lock_checked(&self.unclassified))
     }
 
     /// Records which users are bots (`ignore_bots` filters).
     pub fn set_users_bot(&self, users: &[(u64, bool)]) {
-        // phase 0: not recorded yet.
+        if users.is_empty() || self.is_closed() {
+            return;
+        }
+        self.worker
+            .push(WorkerCmd::Rx(RxCmd::SetBots(users.to_vec())));
     }
 
     // ── receive ──────────────────────────────────────────────────────────────────────────────────
 
     /// A per-user or mixed subscription (`ReceiveDisabled` with `receive=False`).
     pub fn subscribe(&self, spec: SubSpec) -> Result<Subscription, CoreError> {
-        Err(CoreError::Internal("unimplemented"))
+        self.ensure_open()?;
+        if !self.settings.receive {
+            return Err(CoreError::ReceiveDisabled);
+        }
+        spec.validate()?;
+        // Held until the queue is registered (visible to `open_queues`).
+        let _slot = self
+            .subs_adm
+            .reserve("subscriptions", MAX_SUBS_PER_CONN, || {
+                self.worker.open_queues()
+            })?;
+        let budget = self.worker.reserve_budget(spec.budget_bytes()?)?;
+        let token = self.wake.alloc()?;
+        let queue = SubQueue::new(&spec, token);
+        self.worker.register_queue(&queue);
+        if self.is_closed() {
+            // T6 may already have swept the registered queues.
+            queue.close(CloseReason::ConnectionClosed);
+            return Err(self.closed_err());
+        }
+        let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
+        self.worker.push(WorkerCmd::Rx(RxCmd::AddSub {
+            id,
+            spec,
+            queue: queue.clone(),
+        }));
+        Ok(Subscription::new(
+            id,
+            queue,
+            Arc::downgrade(&self.worker),
+            budget,
+        ))
     }
 
     /// A `listen_users` router.
     pub fn subscribe_router(&self, spec: RouterSpec) -> Result<RouterHandle, CoreError> {
-        Err(CoreError::Internal("unimplemented"))
+        self.ensure_open()?;
+        if !self.settings.receive {
+            return Err(CoreError::ReceiveDisabled);
+        }
+        // The streams it creates use these parameters: validate them like a subscription.
+        SubSpec {
+            source: RxSource::User(0),
+            format: spec.format,
+            chunk_ms: spec.chunk_ms,
+            max_queue_ms: spec.max_queue_ms,
+            overflow: spec.overflow,
+        }
+        .validate()?;
+        // Held until the router is registered (visible to `open_routers`).
+        let _slot = self
+            .routers_adm
+            .reserve("routers", MAX_SUBS_PER_CONN, || self.worker.open_routers())?;
+        let token = self.wake.alloc()?;
+        let queue = RouterQueue::new(token);
+        self.worker.register_router(&queue);
+        if self.is_closed() {
+            queue.close(true);
+            return Err(self.closed_err());
+        }
+        let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
+        self.worker.push(WorkerCmd::Rx(RxCmd::AddRouter {
+            id,
+            spec,
+            queue: queue.clone(),
+        }));
+        Ok(RouterHandle { id, queue })
     }
 
     /// An event stream.
@@ -219,7 +487,12 @@ impl ConnShared {
         cap: usize,
         kinds: KindMask,
     ) -> Result<Arc<EventQueue>, CoreError> {
-        Err(CoreError::Internal("unimplemented"))
+        self.ensure_open()?;
+        let token = self.wake.alloc()?;
+        match self.events.subscribe(cap, kinds, token) {
+            Err(CoreError::ConnectionClosed(_)) => Err(self.closed_err()),
+            r => r,
+        }
     }
 
     // ── send ─────────────────────────────────────────────────────────────────────────────────────
@@ -229,7 +502,25 @@ impl ConnShared {
         &self,
         spec: PlaybackSpec,
     ) -> Result<(Arc<PcmQueue>, TrackRef), CoreError> {
-        Err(CoreError::Internal("unimplemented"))
+        self.ensure_open()?;
+        spec.validate()?;
+        let _slot = self.reserve_live()?;
+        let token = self.wake.alloc()?;
+        let id = next_source_id();
+        let q = PcmQueue::new(
+            id,
+            &spec,
+            token,
+            self.clock.clone(),
+            self.send_muted.clone(),
+        )?;
+        let (track, done) = self.tracks.register(TrackKind::Playback);
+        let input = live_pcm_input(q.clone(), done, false)?;
+        let ctl = self.start_live(&track, input, Some(id))?;
+        q.attach_track(ctl);
+        let weak: Weak<dyn LiveSource> = Arc::downgrade(&q) as Weak<dyn LiveSource>;
+        self.add_source(weak);
+        Ok((q, track))
     }
 
     /// A push-based encoded stream with its decode thread.
@@ -237,7 +528,18 @@ impl ConnShared {
         &self,
         spec: EncodedSpec,
     ) -> Result<(Arc<EncodedShared>, TrackRef), CoreError> {
-        Err(CoreError::Internal("unimplemented"))
+        self.ensure_open()?;
+        check("volume", spec.volume, VOLUME)?;
+        let _slot = self.reserve_live()?;
+        let token = self.wake.alloc()?;
+        let (track, done) = self.tracks.register(TrackKind::EncodedStream);
+        let (shared, input) = spawn_encoded(spec, token, done)?;
+        // Integration point (phase 2, W4): the encoded stream resumes its paused track on the
+        // first decoded frame; it needs this control once `EncodedShared` can take it.
+        let _ctl = self.start_live(&track, input, Some(shared.id()))?;
+        let weak: Weak<dyn LiveSource> = Arc::downgrade(&shared) as Weak<dyn LiveSource>;
+        self.add_source(weak);
+        Ok((shared, track))
     }
 
     /// A push-based Opus packet stream.
@@ -245,12 +547,37 @@ impl ConnShared {
         &self,
         spec: OpusStreamSpec,
     ) -> Result<(Arc<OpusQueue>, TrackRef), CoreError> {
-        Err(CoreError::Internal("unimplemented"))
+        self.ensure_open()?;
+        check("volume", spec.volume, VOLUME)?;
+        let _slot = self.reserve_live()?;
+        let token = self.wake.alloc()?;
+        let q = OpusQueue::new(&spec, token, self.send_muted.clone())?;
+        let (track, done) = self.tracks.register(TrackKind::OpusStream);
+        let input = opus_stream_input(q.clone(), done)?;
+        // Integration point (phase 2, W4): the first `send` resumes the paused track; it needs
+        // this control once `OpusQueue` can take it.
+        let _ctl = self.start_live(&track, input, Some(q.id()))?;
+        let weak: Weak<dyn LiveSource> = Arc::downgrade(&q) as Weak<dyn LiveSource>;
+        self.add_source(weak);
+        Ok((q, track))
     }
 
     /// Plays a memory source now (`MAX_PLAYING_TRACKS_PER_CONN`).
     pub fn play(&self, src: &SourceSpec, opts: PlayOpts) -> Result<TrackRef, CoreError> {
-        Err(CoreError::Internal("unimplemented"))
+        self.ensure_open()?;
+        if matches!(src, SourceSpec::Encoded(_)) {
+            return Err(CoreError::Track(
+                "encoded streams can only be queued (enqueue_stream)".into(),
+            ));
+        }
+        check("volume", opts.volume, VOLUME)?;
+        loop_state(opts.loops)?;
+        // Held until the track is started (visible to `TrackRegistry::playing`).
+        let _slot = self.reserve_playing()?;
+        let (track, done) = self.tracks.register(src.kind());
+        let (input, _) = src.to_input(done, &self.wake)?;
+        self.start_track(&track, input, opts)?;
+        Ok(track)
     }
 
     /// The sequential track queue.
@@ -263,36 +590,110 @@ impl ConnShared {
         &self.tracks
     }
 
-    /// The encoded stream of a lazy `Encoded` queue entry that became current.
+    /// The encoded stream of a lazy `Encoded` queue entry that became current (once).
     pub fn queue_take_stream(&self, t: &TrackRef) -> Option<Arc<EncodedShared>> {
-        None
+        self.queue.take_stream(t)
     }
 
     /// Stops every track, queue entry and live stream; the connection stays up.
+    ///
+    /// `Driver::stop()` (`SetTrack(None)`) fires no `End` event, so the stopped tracks resolve
+    /// through the `DROPPED` grace (§7.10).
     pub fn stop_all(&self) {
-        // phase 0: nothing is playing.
+        if self.is_closed() {
+            return;
+        }
+        // `stop()` (not just `clear()`): also an entry the worker is starting right now ends.
+        self.queue.stop();
+        let sources: Vec<Arc<dyn LiveSource>> = lock_checked(&self.sources)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for s in &sources {
+            s.close(CloseMode::Abort);
+        }
+        self.with_driver(|d| d.stop());
+        #[cfg(feature = "test-hooks")]
+        self.det.drop_all();
+        self.worker.wake();
     }
 
     /// `None` = songbird default (128 kbps); otherwise 6 000..=510 000 bps.
     pub fn set_bitrate(&self, bps: Option<i32>) -> Result<(), CoreError> {
-        Err(CoreError::Internal("unimplemented"))
+        self.ensure_open()?;
+        let b = match bps {
+            Some(b) => Bitrate::Bits(
+                i32::try_from(check("bitrate", i64::from(b), BITRATE_BPS)?)
+                    .map_err(|_| CoreError::invalid("bitrate out of range"))?,
+            ),
+            None => DEFAULT_BITRATE,
+        };
+        self.with_driver(|d| d.set_bitrate(b));
+        Ok(())
     }
 
     // ── track ops ────────────────────────────────────────────────────────────────────────────────
 
-    /// Starts a `get_info` op; returns the op id.
-    pub fn start_track_info(&self, t: &TrackRef, timeout: Duration) -> Result<u32, CoreError> {
-        Err(CoreError::Internal("unimplemented"))
+    /// songbird's handle of a started track (`TrackError` otherwise).
+    fn songbird_handle(t: &TrackRef) -> Result<TrackHandle, CoreError> {
+        match t.handle.get() {
+            Some(h) => Ok(h.clone()),
+            None if t.is_started() => Err(CoreError::Track(
+                "track has no songbird handle (detached connection)".into(),
+            )),
+            None if t.flags.ended().is_some() => Err(CoreError::Track("track has ended".into())),
+            None => Err(CoreError::Track("track has not started".into())),
+        }
     }
 
-    /// Starts a seek op; returns the op id.
+    /// Starts a `get_info` op; returns the op id. songbird answers only on a live mixer, so a
+    /// parked one times out (`OpResult::TimedOut`).
+    pub fn start_track_info(&self, t: &TrackRef, timeout: Duration) -> Result<u32, CoreError> {
+        self.ensure_open()?;
+        let h = Self::songbird_handle(t)?;
+        let id = self.ops.start(&self.wake, async move {
+            match tokio::time::timeout(timeout, h.get_info()).await {
+                Ok(Ok(state)) => OpResult::Info(TrackInfoData::from_state(&state)),
+                Ok(Err(e)) => OpResult::Err(CoreError::Track(e.to_string().into())),
+                Err(_) => OpResult::TimedOut,
+            }
+        })?;
+        self.fail_ops_if_closed();
+        Ok(id)
+    }
+
+    /// An op started while the connection closes: T8's `fail_all` may already have run (the
+    /// slots lock orders this check after T0 whenever `fail_all` missed the op), so the op is
+    /// resolved now instead of running until its timeout.
+    fn fail_ops_if_closed(&self) {
+        if self.is_closed() {
+            self.ops.fail_all();
+            self.wake.notify(WAKE_OPS);
+        }
+    }
+
+    /// Starts a seek op; returns the op id (`TrackError` for live sources and pending entries).
     pub fn start_track_seek(
         &self,
         t: &TrackRef,
         pos: Duration,
         timeout: Duration,
     ) -> Result<u32, CoreError> {
-        Err(CoreError::Internal("unimplemented"))
+        self.ensure_open()?;
+        check("seconds", pos.as_secs_f64(), SEEK_S)?;
+        if t.flags.kind.is_live() {
+            return Err(CoreError::Track("live sources cannot seek".into()));
+        }
+        let h = Self::songbird_handle(t)?;
+        let id = self.ops.start(&self.wake, async move {
+            match tokio::time::timeout(timeout, h.seek(pos).result_async()).await {
+                Ok(Ok(d)) => OpResult::Seeked(d),
+                Ok(Err(e)) => OpResult::Err(CoreError::Track(e.to_string().into())),
+                Err(_) => OpResult::TimedOut,
+            }
+        })?;
+        self.fail_ops_if_closed();
+        Ok(id)
     }
 
     /// Finished op results.
@@ -302,14 +703,63 @@ impl ConnShared {
 
     // ── lifecycle ────────────────────────────────────────────────────────────────────────────────
 
-    /// Complete teardown T0–T9 (§4.7). Idempotent and non-blocking; safe from `Drop` on any thread.
+    /// Complete teardown T0–T9 (§4.7). Idempotent and non-blocking; safe from `Drop` on any thread
+    /// and during interpreter finalisation. Never takes L2 while running actions, never waits for
+    /// another thread.
     pub fn close(&self, reason: CloseReason) {
         // T0: before taking any lock.
         if self.closing.swap(true, Ordering::AcqRel) {
             return;
         }
-        // phase 0: T1–T8 are not implemented yet; T9 removes the registry entry.
+        // §4.10: in a forked child (or any foreign process) leak everything: the doorbell and the
+        // Driver are shared with the parent, and locks may be held by threads that do not exist.
+        if runtime::in_foreign_process(self.pid) {
+            return;
+        }
+        // T1: phase = Closed(reason) (the first reason wins), copy the status.
+        let (reason, status) = {
+            let mut gw = lock_checked(&self.gw);
+            let r = gw.force_close(reason);
+            (r, gw.status())
+        };
+        // T2–T4: take the Driver under L1, tear it down outside every lock.
+        let driver = lock_checked(&self.driver).take();
+        if let Some(d) = driver {
+            d.teardown();
+        }
+        // T5: close every live source (queued audio freed now; writers get StreamClosed).
+        let sources: Vec<Weak<dyn LiveSource>> = std::mem::take(&mut *lock_checked(&self.sources));
+        for s in sources.iter().filter_map(Weak::upgrade) {
+            s.close(CloseMode::Abort);
+        }
+        // T6 (synchronous): close every subscription/router queue, then the event queues with the
+        // final Disconnected event, then stop the worker.
+        self.worker.close_queues(CloseReason::ConnectionClosed);
+        self.events.close_all(Some(&EventData::Disconnected {
+            reason: reason.as_str(),
+            code: status.close_code,
+            will_retry: false,
+        }));
+        self.worker.shutdown();
+        // T7: abort the connect tasks (op tasks are aborted by `fail_all`).
+        let tasks: Vec<AbortHandle> = std::mem::take(&mut *lock_checked(&self.tasks));
+        for t in &tasks {
+            t.abort();
+        }
+        // T8: resolve every unfinished track, fail pending ops, set the sticky Closed control.
+        self.tracks.finish_all(TrackEndReason::Disconnected);
+        self.queue.close_all(TrackEndReason::Disconnected);
+        #[cfg(feature = "test-hooks")]
+        self.det.drop_all();
+        self.ops.fail_all();
+        self.ctrl.set_closed(reason);
+        self.wake.notify(WAKE_TRACKS);
+        self.wake.notify(WAKE_OPS);
+        // T9: last status wake-up, then EOF on the doorbell; leave the registry.
+        self.wake.notify(WAKE_CONN);
+        self.wake.close();
         super::registry::unregister(self);
+        ::log::debug!("voice connection closed: {}", reason.as_str());
     }
 
     pub fn is_closed(&self) -> bool {
@@ -318,7 +768,38 @@ impl ConnShared {
 
     /// `SongbirdClient.stats()` counters (§11.3).
     pub fn stats(&self) -> Vec<(&'static str, u64)> {
-        Vec::new()
+        let rx = self.worker.rx_counts();
+        let d = self.dispatch.counters();
+        let ld = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        vec![
+            ("ticks_real", rx.ticks_real),
+            ("ticks_synthetic", rx.ticks_synthetic),
+            ("ticks_dropped", ld(&d.ticks_dropped)),
+            ("ticks_skipped", rx.ticks_skipped),
+            ("bad_packets", rx.bad_packets),
+            ("decode_errors", rx.decode_errors),
+            ("plc_frames", rx.plc_frames),
+            ("carry_overflow_frames", rx.carry_overflow_frames),
+            ("dave_trailers_stripped", rx.dave_trailers_stripped),
+            ("decoders_active", rx.decoders_active),
+            ("subscriptions", rx.subscriptions),
+            ("routers", rx.routers),
+            ("lanes", rx.lanes),
+            ("dispatch_reinstalls", ld(&self.stats.dispatch_reinstalls)),
+            ("dispatch_panics", ld(&d.panics)),
+            ("ctrl_dropped", ld(&d.ctrl_dropped)),
+            ("heartbeat_misses", self.worker.heartbeat_misses()),
+            ("panics", self.worker.panics()),
+            ("connects", ld(&self.stats.connects)),
+            ("rejoins", ld(&self.stats.rejoins)),
+            (
+                "stale_connects_dropped",
+                ld(&self.stats.stale_connects_dropped),
+            ),
+            ("gw_unlisted_inputs", ld(&self.stats.gw_unlisted_inputs)),
+            ("pending_ops", self.ops.pending() as u64),
+            ("receive_budget_bytes", self.worker.budget_used() as u64),
+        ]
     }
 
     /// Steps the state machine under L2 and executes the actions in step order (§4.6).
@@ -326,11 +807,436 @@ impl ConnShared {
         if self.closing.load(Ordering::Acquire) {
             return;
         }
-        drop(input); // phase 0: inputs are ignored.
+        let kind = input_kind(&input);
+        let unlisted = {
+            let mut gw = lock_checked(&self.gw); // L2
+            let before = gw.unlisted_inputs();
+            let mut batch: SmallVec<[GwAction; 4]> = SmallVec::new();
+            gw.step(input, self.clock.now(), &mut batch); // pure; no I/O
+            if !batch.is_empty() {
+                // L2 → L2q: enqueue order == step order.
+                let seq = gw.next_action_seq();
+                lock_checked(&self.pending).push_back(ActionBatch {
+                    seq,
+                    actions: batch,
+                });
+            }
+            gw.unlisted_inputs() != before
+        }; // L2 released HERE
+        if unlisted {
+            self.stats
+                .gw_unlisted_inputs
+                .fetch_add(1, Ordering::Relaxed);
+            if UNLISTED_LOG.allow() {
+                ::log::debug!("gateway input {kind} ignored in the current phase");
+            }
+        }
+        self.run_pending();
     }
 
-    /// Housekeeping for tracks and the queue (finalisation, advancing), run by the ConnWorker.
-    pub(crate) fn poll_tracks(&self, now: std::time::Instant) {
-        // phase 0: nothing to do.
+    /// Flat combining: whoever wins `executing` drains every queued batch in order; losers return
+    /// at once, because their batch is already queued and the winner will run it.
+    fn run_pending(&self) {
+        while self
+            .executing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Clears `executing` even if an action unwinds (the caller's `catch_unwind` in
+            // `Dispatch::act`, the worker tick or pyo3): a stuck flag would leave every later
+            // batch queued forever and the state machine without effects.
+            let running = Executing(&self.executing);
+            loop {
+                let next = lock_checked(&self.pending).pop_front(); // L2q held only for the pop
+                let Some(b) = next else {
+                    break;
+                };
+                for a in b.actions {
+                    self.execute(a, b.seq);
+                }
+            }
+            drop(running); // executing = false
+            // Re-check: a batch queued after our last pop, whose producer lost the CAS.
+            if lock_checked(&self.pending).is_empty() {
+                break;
+            }
+        }
+    }
+
+    /// Runs one action. Never called while L2 or L2q is held. After close, only `Teardown` runs.
+    fn execute(&self, a: GwAction, seq: u64) {
+        #[cfg(test)]
+        if self.panic_next_execute.swap(false, Ordering::AcqRel) {
+            panic!("injected executor panic");
+        }
+        if self.closing.load(Ordering::Acquire) && !matches!(a, GwAction::Teardown(_)) {
+            return;
+        }
+        match a {
+            GwAction::Connect { info, generation } => self.exec_connect(info, generation),
+            GwAction::SetSendMute(m) => {
+                self.send_muted.store(m, Ordering::Release);
+                self.with_driver(|d| d.mute(m));
+            }
+            GwAction::Emit(mut ev) => {
+                if let EventData::Connected { timeline_ms, .. } = &mut ev {
+                    *timeline_ms = self.timeline_ms();
+                }
+                self.events.emit(&ev);
+            }
+            GwAction::Control(c) => {
+                if matches!(c, Control::Rejoin { .. }) {
+                    self.stats.rejoins.fetch_add(1, Ordering::Relaxed);
+                }
+                self.ctrl.set(c);
+            }
+            GwAction::RxLink { up, ssrc } => {
+                #[cfg(test)]
+                self.log_exec(Exec::Link { seq, up });
+                self.worker.push(WorkerCmd::Link { up, ssrc, seq });
+            }
+            GwAction::ReinstallDispatch => {
+                self.stats
+                    .dispatch_reinstalls
+                    .fetch_add(1, Ordering::Relaxed);
+                self.with_driver(|d| d.reinstall_dispatch(&self.dispatch, self.settings.receive));
+                ::log::info!("voice event handlers re-installed (watchdog)");
+            }
+            GwAction::Teardown(r) => self.close(r),
+            GwAction::NotifyStatus => self.wake.notify(WAKE_CONN),
+        }
+    }
+
+    /// `Connect{info, gen}`: hand the info to the Driver under L1 (a stale generation is dropped),
+    /// then await the result on RX under a timeout and feed it back as `ConnectResult`.
+    fn exec_connect(&self, info: songbird::ConnectionInfo, generation: u64) {
+        #[cfg(test)]
+        self.log_exec(Exec::Connect(generation));
+        self.stats.connects.fetch_add(1, Ordering::Relaxed);
+        let fut = match self.with_driver(|d| d.connect(info, generation)) {
+            Some(Some(fut)) => fut,
+            Some(None) => {
+                self.stats
+                    .stale_connects_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            None => {
+                #[cfg(feature = "test-hooks")]
+                if self.detached && self.det.auto_connect() {
+                    // Detached connections connect instantly (tests inject failures directly).
+                    self.apply(GwInput::ConnectResult {
+                        generation,
+                        result: Ok(()),
+                    });
+                }
+                return;
+            }
+        };
+        let me = self.me.clone();
+        let deadline = connect_deadline(&self.settings, self.reconnect);
+        let task = runtime::rx().spawn(async move {
+            let result = match tokio::time::timeout(deadline, fut).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(songbird::error::ConnectionError::AttemptDiscarded)) => {
+                    Err(ConnectFailure::AttemptDiscarded)
+                }
+                Ok(Err(e)) => Err(ConnectFailure::Other(e.to_string().into())),
+                Err(_) => Err(ConnectFailure::TimedOut),
+            };
+            if let Err(e) = &result {
+                ::log::debug!("voice connect attempt {generation} failed: {e:?}");
+            }
+            if let Some(conn) = me.upgrade() {
+                conn.apply(GwInput::ConnectResult { generation, result });
+            }
+        });
+        let mut tasks = lock_checked(&self.tasks);
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task.abort_handle());
+        drop(tasks);
+        if self.is_closed() {
+            // T7 may already have run.
+            task.abort();
+        }
+    }
+
+    #[cfg(test)]
+    fn log_exec(&self, e: Exec) {
+        let mut log = self.exec_log.lock();
+        if log.len() < (1 << 20) {
+            log.push(e);
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // used by the test-hooks tests
+    pub(crate) fn exec_log(&self) -> Vec<Exec> {
+        self.exec_log.lock().clone()
+    }
+
+    /// Housekeeping for tracks and the queue (finalisation, `TrackEnded`, advancing), run by the
+    /// ConnWorker every tick while tracks may end.
+    pub(crate) fn poll_tracks(&self, now: Instant) {
+        let tick = u64::try_from(now.saturating_duration_since(self.t0).as_millis())
+            .unwrap_or(u64::MAX)
+            / u64::from(TICK_MS);
+        let mut ended: Vec<(u64, TrackEndReason)> = Vec::new();
+        self.tracks.poll_ended(tick, &mut ended);
+        if !ended.is_empty() {
+            for (track_id, reason) in &ended {
+                self.events.emit(&EventData::TrackEnded {
+                    track_id: *track_id,
+                    reason: *reason,
+                });
+            }
+            self.wake.notify(WAKE_TRACKS);
+        }
+        if !self.is_closed() && self.queue.needs_advance() {
+            self.queue.advance(self);
+        }
+    }
+
+    /// Whether the worker must keep polling tracks every tick.
+    pub(crate) fn tracks_need_poll(&self) -> bool {
+        self.tracks.needs_poll() || self.queue.needs_advance()
+    }
+
+    /// Rings `WAKE_TRACKS` (a lazy encoded entry became current).
+    pub(crate) fn notify_tracks(&self) {
+        self.wake.notify(WAKE_TRACKS);
+    }
+
+    pub(crate) fn events(&self) -> &EventHub {
+        &self.events
+    }
+
+    /// The state machine's next armed deadline.
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        lock_checked(&self.gw).next_deadline()
+    }
+
+    /// The last heartbeat, while a Driver exists (`None`: no handler-liveness watchdog).
+    pub(crate) fn last_heartbeat(&self) -> Option<Instant> {
+        if self.detached || self.is_closed() {
+            return None;
+        }
+        Some(self.dispatch.last_heartbeat())
+    }
+
+    /// The sender `Dispatch` uses (test hooks inject receive inputs through it).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn rx_sender_ref(&self) -> Option<&RxSender> {
+        self.rx_tx.as_ref()
+    }
+
+    /// The dispatcher (test hooks feed driver events through its paths).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn dispatch(&self) -> &Dispatch {
+        &self.dispatch
+    }
+
+    /// Hands a memory/queue input to songbird (or, detached, to the parking lot) and binds the
+    /// handle.
+    fn start_track(
+        &self,
+        track: &TrackRef,
+        input: songbird::input::Input,
+        opts: PlayOpts,
+    ) -> Result<(), CoreError> {
+        #[cfg(feature = "test-hooks")]
+        if self.detached {
+            let ctl = self.park(track, input, None);
+            if opts.paused {
+                ctl.pause();
+            }
+            return Ok(());
+        }
+        let t = songbird::tracks::Track::new(input)
+            .volume(opts.volume)
+            .loops(loop_state(opts.loops)?);
+        let t = if opts.paused { t.pause() } else { t };
+        let Some(handle) = self.with_driver(|d| d.play(t)) else {
+            return Err(self.closed_err());
+        };
+        self.tracks.bind(track, handle);
+        Ok(())
+    }
+
+    /// The queue's current entry becomes a songbird track (`TrackQueue::advance`).
+    pub(crate) fn start_queue_entry(
+        &self,
+        src: &SourceSpec,
+        opts: PlayOpts,
+        track: &TrackRef,
+        done: crate::tracks::DoneGuard,
+    ) -> Result<Option<Arc<EncodedShared>>, CoreError> {
+        self.ensure_open()?;
+        let (input, stream) = src.to_input(done, &self.wake)?;
+        if let Some(s) = &stream {
+            let weak: Weak<dyn LiveSource> = Arc::downgrade(s) as Weak<dyn LiveSource>;
+            self.add_source(weak);
+        }
+        self.start_track(track, input, opts)?;
+        Ok(stream)
+    }
+
+    /// Hands a live input to songbird **paused** (§4.9) and returns its track control.
+    fn start_live(
+        &self,
+        track: &TrackRef,
+        input: songbird::input::Input,
+        #[allow(unused_variables)] source_id: Option<u32>,
+    ) -> Result<Box<dyn TrackControl>, CoreError> {
+        #[cfg(feature = "test-hooks")]
+        if self.detached {
+            return Ok(self.park(track, input, source_id));
+        }
+        let t = songbird::tracks::Track::new(input).pause();
+        let Some(handle) = self.with_driver(|d| d.play(t)) else {
+            return Err(self.closed_err());
+        };
+        self.tracks.bind(track, handle.clone());
+        Ok(Box::new(handle))
+    }
+
+    /// Runs `f` on the Driver under L1 (O(1) flume sends only); `None` without a Driver (torn down
+    /// or detached). Nothing else is called under L1.
+    fn with_driver<R>(&self, f: impl FnOnce(&mut OwnedDriver) -> R) -> Option<R> {
+        let mut g = lock_checked(&self.driver);
+        g.as_mut().map(f)
+    }
+
+    /// One of `MAX_LIVE_SOURCES_PER_CONN` (dead sources are pruned); hold the reservation until
+    /// `add_source` has registered the source.
+    fn reserve_live(&self) -> Result<Reservation<'_>, CoreError> {
+        self.live_adm
+            .reserve("live_sources", MAX_LIVE_SOURCES_PER_CONN, || {
+                let mut v = lock_checked(&self.sources);
+                v.retain(|w| w.strong_count() > 0);
+                v.len()
+            })
+    }
+
+    /// One of `MAX_PLAYING_TRACKS_PER_CONN` (`play()` tracks plus the current queue entry); hold
+    /// the reservation until the track is started (`TrackRegistry::playing` counts it).
+    pub(crate) fn reserve_playing(&self) -> Result<Reservation<'_>, CoreError> {
+        self.playing_adm
+            .reserve("playing_tracks", MAX_PLAYING_TRACKS_PER_CONN, || {
+                self.tracks.playing()
+            })
+    }
+
+    /// Registers a live source for T5 and the housekeeper.
+    fn add_source(&self, s: Weak<dyn LiveSource>) {
+        {
+            let mut v = lock_checked(&self.sources);
+            v.retain(|w| w.strong_count() > 0);
+            v.push(s.clone());
+        }
+        if self.is_closed() {
+            // T5 may already have run.
+            if let Some(src) = s.upgrade() {
+                src.close(CloseMode::Abort);
+            }
+            return;
+        }
+        self.worker.push(WorkerCmd::AddSource(s));
+    }
+
+    fn ensure_open(&self) -> Result<(), CoreError> {
+        if self.is_closed() {
+            Err(self.closed_err())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `ConnectionClosed(reason)` with the connection's close reason.
+    fn closed_err(&self) -> CoreError {
+        CoreError::ConnectionClosed(
+            self.status()
+                .close_reason
+                .unwrap_or(CloseReason::ConnectionClosed),
+        )
+    }
+
+    /// Whether this is a detached test connection (no songbird Driver).
+    pub fn is_detached(&self) -> bool {
+        self.detached
+    }
+
+    pub fn guild_id(&self) -> NonZeroU64 {
+        self.guild_id
+    }
+
+    pub fn user_id(&self) -> NonZeroU64 {
+        self.user_id
     }
 }
+
+/// Clears the executor flag when dropped, including on unwind (§4.6).
+struct Executing<'a>(&'a AtomicBool);
+
+impl Drop for Executing<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for ConnShared {
+    fn drop(&mut self) {
+        if runtime::in_foreign_process(self.pid) {
+            // §4.10: a forked child never touches the inherited Driver. Dropping it would send
+            // `Poison` through channels and wake a runtime whose locks a vanished parent thread may
+            // hold; `close()` skipped T2–T9 for the same reason. Leak it.
+            self.closing.store(true, Ordering::Release);
+            if let Some(d) = self.driver.get_mut().take() {
+                leak_driver(d);
+            }
+            return;
+        }
+        // Normally already closed by `native.Connection`'s Drop; idempotent.
+        self.close(CloseReason::Dropped);
+    }
+}
+
+/// §4.10: the inherited Driver of a forked child is leaked, never dropped.
+#[cfg(not(test))]
+fn leak_driver(d: OwnedDriver) {
+    std::mem::forget(d);
+}
+
+/// Unit tests run in the creating process: the "leaked" Driver is kept here so the test can
+/// assert the leak and then tear it down.
+#[cfg(test)]
+pub(crate) static LEAKED_DRIVERS: Mutex<Vec<OwnedDriver>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn leak_driver(d: OwnedDriver) {
+    LEAKED_DRIVERS.lock().push(d);
+}
+
+/// A short name of an input for logs (never its payload: tokens and session ids are secrets).
+fn input_kind(i: &GwInput) -> &'static str {
+    match i {
+        GwInput::Join { .. } => "Join",
+        GwInput::Move { .. } => "Move",
+        GwInput::BeginRejoin => "BeginRejoin",
+        GwInput::Leave => "Leave",
+        GwInput::SetFlags { .. } => "SetFlags",
+        GwInput::VoiceState { .. } => "VoiceState",
+        GwInput::VoiceServer { .. } => "VoiceServer",
+        GwInput::ConnectResult { .. } => "ConnectResult",
+        GwInput::DriverConnect { .. } => "DriverConnect",
+        GwInput::DriverReconnect { .. } => "DriverReconnect",
+        GwInput::DriverDisconnect { .. } => "DriverDisconnect",
+        GwInput::RxStalled { .. } => "RxStalled",
+        GwInput::HandlersLost => "HandlersLost",
+        GwInput::Deadline => "Deadline",
+        GwInput::Close(_) => "Close",
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -11,8 +11,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use sbcore::conn::ConnShared;
 use sbcore::conn::ops::TrackInfoData;
 use sbcore::limits::{VOLUME, check};
-use sbcore::tracks::flags::set_track_loops;
-use sbcore::tracks::{ControlError, PendingChange, TrackHandle, TrackRef};
+use sbcore::tracks::{PendingChange, TrackRef};
 use sbcore::{CloseReason, CoreError};
 
 use crate::convert::int_arg;
@@ -49,36 +48,46 @@ impl NativeTrack {
     }
 
     fn is_pending(&self) -> bool {
-        self.track.handle.get().is_none() && self.track.flags.ended().is_none()
+        !self.track.is_started() && self.track.flags.ended().is_none()
     }
 
-    /// Applies `op` to songbird's handle, or `change` to a pending queue entry.
-    fn control(
-        &self,
-        py: Python<'_>,
-        change: PendingChange,
-        op: impl FnOnce(&TrackHandle) -> Result<(), CoreError>,
-    ) -> PyResult<()> {
-        ensure_not_forked(py)?;
-        if let Some(h) = self.track.handle.get() {
-            return op(h).py(py);
-        }
-        let conn = self.conn.upgrade().ok_or_else(|| {
+    fn conn(&self, py: Python<'_>) -> PyResult<Arc<ConnShared>> {
+        self.conn.upgrade().ok_or_else(|| {
             core_err(
                 py,
                 CoreError::ConnectionClosed(CloseReason::ConnectionClosed),
             )
-        })?;
-        if conn.queue().update_pending(&self.track, change).py(py)? {
-            Ok(())
-        } else {
-            Err(core_err(py, CoreError::Track("track has ended".into())))
-        }
+        })
     }
-}
 
-fn track_err(e: ControlError) -> CoreError {
-    CoreError::Track(e.to_string().into())
+    /// Applies `op` to the started track, or `change` to a pending queue entry. An entry that
+    /// starts between the two checks gets `op`.
+    fn control(
+        &self,
+        py: Python<'_>,
+        change: PendingChange,
+        op: impl Fn(&TrackRef) -> Result<(), CoreError>,
+    ) -> PyResult<()> {
+        ensure_not_forked(py)?;
+        if self.track.is_started() {
+            return op(&self.track).py(py);
+        }
+        if self.track.flags.ended().is_some() {
+            return Err(core_err(py, CoreError::Track("track has ended".into())));
+        }
+        if self
+            .conn(py)?
+            .queue()
+            .update_pending(&self.track, change)
+            .py(py)?
+        {
+            return Ok(());
+        }
+        if self.track.is_started() {
+            return op(&self.track).py(py);
+        }
+        Err(core_err(py, CoreError::Track("track has ended".into())))
+    }
 }
 
 #[gen_stub_pymethods]
@@ -127,25 +136,28 @@ impl NativeTrack {
     }
 
     fn pause(&self, py: Python<'_>) -> PyResult<()> {
-        self.control(py, PendingChange::Paused(true), |h| {
-            h.pause().map_err(track_err)
-        })
+        self.control(py, PendingChange::Paused(true), TrackRef::pause)
     }
 
     fn resume(&self, py: Python<'_>) -> PyResult<()> {
-        self.control(py, PendingChange::Paused(false), |h| {
-            h.play().map_err(track_err)
-        })
+        self.control(py, PendingChange::Paused(false), TrackRef::resume)
     }
 
     /// Stops the track; a pending entry is removed with reason ``"stopped"``.
     fn stop(&self, py: Python<'_>) -> PyResult<()> {
         ensure_not_forked(py)?;
-        if let Some(h) = self.track.handle.get() {
-            return h.stop().map_err(track_err).py(py);
+        if self.track.flags.ended().is_some() {
+            return Ok(());
         }
-        if let Some(conn) = self.conn.upgrade() {
-            conn.queue().remove(&self.track);
+        if !self.track.is_started()
+            && let Some(conn) = self.conn.upgrade()
+            && conn.queue().remove(&self.track)
+        {
+            return Ok(());
+        }
+        if self.track.is_started() {
+            // songbird reports `Finished` for a track that already ended: not an error here.
+            let _ = self.track.stop();
         }
         Ok(())
     }
@@ -153,9 +165,7 @@ impl NativeTrack {
     /// ``0.0..=4.0``. File tracks: applied by songbird's live mixer.
     fn set_volume(&self, py: Python<'_>, volume: f32) -> PyResult<()> {
         let volume = check("volume", volume, VOLUME).py(py)?;
-        self.control(py, PendingChange::Volume(volume), |h| {
-            h.set_volume(volume).map_err(track_err)
-        })
+        self.control(py, PendingChange::Volume(volume), |t| t.set_volume(volume))
     }
 
     /// ``None`` loops forever. ``TrackError`` for live sources.
@@ -170,9 +180,7 @@ impl NativeTrack {
             Some(n) => Some(int_arg(py, "loops", n, 0..=u32::MAX - 1)?),
             None => None,
         };
-        self.control(py, PendingChange::Loops(loops), |h| {
-            set_track_loops(h, loops)
-        })
+        self.control(py, PendingChange::Loops(loops), |t| t.set_loops(loops))
     }
 
     fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {

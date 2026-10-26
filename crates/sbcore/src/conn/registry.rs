@@ -1,6 +1,5 @@
 //! The process-wide registry of live connections (W2, §4.10): `_shutdown_all()` at `atexit` closes
 //! every connection with `ProcessExit`. Holds only `Weak` references; nothing runs under the lock.
-#![allow(dead_code)] // phase-0 skeleton
 
 use std::sync::{Arc, Weak};
 

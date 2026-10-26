@@ -2,12 +2,24 @@
 //!
 //! `ConnShared::apply` runs [`GatewayState::step`] under L2, enqueues the resulting actions in step
 //! order (L2 → L2q) and executes them after unlocking (§4.6).
-#![allow(dead_code, unused_variables)] // phase-0 skeleton
+//!
+//! Deviations from the letter of the §4.5 table (see `docs/deviations/W2.md`):
+//! * every transition into `Closed(r)` yields exactly `[Teardown(r)]`; the `Emit(Disconnected
+//!   {will_retry: false})` and `Control(Closed)` of the table are performed by teardown T6/T8, so the
+//!   final event is emitted once and is always last;
+//! * a step that changes the public `state` string appends `NotifyStatus` (unless it closes);
+//! * `Connected` → `AwaitingRejoin` on a driver disconnect also emits `RxLink{up: false}` and
+//!   `Disconnected{will_retry: true}` (like the 4014 row);
+//! * `AwaitingMove` stores a `VoiceServer` that arrives before the move's `VoiceState`;
+//! * `AwaitingMove` + `VoiceState(None)` closes with `Requested` after `request_leave()`;
+//! * `rejoin_attempts = 0` disables gateway rejoins everywhere (a rejoin is scheduled only while
+//!   `attempt + 1 ≤ rejoin_attempts`).
 
 use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
 use smallvec::SmallVec;
+use songbird::id::{ChannelId, GuildId, UserId};
 
 use crate::ctrl::Control;
 use crate::error::CloseReason;
@@ -40,6 +52,11 @@ impl Phase {
             Phase::Closed(_) => "closed",
         }
     }
+
+    /// Every phase except `Idle` and `Closed`.
+    pub fn is_open(&self) -> bool {
+        !matches!(self, Phase::Idle | Phase::Closed(_))
+    }
 }
 
 /// songbird `DisconnectKind`, mirrored so the state machine stays testable without songbird events.
@@ -61,6 +78,57 @@ pub enum DiscReason {
     Requested,
     WsClosed(Option<u16>),
     Other,
+}
+
+impl DiscReason {
+    /// The `VoiceEvent.Disconnected.reason` string.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DiscReason::AttemptDiscarded => "attempt_discarded",
+            DiscReason::Internal => "internal",
+            DiscReason::Io => "io",
+            DiscReason::ProtocolViolation => "protocol_violation",
+            DiscReason::TimedOut => "timed_out",
+            DiscReason::Requested => "requested",
+            DiscReason::WsClosed(_) => "ws_closed",
+            DiscReason::Other => "other",
+        }
+    }
+
+    /// The voice close code, if any.
+    pub const fn code(self) -> Option<u16> {
+        match self {
+            DiscReason::WsClosed(c) => c,
+            _ => None,
+        }
+    }
+
+    /// Maps songbird's reason (the close code is the enum discriminant).
+    pub fn from_songbird(r: songbird::events::context_data::DisconnectReason) -> Self {
+        use songbird::events::context_data::DisconnectReason as R;
+        match r {
+            R::AttemptDiscarded => DiscReason::AttemptDiscarded,
+            R::Internal => DiscReason::Internal,
+            R::Io => DiscReason::Io,
+            R::ProtocolViolation => DiscReason::ProtocolViolation,
+            R::TimedOut => DiscReason::TimedOut,
+            R::Requested => DiscReason::Requested,
+            R::WsClosed(code) => DiscReason::WsClosed(code.map(|c| c as u16)),
+            _ => DiscReason::Other,
+        }
+    }
+}
+
+impl DiscKind {
+    /// Maps songbird's kind.
+    pub fn from_songbird(k: songbird::events::context_data::DisconnectKind) -> Self {
+        use songbird::events::context_data::DisconnectKind as K;
+        match k {
+            K::Connect => DiscKind::Connect,
+            K::Reconnect => DiscKind::Reconnect,
+            _ => DiscKind::Runtime,
+        }
+    }
 }
 
 /// Why a `Connect` future failed.
@@ -126,6 +194,7 @@ pub enum GwAction {
         generation: u64,
     },
     SetSendMute(bool),
+    /// `Connected.timeline_ms` is filled in by the executor (the state machine has no timeline).
     Emit(EventData),
     Control(Control),
     RxLink {
@@ -197,14 +266,24 @@ pub struct StatusSnapshot {
 }
 
 /// The voice server half of the connection info.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct ServerInfo {
     token: Box<str>,
     endpoint: Box<str>,
 }
 
+/// Secrets (§6.3): `GatewayState` is `Debug`, so the token must never be printed.
+impl std::fmt::Debug for ServerInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerInfo")
+            .field("token", &"<redacted>")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
 /// The state machine. Pure: `step` performs no I/O and never blocks.
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct GatewayState {
     p: GatewayParams,
     phase: Phase,
@@ -212,6 +291,8 @@ pub struct GatewayState {
     target: Option<NonZeroU64>,
     /// Channel of the current media connection.
     channel: Option<u64>,
+    /// Channel of the in-flight `Connect` (Connecting).
+    connect_target: Option<NonZeroU64>,
     session: Option<Box<str>>,
     server: Option<ServerInfo>,
     /// The last complete server info (3 s move fallback, §4.5).
@@ -222,10 +303,42 @@ pub struct GatewayState {
     attempt: u8,
     leave_requested: bool,
     ssrc: Option<u32>,
-    /// Armed timer (move fallback, move grace, rejoin due/deadline).
-    deadline: Option<Instant>,
+    /// Joining after a move: when the 3 s server fallback fires.
+    fallback: Option<Instant>,
     last_reinstall: Option<Instant>,
+    /// When the media link was last reported down (`Reconnected.gap_ms`).
+    link_down_at: Option<Instant>,
+    close_code: Option<u16>,
+    /// (phase, input) pairs that matched no row (§4.5 default rule).
+    unlisted: u64,
     action_seq: u64,
+}
+
+/// Secrets (§6.3): the token is never printed and the session id only as a length.
+impl std::fmt::Debug for GatewayState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayState")
+            .field("phase", &self.phase)
+            .field("target", &self.target)
+            .field("channel", &self.channel)
+            .field("connect_target", &self.connect_target)
+            .field("session_len", &self.session.as_ref().map(|s| s.len()))
+            .field("server", &self.server)
+            .field("prev_server", &self.prev_server)
+            .field("generation", &self.generation)
+            .field("attempt", &self.attempt)
+            .field("leave_requested", &self.leave_requested)
+            .field("ssrc", &self.ssrc)
+            .finish_non_exhaustive()
+    }
+}
+
+/// SplitMix64 (deterministic jitter; the state machine stays pure).
+fn mix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 impl GatewayState {
@@ -235,6 +348,7 @@ impl GatewayState {
             phase: Phase::Idle,
             target: None,
             channel: None,
+            connect_target: None,
             session: None,
             server: None,
             prev_server: None,
@@ -244,27 +358,729 @@ impl GatewayState {
             attempt: 0,
             leave_requested: false,
             ssrc: None,
-            deadline: None,
+            fallback: None,
             last_reinstall: None,
+            link_down_at: None,
+            close_code: None,
+            unlisted: 0,
             action_seq: 0,
         }
     }
 
+    /// The current phase.
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// Number of inputs that matched no row (`stats()["gw_unlisted_inputs"]`).
+    pub fn unlisted_inputs(&self) -> u64 {
+        self.unlisted
+    }
+
     /// One transition (§4.5 table). Pure: appends actions to `out`, performs no I/O.
     pub fn step(&mut self, input: GwInput, now: Instant, out: &mut SmallVec<[GwAction; 4]>) {
-        // phase 0: every (phase, input) pair is a no-op.
+        if matches!(self.phase, Phase::Closed(_)) {
+            return; // "Closed | anything | no-op"
+        }
+        let before = self.phase.state_name();
+        let start = out.len();
+        let listed = match input {
+            GwInput::Join {
+                channel,
+                self_mute,
+                self_deaf,
+            } => self.on_join(channel, self_mute, self_deaf, out),
+            GwInput::Move { channel } => self.on_move(channel, now, out),
+            GwInput::BeginRejoin => self.on_begin_rejoin(now),
+            GwInput::Leave => {
+                self.leave_requested = true;
+                true
+            }
+            GwInput::SetFlags {
+                self_mute,
+                self_deaf,
+            } => {
+                if self.phase.is_open() {
+                    self.self_mute = self_mute;
+                    self.self_deaf = self_deaf;
+                    out.push(GwAction::SetSendMute(self_mute));
+                    true
+                } else {
+                    false
+                }
+            }
+            GwInput::VoiceState {
+                session_id,
+                channel,
+            } => match channel.and_then(NonZeroU64::new) {
+                None if channel.is_none() => self.on_voice_state_none(out),
+                None => false, // channel 0: not a real channel id
+                Some(c) => self.on_voice_state(session_id, c, now, out),
+            },
+            GwInput::VoiceServer { token, endpoint } => {
+                let ep = endpoint.as_deref().and_then(normalize_endpoint);
+                match ep {
+                    None => self.on_voice_server_none(now, out),
+                    Some(ep) => self.on_voice_server(
+                        ServerInfo {
+                            token,
+                            endpoint: ep.into_boxed_str(),
+                        },
+                        out,
+                    ),
+                }
+            }
+            GwInput::ConnectResult { generation, result } => {
+                self.on_connect_result(generation, result, now, out)
+            }
+            GwInput::DriverConnect { ssrc } => self.on_driver_connect(ssrc, false, now, out),
+            GwInput::DriverReconnect { ssrc } => self.on_driver_connect(ssrc, true, now, out),
+            GwInput::DriverDisconnect { kind, reason } => {
+                self.on_driver_disconnect(kind, reason, now, out)
+            }
+            GwInput::RxStalled { since } => self.on_rx_stalled(since, now, out),
+            GwInput::HandlersLost => {
+                if self.phase.is_open() {
+                    self.reinstall(now, out);
+                    true
+                } else {
+                    false
+                }
+            }
+            GwInput::Deadline => self.on_deadline(now, out),
+            GwInput::Close(r) => {
+                self.close_to(r, None, out);
+                true
+            }
+        };
+        if !listed {
+            debug_assert_eq!(out.len(), start, "an unlisted pair produced actions");
+            self.unlisted = self.unlisted.saturating_add(1);
+            return;
+        }
+        let after = self.phase.state_name();
+        if before != after
+            && !matches!(self.phase, Phase::Closed(_))
+            && !out
+                .get(start..)
+                .is_some_and(|s| s.iter().any(|a| matches!(a, GwAction::NotifyStatus)))
+        {
+            out.push(GwAction::NotifyStatus);
+        }
+    }
+
+    // ── per-input handlers (return whether the (phase, input) pair is listed) ────────────────────
+
+    fn on_join(
+        &mut self,
+        channel: NonZeroU64,
+        self_mute: bool,
+        self_deaf: bool,
+        out: &mut SmallVec<[GwAction; 4]>,
+    ) -> bool {
+        if self.phase != Phase::Idle {
+            return false;
+        }
+        self.phase = Phase::Joining;
+        self.target = Some(channel);
+        self.self_mute = self_mute;
+        self.self_deaf = self_deaf;
+        // No Rust deadline: the Python `connect(timeout=)` governs.
+        out.push(GwAction::SetSendMute(self_mute));
+        true
+    }
+
+    fn on_move(
+        &mut self,
+        channel: NonZeroU64,
+        now: Instant,
+        out: &mut SmallVec<[GwAction; 4]>,
+    ) -> bool {
+        match self.phase {
+            Phase::Connected => {
+                self.stash_server();
+                self.link_down(now, out);
+                self.enter_joining(channel, now);
+                true
+            }
+            Phase::Joining | Phase::Connecting { .. } => {
+                // The newer move supersedes the pending one; a result of the abandoned attempt is
+                // stale (the next Connect bumps the generation).
+                self.stash_server();
+                self.enter_joining(channel, now);
+                true
+            }
+            Phase::AwaitingMove { .. } | Phase::AwaitingRejoin { .. } | Phase::Rejoining { .. } => {
+                self.target = Some(channel);
+                true
+            }
+            Phase::Idle | Phase::Closed(_) => false,
+        }
+    }
+
+    fn on_begin_rejoin(&mut self, now: Instant) -> bool {
+        if !self.phase.is_open() {
+            return false;
+        }
+        self.enter_rejoining(0, now);
+        true
+    }
+
+    fn on_voice_state_none(&mut self, out: &mut SmallVec<[GwAction; 4]>) -> bool {
+        match self.phase {
+            // Expected from the leave half of the rejoin.
+            Phase::Rejoining { .. } => true,
+            Phase::AwaitingMove { .. } => {
+                let r = if self.leave_requested {
+                    CloseReason::Requested
+                } else {
+                    CloseReason::Kicked
+                };
+                self.close_to(r, None, out);
+                true
+            }
+            Phase::Joining
+            | Phase::Connecting { .. }
+            | Phase::Connected
+            | Phase::AwaitingRejoin { .. } => {
+                let r = if self.leave_requested {
+                    CloseReason::Requested
+                } else {
+                    CloseReason::LeftChannel
+                };
+                self.close_to(r, None, out);
+                true
+            }
+            Phase::Idle | Phase::Closed(_) => false,
+        }
+    }
+
+    fn on_voice_state(
+        &mut self,
+        session: Box<str>,
+        c: NonZeroU64,
+        now: Instant,
+        out: &mut SmallVec<[GwAction; 4]>,
+    ) -> bool {
+        match self.phase {
+            Phase::Joining | Phase::Rejoining { .. } => {
+                self.session = Some(session);
+                if self.target != Some(c) {
+                    self.target = Some(c);
+                    // Joining: a server update from before the move is not reused (§4.5). In
+                    // Rejoining every server was received after the leave, so it stays valid.
+                    if self.phase == Phase::Joining {
+                        self.stash_server();
+                    }
+                    out.push(GwAction::Control(Control::ChannelMoved {
+                        channel_id: c.get(),
+                    }));
+                }
+                self.maybe_connect(out);
+                true
+            }
+            Phase::Connecting { .. } | Phase::Connected => {
+                let current = if self.phase == Phase::Connected {
+                    self.channel.and_then(NonZeroU64::new)
+                } else {
+                    self.connect_target
+                };
+                if current != Some(c) {
+                    self.session = Some(session);
+                    self.moved_away(c, now, out);
+                } else if self.session.as_deref() != Some(&*session) {
+                    // Mirrors songbird `info.rs:59-97`: a new session on the same channel.
+                    self.session = Some(session);
+                    self.begin_connect(out);
+                }
+                // Equal session: that update was just a mute/deaf flag change.
+                true
+            }
+            Phase::AwaitingMove { .. } => {
+                let session_changed = self.session.as_deref() != Some(&*session);
+                self.session = Some(session);
+                if self.channel != Some(c.get()) {
+                    // A move: a fresh server (received while awaiting) connects at once;
+                    // otherwise wait for one, with the 3 s fallback to the previous server.
+                    self.phase = Phase::Joining;
+                    self.target = Some(c);
+                    out.push(GwAction::Control(Control::ChannelMoved {
+                        channel_id: c.get(),
+                    }));
+                    if !self.maybe_connect(out) {
+                        self.arm_fallback(now);
+                    }
+                } else if session_changed {
+                    self.target = Some(c);
+                    if self.server.is_none() {
+                        self.server = self.prev_server.clone();
+                    }
+                    self.begin_connect(out);
+                }
+                true
+            }
+            Phase::AwaitingRejoin { .. } | Phase::Idle | Phase::Closed(_) => false,
+        }
+    }
+
+    fn on_voice_server_none(&mut self, now: Instant, out: &mut SmallVec<[GwAction; 4]>) -> bool {
+        if !self.phase.is_open() {
+            return false;
+        }
+        // Discord sends a new update once it reallocates the server; the move fallback (reusing
+        // the previous server) no longer applies.
+        self.server = None;
+        self.fallback = None;
+        if matches!(self.phase, Phase::Connected | Phase::Connecting { .. }) {
+            if self.phase == Phase::Connected
+                && let Some(ch) = self.channel.and_then(NonZeroU64::new)
+            {
+                self.target = Some(ch);
+            } else if let Some(ct) = self.connect_target {
+                self.target = Some(ct);
+            }
+            self.phase = Phase::Joining;
+            self.fallback = None;
+            self.link_down(now, out);
+        }
+        true
+    }
+
+    fn on_voice_server(&mut self, srv: ServerInfo, out: &mut SmallVec<[GwAction; 4]>) -> bool {
+        match self.phase {
+            Phase::Joining | Phase::Rejoining { .. } => {
+                // In Rejoining every server is fresh: entering it cleared `server` (§4.5).
+                self.server = Some(srv);
+                self.fallback = None;
+                self.maybe_connect(out);
+                true
+            }
+            Phase::Connecting { .. } | Phase::Connected => {
+                if self.server.as_ref() == Some(&srv) {
+                    return false; // unchanged: not a listed row
+                }
+                self.server = Some(srv);
+                if let Some(ch) = self.current_channel() {
+                    self.target = Some(ch);
+                }
+                self.begin_connect(out);
+                true
+            }
+            Phase::AwaitingMove { .. } => {
+                // Stored for the move that the next VoiceState announces (no actions).
+                self.server = Some(srv);
+                true
+            }
+            Phase::AwaitingRejoin { .. } | Phase::Idle | Phase::Closed(_) => false,
+        }
+    }
+
+    fn on_connect_result(
+        &mut self,
+        g: u64,
+        result: Result<(), ConnectFailure>,
+        now: Instant,
+        out: &mut SmallVec<[GwAction; 4]>,
+    ) -> bool {
+        let Phase::Connecting { generation } = self.phase else {
+            return false;
+        };
+        if g != generation {
+            return true; // superseded
+        }
+        match result {
+            Err(ConnectFailure::AttemptDiscarded) => {}
+            Ok(()) => {
+                self.phase = Phase::Connected;
+                self.channel = self.connect_target.map(NonZeroU64::get);
+                self.target = self.connect_target;
+                self.attempt = 0;
+                self.fallback = None;
+                let channel_id = self.channel.unwrap_or(0);
+                out.push(GwAction::Emit(EventData::Connected {
+                    channel_id,
+                    ssrc: self.ssrc.unwrap_or(0),
+                    timeline_ms: 0,
+                }));
+                self.link_down_at = None;
+                out.push(GwAction::RxLink {
+                    up: true,
+                    ssrc: self.ssrc,
+                });
+                out.push(GwAction::NotifyStatus);
+            }
+            Err(_) => {
+                let next = self.attempt.saturating_add(1);
+                let due = now.checked_add(self.backoff(next)).unwrap_or(now);
+                if !self.schedule_rejoin(next, due) {
+                    self.close_to(CloseReason::ConnectFailed, None, out);
+                }
+            }
+        }
+        true
+    }
+
+    fn on_driver_connect(
+        &mut self,
+        ssrc: u32,
+        reconnect: bool,
+        now: Instant,
+        out: &mut SmallVec<[GwAction; 4]>,
+    ) -> bool {
+        if !self.phase.is_open() {
+            return false;
+        }
+        self.ssrc = Some(ssrc);
+        if self.phase == Phase::Connected {
+            let gap_ms = self
+                .link_down_at
+                .take()
+                .map_or(0, |t| now.saturating_duration_since(t).as_millis() as u64);
+            if reconnect {
+                out.push(GwAction::Emit(EventData::Reconnected {
+                    channel_id: self.channel.unwrap_or(0),
+                    ssrc,
+                    gap_ms,
+                }));
+            }
+            out.push(GwAction::RxLink {
+                up: true,
+                ssrc: Some(ssrc),
+            });
+        }
+        // Other phases: the event comes from an attempt that is being replaced, or Connecting
+        // reaches Connected only through its own ConnectResult.
+        true
+    }
+
+    fn on_driver_disconnect(
+        &mut self,
+        kind: DiscKind,
+        reason: Option<DiscReason>,
+        now: Instant,
+        out: &mut SmallVec<[GwAction; 4]>,
+    ) -> bool {
+        if !self.phase.is_open() {
+            return false;
+        }
+        let reason = match reason {
+            // Our own `leave()` (and songbird's "requested in some way").
+            None | Some(DiscReason::Requested) => return true,
+            Some(r) => r,
+        };
+        match self.phase {
+            Phase::AwaitingMove { .. } => true, // already waiting for the gateway
+            Phase::Connecting { .. } if kind == DiscKind::Connect => true, // ConnectResult carries it
+            Phase::Connected => match kind {
+                DiscKind::Connect => false,
+                DiscKind::Runtime => {
+                    match reason.code() {
+                        Some(4014) => {
+                            // Moved, kicked or channel deleted: the gateway update decides.
+                            let deadline = now.checked_add(self.p.move_grace).unwrap_or(now);
+                            self.phase = Phase::AwaitingMove { deadline };
+                            self.stash_server();
+                            self.link_down(now, out);
+                            out.push(GwAction::Emit(EventData::Disconnected {
+                                reason: reason.as_str(),
+                                code: Some(4014),
+                                will_retry: true,
+                            }));
+                        }
+                        Some(code @ (4016 | 4017)) => {
+                            // A rejoin cannot fix a protocol mismatch.
+                            self.close_to(CloseReason::SessionInvalid(Some(code)), Some(code), out);
+                        }
+                        _ => self.rejoin_or_lost(reason, now, out),
+                    }
+                    true
+                }
+                DiscKind::Reconnect => {
+                    self.rejoin_or_lost(reason, now, out);
+                    true
+                }
+            },
+            Phase::Joining
+            | Phase::Connecting { .. }
+            | Phase::AwaitingRejoin { .. }
+            | Phase::Rejoining { .. } => {
+                if kind == DiscKind::Connect {
+                    return false;
+                }
+                // Typically the old voice WS closing (4014) during a move or rejoin: no phase
+                // change; the pending gateway update or attempt decides what happens next.
+                self.link_down(now, out);
+                out.push(GwAction::Emit(EventData::Disconnected {
+                    reason: reason.as_str(),
+                    code: reason.code(),
+                    will_retry: true,
+                }));
+                true
+            }
+            Phase::Idle | Phase::Closed(_) => false,
+        }
+    }
+
+    fn on_rx_stalled(
+        &mut self,
+        since: Instant,
+        now: Instant,
+        out: &mut SmallVec<[GwAction; 4]>,
+    ) -> bool {
+        if self.phase != Phase::Connected {
+            return false;
+        }
+        self.reinstall(now, out);
+        if now.saturating_duration_since(since) >= self.p.stall_recover && self.p.auto_recover {
+            // The documented DAVE #310 / UDP-rx #315 recovery.
+            self.schedule_rejoin(1, now);
+        }
+        true
+    }
+
+    fn on_deadline(&mut self, now: Instant, out: &mut SmallVec<[GwAction; 4]>) -> bool {
+        match self.phase {
+            Phase::Joining => match self.fallback {
+                Some(at) if now >= at => {
+                    // Reuse the previous endpoint/token with the new channel id (DAVE needs it).
+                    self.fallback = None;
+                    if self.session.is_some()
+                        && let Some(ps) = self.prev_server.clone()
+                    {
+                        self.server = Some(ps);
+                        self.begin_connect(out);
+                    }
+                    true
+                }
+                _ => false,
+            },
+            Phase::AwaitingMove { deadline } if now >= deadline => {
+                // No state update within the grace period: assume the gateway session dropped.
+                if !self.schedule_rejoin(1, now) {
+                    self.close_to(CloseReason::Lost, Some(4014), out);
+                }
+                true
+            }
+            Phase::AwaitingRejoin { attempt, due } if now >= due => {
+                self.enter_rejoining(attempt, now);
+                let channel_id = self
+                    .target
+                    .map(NonZeroU64::get)
+                    .or(self.channel)
+                    .unwrap_or(0);
+                out.push(GwAction::Control(Control::Rejoin {
+                    attempt: u32::from(attempt),
+                    channel_id,
+                }));
+                true
+            }
+            Phase::Rejoining { attempt, deadline } if now >= deadline => {
+                let next = attempt.saturating_add(1);
+                let due = now.checked_add(self.backoff(next)).unwrap_or(now);
+                if !self.schedule_rejoin(next, due) {
+                    self.close_to(CloseReason::RejoinFailed, None, out);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────────────────────────
+
+    /// The channel of the current media connection (Connected) or of the in-flight attempt.
+    fn current_channel(&self) -> Option<NonZeroU64> {
+        match self.phase {
+            Phase::Connected => self.channel.and_then(NonZeroU64::new),
+            Phase::Connecting { .. } => self.connect_target,
+            _ => self.target,
+        }
+    }
+
+    /// Keeps the current server as the fallback for a move, and forgets it as the active one.
+    fn stash_server(&mut self) {
+        if let Some(s) = self.server.take() {
+            self.prev_server = Some(s);
+        }
+    }
+
+    fn arm_fallback(&mut self, now: Instant) {
+        self.fallback = self
+            .prev_server
+            .is_some()
+            .then(|| now.checked_add(self.p.server_fallback).unwrap_or(now));
+    }
+
+    fn enter_joining(&mut self, target: NonZeroU64, now: Instant) {
+        self.phase = Phase::Joining;
+        self.target = Some(target);
+        self.server = None;
+        self.arm_fallback(now);
+    }
+
+    /// External move away from the current channel (Connected/Connecting rows).
+    fn moved_away(&mut self, c: NonZeroU64, now: Instant, out: &mut SmallVec<[GwAction; 4]>) {
+        self.stash_server();
+        out.push(GwAction::Control(Control::ChannelMoved {
+            channel_id: c.get(),
+        }));
+        self.link_down(now, out);
+        self.enter_joining(c, now);
+    }
+
+    fn enter_rejoining(&mut self, attempt: u8, now: Instant) {
+        let deadline = now.checked_add(self.p.rejoin_timeout).unwrap_or(now);
+        self.phase = Phase::Rejoining { attempt, deadline };
+        self.attempt = attempt;
+        // The op 4 leave revokes the old token: a fresh VoiceServer is required, and the move
+        // fallback is never armed here.
+        self.server = None;
+        self.prev_server = None;
+        self.fallback = None;
+    }
+
+    /// `AwaitingRejoin{next, due}` iff `reconnect` and `next ≤ rejoin_attempts`.
+    fn schedule_rejoin(&mut self, next: u8, due: Instant) -> bool {
+        if !self.p.reconnect || next == 0 || next > self.p.rejoin_attempts {
+            return false;
+        }
+        self.phase = Phase::AwaitingRejoin { attempt: next, due };
+        self.attempt = next;
+        self.fallback = None;
+        true
+    }
+
+    /// Connected + a non-4014 disconnect: rejoin with backoff, or close as `Lost`.
+    fn rejoin_or_lost(
+        &mut self,
+        reason: DiscReason,
+        now: Instant,
+        out: &mut SmallVec<[GwAction; 4]>,
+    ) {
+        let next = self.attempt.saturating_add(1);
+        let due = now.checked_add(self.backoff(next)).unwrap_or(now);
+        if self.schedule_rejoin(next, due) {
+            self.link_down(now, out);
+            out.push(GwAction::Emit(EventData::Disconnected {
+                reason: reason.as_str(),
+                code: reason.code(),
+                will_retry: true,
+            }));
+        } else {
+            self.close_to(CloseReason::Lost, reason.code(), out);
+        }
+    }
+
+    /// Starts a connect if session, server and target are all known.
+    fn maybe_connect(&mut self, out: &mut SmallVec<[GwAction; 4]>) -> bool {
+        if self.session.is_some() && self.server.is_some() && self.target.is_some() {
+            self.begin_connect(out)
+        } else {
+            false
+        }
+    }
+
+    /// Connecting{gen+1} with a freshly built `ConnectionInfo` (the attempt counter is carried).
+    fn begin_connect(&mut self, out: &mut SmallVec<[GwAction; 4]>) -> bool {
+        let (Some(target), Some(session), Some(server)) =
+            (self.target, self.session.as_ref(), self.server.as_ref())
+        else {
+            return false;
+        };
+        let info = songbird::ConnectionInfo {
+            channel_id: ChannelId::from(target),
+            endpoint: server.endpoint.to_string(),
+            guild_id: GuildId::from(self.p.guild_id),
+            session_id: session.to_string(),
+            token: server.token.to_string(),
+            user_id: UserId::from(self.p.user_id),
+        };
+        self.generation = self.generation.wrapping_add(1);
+        self.phase = Phase::Connecting {
+            generation: self.generation,
+        };
+        self.connect_target = Some(target);
+        self.fallback = None;
+        // The new connection gets a new SSRC (DriverConnect reports it, in either order).
+        self.ssrc = None;
+        out.push(GwAction::Connect {
+            info,
+            generation: self.generation,
+        });
+        true
+    }
+
+    fn link_down(&mut self, now: Instant, out: &mut SmallVec<[GwAction; 4]>) {
+        if self.link_down_at.is_none() {
+            self.link_down_at = Some(now);
+        }
+        out.push(GwAction::RxLink {
+            up: false,
+            ssrc: None,
+        });
+    }
+
+    /// `ReinstallDispatch`, at most once per `reinstall_interval` (shared by HandlersLost and
+    /// RxStalled).
+    fn reinstall(&mut self, now: Instant, out: &mut SmallVec<[GwAction; 4]>) {
+        if self
+            .last_reinstall
+            .is_none_or(|t| now.saturating_duration_since(t) >= self.p.reinstall_interval)
+        {
+            self.last_reinstall = Some(now);
+            out.push(GwAction::ReinstallDispatch);
+        }
+    }
+
+    fn close_to(&mut self, r: CloseReason, code: Option<u16>, out: &mut SmallVec<[GwAction; 4]>) {
+        self.phase = Phase::Closed(r);
+        self.close_code = code.or(r.code());
+        self.fallback = None;
+        out.push(GwAction::Teardown(r));
+    }
+
+    /// Rejoin backoff: 1, 2, 4, 8, 16 s (attempt 1, 2, …) with ±20 % deterministic jitter.
+    pub fn backoff(&self, attempt: u8) -> Duration {
+        let exp = u32::from(attempt.saturating_sub(1).min(4));
+        let base_ms: u64 = 1_000u64 << exp;
+        let seed = self.p.guild_id.get()
+            ^ self.generation.rotate_left(17)
+            ^ u64::from(attempt).rotate_left(41);
+        // jitter ∈ [-200, 200] per mille.
+        let jitter = (mix64(seed) % 401) as i64 - 200;
+        let ms = (base_ms as i64).saturating_add(base_ms as i64 * jitter / 1_000);
+        Duration::from_millis(ms.max(0) as u64)
+    }
+
+    /// T1: sets `Closed(r)` unless already closed; returns the effective close reason.
+    pub(crate) fn force_close(&mut self, r: CloseReason) -> CloseReason {
+        match self.phase {
+            Phase::Closed(existing) => existing,
+            _ => {
+                self.phase = Phase::Closed(r);
+                self.close_code = r.code();
+                self.fallback = None;
+                r
+            }
+        }
     }
 
     /// The earliest armed deadline, if any.
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.deadline
+        match self.phase {
+            Phase::Joining => self.fallback,
+            Phase::AwaitingMove { deadline } => Some(deadline),
+            Phase::AwaitingRejoin { due, .. } => Some(due),
+            Phase::Rejoining { deadline, .. } => Some(deadline),
+            _ => None,
+        }
     }
 
     /// The current public status.
     pub fn status(&self) -> StatusSnapshot {
-        let (close_reason, close_code) = match self.phase {
-            Phase::Closed(r) => (Some(r), r.code()),
-            _ => (None, None),
+        let close_reason = match self.phase {
+            Phase::Closed(r) => Some(r),
+            _ => None,
         };
         StatusSnapshot {
             state: self.phase.state_name(),
@@ -276,7 +1092,11 @@ impl GatewayState {
             rejoin_attempt: self.attempt,
             generation: self.generation,
             close_reason,
-            close_code,
+            close_code: if close_reason.is_some() {
+                self.close_code
+            } else {
+                None
+            },
         }
     }
 
@@ -303,30 +1123,4 @@ pub fn normalize_endpoint(ep: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn endpoint_normalisation() {
-        assert_eq!(
-            normalize_endpoint("wss://c-ams.discord.media/").as_deref(),
-            Some("c-ams.discord.media")
-        );
-        assert_eq!(
-            normalize_endpoint("c-ams.discord.media:443").as_deref(),
-            Some("c-ams.discord.media:443")
-        );
-        assert_eq!(normalize_endpoint("wss:///"), None);
-        assert_eq!(normalize_endpoint(""), None);
-    }
-
-    #[test]
-    fn new_state_is_idle() {
-        let id = NonZeroU64::new(1).unwrap();
-        let g = GatewayState::new(GatewayParams::new(id, id, true, 3, true));
-        let s = g.status();
-        assert_eq!(s.state, "idle");
-        assert_eq!(s.generation, 0);
-        assert!(g.next_deadline().is_none());
-    }
-}
+mod tests;

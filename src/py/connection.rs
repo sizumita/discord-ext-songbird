@@ -31,7 +31,7 @@ use sbcore::tx::encoded::EncodedSpec;
 use sbcore::tx::opus_stream::OpusStreamSpec;
 use sbcore::tx::queue::{DisconnectPolicy, PlaybackSpec};
 use sbcore::tx::source::{EncodedFactory, SourceSpec};
-use sbcore::{CloseReason, clock::Clock};
+use sbcore::{CloseReason, CoreError, clock::Clock};
 
 use crate::convert::int_arg;
 use crate::errors::{CoreResultExt, core_err, ensure_not_forked};
@@ -192,7 +192,21 @@ impl PyVoiceSettings {
             bitrate: bitrate.and_then(|b| i32::try_from(b).ok()),
             softclip,
             driver_timeout_s,
-            driver_retries: int_arg(py, "driver_retries", driver_retries, DRIVER_RETRIES)?,
+            driver_retries: int_arg(py, "driver_retries", driver_retries, DRIVER_RETRIES)
+                .inspect_err(|e| {
+                    if driver_retries == 0 {
+                        // §4.8 / §13.5: the rejection of 0 explains why (a note keeps the
+                        // structured `what`/`value`/`minimum`/`maximum` fields intact).
+                        let _ = e.value(py).call_method1(
+                            "add_note",
+                            (
+                                "driver_retries=0 is not allowed: songbird cannot express \"no \
+                              retries\", and an unset retry limit means infinite retries. Use \
+                              reconnect=False for the minimum (one retry).",
+                            ),
+                        );
+                    }
+                })?,
             rejoin_attempts: int_arg(py, "rejoin_attempts", rejoin_attempts, REJOIN_ATTEMPTS)?,
             auto_recover,
         };
@@ -345,6 +359,23 @@ impl Connection {
     fn native_track(&self, track: TrackRef) -> NativeTrack {
         NativeTrack::new(track, self.weak())
     }
+
+    /// `TrackQueue::enqueue`, reporting the connection's own close reason (like every other
+    /// connection-level method) instead of the queue's generic one.
+    fn enqueue_spec(&self, spec: SourceSpec, opts: PlayOpts) -> Result<TrackRef, CoreError> {
+        self.shared
+            .queue()
+            .enqueue(spec, opts, self.shared.tracks())
+            .map_err(|e| match e {
+                CoreError::ConnectionClosed(_) => CoreError::ConnectionClosed(
+                    self.shared
+                        .status()
+                        .close_reason
+                        .unwrap_or(CloseReason::ConnectionClosed),
+                ),
+                e => e,
+            })
+    }
 }
 
 /// `(volume, loops, paused)` → `PlayOpts`.
@@ -470,11 +501,12 @@ impl Connection {
     // ── signalling ───────────────────────────────────────────────────────────────────────────────
 
     /// Ready wake ids (call after the doorbell socket became readable).
-    fn take_ready(&self, py: Python<'_>) -> PyResult<Vec<u8>> {
+    fn take_ready(&self, py: Python<'_>) -> PyResult<Vec<u16>> {
         ensure_not_forked(py)?;
         let mut out = Vec::new();
         self.shared.take_ready(&mut out);
-        Ok(out)
+        // `list[int]` (§12.6): pyo3 would turn a `Vec<u8>` into `bytes`.
+        Ok(out.into_iter().map(u16::from).collect())
     }
 
     /// Pending control slots, in the order of §6.4.
@@ -756,11 +788,7 @@ impl Connection {
         ensure_not_forked(py)?;
         let spec = source_spec(source)?;
         let opts = play_opts(py, volume, loops, paused)?;
-        let track = self
-            .shared
-            .queue()
-            .enqueue(spec, opts, self.shared.tracks())
-            .py(py)?;
+        let track = self.enqueue_spec(spec, opts).py(py)?;
         Ok(self.native_track(track))
     }
 
@@ -788,11 +816,7 @@ impl Connection {
                 volume: opts.volume,
             },
         });
-        let track = self
-            .shared
-            .queue()
-            .enqueue(spec, opts, self.shared.tracks())
-            .py(py)?;
+        let track = self.enqueue_spec(spec, opts).py(py)?;
         Ok(self.native_track(track))
     }
 

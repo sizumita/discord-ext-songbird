@@ -10,7 +10,7 @@ pub mod queue;
 pub mod registry;
 
 pub use flags::{
-    DoneGuard, PendingChange, PlayOpts, TrackEndReason, TrackFlags, TrackKind, TrackRef,
+    DoneGuard, PendingChange, PlayOpts, TrackEndReason, TrackFlags, TrackKind, TrackRef, loop_state,
 };
 pub use queue::TrackQueue;
 pub use registry::TrackRegistry;
