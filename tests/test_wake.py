@@ -86,12 +86,13 @@ async def test_failed_connection_closes_the_fd_once() -> None:
 
 
 async def test_taken_bell_cannot_be_reused(testing: Any) -> None:
-    _rsock, wsock = socket.socketpair()
+    rsock, wsock = socket.socketpair()
     bell = native.WakeBell(wsock.detach())
     conn, _h = testing.detached_connection(1, 2, settings(), bell)
     with pytest.raises(ValueError):
         native.Connection(bell, 1, 2, settings(), True)
     conn.close("requested")
+    rsock.close()
 
 
 def test_wakebell_rejects_non_sockets() -> None:

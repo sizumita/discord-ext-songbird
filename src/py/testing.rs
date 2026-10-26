@@ -53,7 +53,10 @@ impl Harness {
             advance_ms,
             0..=hooks::harness::MAX_STEP_MS,
         )?;
-        self.h.step(ms).py(py)
+        // Detached: the worker runs on the RX runtime in production, never attached to Python, so
+        // a step (Opus decoding, mixing, resampling) must not hold the GIL on a GIL build.
+        let h = &self.h;
+        py.detach(|| h.step(ms)).py(py)
     }
 
     /// Manual time elapsed since the connection was created, in ms.
@@ -279,7 +282,9 @@ impl MixerHarness {
     fn pull<'py>(&self, py: Python<'py>, ticks: i64) -> PyResult<Bound<'py, PyBytes>> {
         let ticks = int_arg(py, "ticks", ticks, 0..=hooks::mixer::MAX_PULL_TICKS)?;
         let mut out = Vec::new();
-        self.m.pull(ticks, &mut out).py(py)?;
+        // Detached, like songbird's mixer thread, which never attaches to Python.
+        let m = &self.m;
+        py.detach(|| m.pull(ticks, &mut out)).py(py)?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(out.len().saturating_mul(4))

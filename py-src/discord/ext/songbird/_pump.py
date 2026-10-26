@@ -12,7 +12,9 @@ slots), ``WAKE_TRACKS`` (a track's ``ended`` changed, level-triggered). Ids 4–
 The pump holds the client only through a weak reference. If the client is collected without
 ``disconnect()``, the weakref callback closes the native connection (``"dropped"``); that shuts the
 doorbell down, ``sock_recv`` returns ``b""`` and the pump exits. The task's ``finally`` closes the
-connection too (``"loop_closed"``), so a loop that dies always tears it down.
+connection too (``"loop_closed"``), so a loop that dies always tears it down. Helper tasks the library
+starts for a connection (a queued stream's feed) run through :meth:`_Pump.spawn` and are cancelled when
+the pump shuts down, so they cannot keep a collected client's connection alive.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ import contextlib
 import logging
 import socket
 import weakref
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Coroutine, Iterable
 from typing import TYPE_CHECKING, Any
 
 from . import native
@@ -51,6 +53,7 @@ class _Pump:
         "_op_waiters",
         "_track_waiters",
         "_closed",
+        "_tasks",
         "_task",
         "__weakref__",
     )
@@ -71,6 +74,7 @@ class _Pump:
         self._op_waiters: dict[int, asyncio.Future[Any]] = {}
         self._track_waiters: dict[native.NativeTrack, list[asyncio.Future[None]]] = {}
         self._closed = False
+        self._tasks: set[asyncio.Task[Any]] = set()
         self._task: asyncio.Task[None] = loop.create_task(self._run(), name="songbird-pump")
 
     # ── lifecycle ────────────────────────────────────────────────────────────────────────────────
@@ -125,6 +129,9 @@ class _Pump:
             _log.debug("final pump dispatch failed", exc_info=True)
         self._closed = True
         self._wake_everyone()
+        # Even when the client was collected (nothing will call its cleanup()): a helper waiting on
+        # its source must not hold the connection until that source yields.
+        cancel_tasks(self._tasks)
         try:
             self._rsock.close()
         except OSError:
@@ -161,6 +168,17 @@ class _Pump:
             return True
         done, _ = await asyncio.wait({self._task}, timeout=timeout)
         return bool(done)
+
+    def spawn(self, coro: Coroutine[Any, Any, Any], *, name: str | None = None) -> asyncio.Task[Any]:
+        """Run ``coro`` on the pump's loop as a helper task of this connection; it is cancelled when
+        the pump shuts down (loop thread only)."""
+        task = self._loop.create_task(coro, name=name)
+        if self._closed:
+            task.cancel()
+            return task
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
 
     def stop(self) -> None:
         """Cancel the pump task (its ``finally`` closes the connection)."""

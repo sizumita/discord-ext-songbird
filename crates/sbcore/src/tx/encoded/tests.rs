@@ -138,6 +138,34 @@ fn decode_thread_exits_on_close_mid_stream() {
 }
 
 #[test]
+fn a_stream_closed_before_its_first_byte_is_never_probed() {
+    let _s = SERIAL.lock();
+    for mode in [CloseMode::Abort, CloseMode::Drain] {
+        let r = erig(64 << 10).unwrap();
+        std::thread::sleep(Duration::from_millis(20)); // the decode thread waits for input
+        if mode == CloseMode::Drain {
+            // An empty finished stream still probes (and fails): it is not a close.
+            LiveSource::close(&*r.shared, mode);
+            wait_until("thread exited", || Arc::strong_count(&r.shared) == 1);
+            assert!(PROBED.lock().contains(&r.shared.id));
+            assert!(r.flags.hints() & DECODE_ERROR != 0);
+            continue;
+        }
+        LiveSource::close(&*r.shared, mode);
+        wait_until("thread exited", || Arc::strong_count(&r.shared) == 1);
+        assert!(!PROBED.lock().contains(&r.shared.id));
+        assert_eq!(r.flags.hints() & DECODE_ERROR, 0);
+    }
+    // Once a byte arrived, the probe runs.
+    let r = erig(64 << 10).unwrap();
+    let bytes = wav(48_000, 1, &[0i16; 4_800]);
+    r.shared.write(&bytes).unwrap();
+    wait_until("probed", || PROBED.lock().contains(&r.shared.id));
+    LiveSource::close(&*r.shared, CloseMode::Abort);
+    wait_until("thread exited", || Arc::strong_count(&r.shared) == 1);
+}
+
+#[test]
 fn the_17th_encoded_stream_is_refused() {
     let _s = SERIAL.lock();
     wait_until("no workers", || {

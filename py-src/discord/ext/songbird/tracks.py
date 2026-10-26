@@ -343,7 +343,8 @@ class TrackQueue:
             from .playback import EncodedStream  # local: playback imports tracks
 
             stream = EncodedStream(sink, self._pump)
-            task = self._pump.loop.create_task(_feed(stream, feed), name=f"songbird-queue-feed-{t.id}")
+            # Spawned by the pump: it is cancelled at shutdown even if the client was collected.
+            task = self._pump.spawn(_feed(stream, feed), name=f"songbird-queue-feed-{t.id}")
             self._tasks.add(task)
             task.add_done_callback(self._feed_done)
 

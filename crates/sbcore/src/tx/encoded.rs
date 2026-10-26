@@ -47,6 +47,10 @@ pub static ENCODED_WORKERS: AtomicUsize = AtomicUsize::new(0);
 /// Names `songbird-decode-N` threads.
 static DECODE_THREAD_SEQ: AtomicUsize = AtomicUsize::new(0);
 
+/// Ids of the encoded streams whose decode thread probed its input (tests).
+#[cfg(test)]
+static PROBED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
 /// Decoded lookahead of the internal queue.
 const LOOKAHEAD_MS: u32 = 1_000;
 /// Decoded audio is pushed in pieces of at most this many 48 kHz frames (100 ms).
@@ -221,6 +225,22 @@ impl EncodedShared {
     /// Bytes buffered in the ring (not yet decoded).
     pub fn buffered_bytes(&self) -> usize {
         lock_checked(&self.ring.inner).bytes.len()
+    }
+
+    /// Decode thread: waits until the ring holds a byte or the input is finished; `false` if the
+    /// stream closed first (there is nothing to probe).
+    fn wait_for_input(&self) -> bool {
+        let ring = &self.ring;
+        let mut g = lock_checked(&ring.inner);
+        loop {
+            if g.closed {
+                return false;
+            }
+            if !g.bytes.is_empty() || g.finished {
+                return true;
+            }
+            let _ = ring.readable.wait_for(&mut g, WAIT);
+        }
     }
 
     /// Closes the ring (wakes the decode thread and any waiter); queued bytes are freed.
@@ -531,6 +551,14 @@ impl BadPackets {
 
 /// The body of a decode thread.
 fn decode_loop(shared: &Arc<EncodedShared>) -> Outcome {
+    // A stream closed before its first byte (never written, a queue entry skipped or the connection
+    // closed before the feed produced data) is a normal close: probing it would only make symphonia
+    // log "probe reach EOF at 0 bytes" at ERROR (symphonia-core 0.5.5 `probe.rs:298`).
+    if !shared.wait_for_input() {
+        return Outcome::Closed;
+    }
+    #[cfg(test)]
+    PROBED.lock().push(shared.id);
     let mss = MediaSourceStream::new(
         Box::new(ByteRingSource {
             shared: shared.clone(),

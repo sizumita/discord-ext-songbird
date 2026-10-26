@@ -1,26 +1,38 @@
-"""Leak tests (§13.4): weakrefs, the pump's weakref callback and ``finally``, and — on the real
-module — ``_debug_live_counts()`` returning to baseline with a real songbird Driver."""
+"""Leak tests (§13.4): weakrefs, the pump's weakref callback and ``finally``, 100 connect/close
+cycles through the test hooks with every ``_debug_live_counts()`` entry back to baseline, and — on
+the real module — the same with a real songbird Driver."""
 
 from __future__ import annotations
 
 import asyncio
 import gc
+import io
+import logging
 import socket
 import threading
 import time
+import wave
 import weakref
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
 from conftest import (
+    CHANNEL_ID,
+    FAKE,
     GUILD_ID,
+    OTHER_CHANNEL_ID,
     FakeClient,
     FakeGuild,
     HarnessClient,
     World,
     connect_detached,
     inject_ticks,
+    pump_settle,
     run_isolated,
+    tone,
+    voice_packets,
+    wait_for,
 )
 from discord.ext import songbird
 from discord.ext.songbird import ConnectFailed, OpusPackets, RawPcm, SongbirdClient, native
@@ -222,3 +234,119 @@ async def test_track_queue_holds_no_reference_to_the_client(world: World) -> Non
     del queue
     collect()
     assert queue_ref() is None
+
+
+# ── 100 connect/close cycles: the 0.5 leak reproduction against the 0.6 API (§15.1 defect 1) ─────
+
+SPEAKER, SPEAKER_SSRC = 7_000_000_000_000_001, 101
+#: How a cycle ends, in turn: the user's leave, a forced one, being removed from the channel, a
+#: terminal loss with ``reconnect=False`` (best-effort leave), and an app that drops the client
+#: without disconnecting.
+CLOSE_PATHS = ("disconnect", "force", "left_channel", "lost", "abandoned")
+#: Counters every cycle must raise, so the baseline check cannot pass vacuously.
+EXERCISED = ("ConnShared", "SubQueue", "EventQueue", "PcmQueue", "TrackFlags", "LiveReader")
+EXERCISED_REAL = ("ConnWorker", "Dispatch", "SsrcState", "DecodeThread", "SongbirdInput", "DoneGuard")
+
+
+def _wav(ms: int) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(48_000)
+        w.writeframes(tone(ms))
+    return buf.getvalue()
+
+
+async def _blocked_feed(gate: asyncio.Event) -> AsyncIterator[bytes]:
+    """A queued stream's source: a short WAV, then it stalls until ``gate`` opens."""
+    yield _wav(100)
+    await gate.wait()
+
+
+async def _leak_cycle(path: str, testing: Any, gate: asyncio.Event) -> tuple[list[weakref.ref[Any]], dict[str, int]]:
+    """One SongbirdClient lifetime through discord.py's ``Connectable.connect`` with fake discord
+    objects: every kind of stream, source and track is opened and used, then the client ends by
+    ``path``. Returns weak references to every Python object and the live counts while open."""
+    client = FakeClient()
+    guild = FakeGuild(client)
+    world = World(client, guild, guild.add_channel(CHANNEL_ID), guild.add_channel(OTHER_CHANNEL_ID))
+    vc = await connect_detached(world, reconnect=path != "lost")
+    conn, pump = vc._conn, vc._pump
+    assert conn is not None and pump is not None
+    testing.inject_map(conn, SPEAKER_SSRC, SPEAKER)
+    mixed = vc.listen_mixed()
+    user = vc.listen_user(SPEAKER, songbird.MULAW_8K)
+    router = vc.listen_users(songbird.PCM16_16K)
+    events = vc.events()
+    pb = vc.open_playback()
+    pb.write_nowait(tone(100, rate=24_000, channels=1))
+    mixer = testing.MixerHarness(pb._pb)
+    encoded = vc.open_encoded_stream()
+    opus = vc.open_opus_stream()
+    opus.send_nowait(voice_packets(testing)[0])
+    track = vc.play(RawPcm(bytes(4_800), songbird.PCM16_24K))
+    queued_stream = vc.queue.enqueue_stream(_blocked_feed(gate))
+    queued = vc.enqueue(OpusPackets(voice_packets(testing, 60)))
+    inject_ticks(vc, testing, 5, ssrc=SPEAKER_SSRC)
+    mixer.pull(3)
+    await pump_settle()
+    per_user = await asyncio.wait_for(anext(router), 2)
+    chunk = mixed.read_nowait()
+    assert chunk is not None and user.read_nowait() is not None and per_user.read_nowait() is not None
+    assert events.read_nowait() is not None
+    await wait_for(lambda: bool(vc.queue._tasks))  # the queued stream is current and being fed
+    during = _counts()
+    refs: list[weakref.ref[Any]] = [
+        weakref.ref(o)
+        for o in (vc, conn, pump, vc.queue, mixed, user, router, per_user, events, pb, encoded, opus, track)
+        + (queued_stream, queued, chunk)
+    ]
+    if path == "abandoned":
+        world.client._connection._voice_clients.clear()
+        del vc
+        collect()  # the pump's weakref callback closes the connection ("dropped")
+        assert conn.status().close_reason == "dropped"
+    elif path == "left_channel":
+        await vc.on_voice_state_update({"channel_id": None, "session_id": "s"})  # type: ignore
+        await wait_for(lambda: world.client._connection._get_voice_client(GUILD_ID) is None)
+        assert conn.status().close_reason == "left_channel"
+    elif path == "lost":
+        testing.inject_driver_event(conn, "disconnect", reason="io")
+        await wait_for(lambda: world.client._connection._get_voice_client(GUILD_ID) is None)
+        assert conn.status().close_reason == "lost"
+    else:
+        await vc.disconnect(force=path == "force")
+        assert conn.status().close_reason == "requested"
+    assert await pump.closed(timeout=2)
+    # `gate` stays shut: the queued stream's feed waits on its source until the library cancels it
+    # (cleanup(), or the pump's shutdown when the client was collected).
+    await world.guild.settle()
+    await pump_settle()
+    return refs, during
+
+
+async def test_connect_close_cycles_return_to_baseline(testing: Any, caplog: pytest.LogCaptureFixture) -> None:
+    """100 connect/close cycles leave no Python object and no native object behind: every
+    ``weakref`` dies and every ``_debug_live_counts()`` entry returns to its baseline (§13.4).
+    Normal closes log no errors."""
+    caplog.set_level(logging.WARNING, logger="discord.ext.songbird")
+    collect()
+    baseline = _counts()
+    for i in range(100):
+        gate = asyncio.Event()
+        refs, during = await _leak_cycle(CLOSE_PATHS[i % len(CLOSE_PATHS)], testing, gate)
+        exercised = EXERCISED if FAKE else EXERCISED + EXERCISED_REAL
+        assert all(during.get(k, 0) > baseline.get(k, 0) for k in exercised), (baseline, during)
+        collect()
+        alive = [r() for r in refs if r() is not None]
+        assert not alive, (CLOSE_PATHS[i % len(CLOSE_PATHS)], alive)
+    deadline = time.monotonic() + 10  # decode threads exit on their own once their stream closed
+    while (now := _counts()) != {k: baseline.get(k, 0) for k in now} and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+        collect()
+    assert now == {k: baseline.get(k, 0) for k in now}, (baseline, now)
+    assert not [o for o in gc.get_objects() if isinstance(o, (SongbirdClient, native.Connection))]
+    await asyncio.sleep(0.5)  # let the songbird-log thread forward what the native side logged
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR and r.name.startswith("discord.ext.songbird")]
+    assert not errors, [f"{r.name}: {r.getMessage()}" for r in errors[:5]]
