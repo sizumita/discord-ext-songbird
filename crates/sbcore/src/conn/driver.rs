@@ -4,7 +4,6 @@
 //! clone sends `Poison`. It lives in `ConnShared.driver` (L1) and is `take()`n exactly once, at
 //! teardown. Every method enters the NET runtime (songbird may `tokio::spawn`) and does O(1) flume
 //! sends only.
-#![allow(dead_code)] // phase-0 skeleton
 
 use std::num::NonZeroU8;
 use std::time::Duration;
@@ -44,6 +43,20 @@ pub(crate) fn build_config(s: &VoiceSettings, reconnect: bool) -> songbird::Conf
         .preallocated_tracks(PREALLOCATED_TRACKS)
         .disposer(runtime::disposer().clone())
         .scheduler(runtime::scheduler().clone())
+}
+
+/// How long a `Connect` future may run (§4.8): `min(120 s, driver_timeout × (retries + 1) + 30 s)`,
+/// with `retries` = `driver_retries` (`reconnect=True`) or 1.
+pub(crate) fn connect_deadline(s: &VoiceSettings, reconnect: bool) -> Duration {
+    let retries = if reconnect {
+        u32::from(s.driver_retries.get())
+    } else {
+        1
+    };
+    s.driver_timeout
+        .saturating_mul(retries.saturating_add(1))
+        .saturating_add(Duration::from_secs(30))
+        .min(Duration::from_secs(120))
 }
 
 /// The one owner of a songbird `Driver` (I3). NO `Clone`, NO `Deref`.
@@ -140,5 +153,57 @@ impl OwnedDriver {
         d.stop();
         d.leave();
         drop(d);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conn::settings::RawVoiceSettings;
+
+    #[test]
+    fn config_never_retries_infinitely_and_preallocates() {
+        for (reconnect, retries) in [(true, 5u8), (true, 1), (false, 7)] {
+            let s = VoiceSettings::validate(RawVoiceSettings {
+                driver_retries: retries,
+                ..RawVoiceSettings::default()
+            })
+            .unwrap();
+            let cfg = build_config(&s, reconnect);
+            let limit = cfg.driver_retry.retry_limit.expect("never None (infinite)");
+            assert_eq!(limit.get(), if reconnect { retries } else { 1 });
+            assert_eq!(cfg.preallocated_tracks, PREALLOCATED_TRACKS);
+            assert!(cfg.driver_timeout.is_some());
+        }
+        let off = VoiceSettings::validate(RawVoiceSettings {
+            receive: false,
+            ..RawVoiceSettings::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            build_config(&off, true).decode_mode,
+            DecodeMode::Pass
+        ));
+        let on = VoiceSettings::validate(RawVoiceSettings::default()).unwrap();
+        assert!(matches!(
+            build_config(&on, true).decode_mode,
+            DecodeMode::Decrypt
+        ));
+    }
+
+    #[test]
+    fn connect_deadline_is_capped() {
+        let s = VoiceSettings::validate(RawVoiceSettings::default()).unwrap();
+        // 10 s × (5 + 1) + 30 s = 90 s.
+        assert_eq!(connect_deadline(&s, true), Duration::from_secs(90));
+        // 10 s × 2 + 30 s.
+        assert_eq!(connect_deadline(&s, false), Duration::from_secs(50));
+        let slow = VoiceSettings::validate(RawVoiceSettings {
+            driver_timeout_s: 60.0,
+            driver_retries: 10,
+            ..RawVoiceSettings::default()
+        })
+        .unwrap();
+        assert_eq!(connect_deadline(&slow, true), Duration::from_secs(120));
     }
 }
