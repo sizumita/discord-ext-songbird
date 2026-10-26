@@ -41,6 +41,17 @@ pub fn next_source_id() -> u32 {
     }
 }
 
+/// Marks the calling thread as a mixer thread on its first reader/decoder call (§5.2 debug
+/// enforcement). Tests that drive readers directly set `Role::Harness` first.
+#[inline]
+pub(crate) fn enter_mixer() {
+    use crate::runtime::{Role, role, set_role};
+    match role() {
+        Role::Unknown => set_role(Role::Mixer),
+        r => debug_assert_ne!(r, Role::Python, "mixer entry point on a Python thread"),
+    }
+}
+
 #[cfg(feature = "test-hooks")]
 use std::sync::Arc;
 
@@ -146,6 +157,11 @@ pub trait LiveSource: Send + Sync {
     fn housekeep(&self, now: Instant, events: &EventHub) -> HouseStatus;
     fn on_link(&self, up: bool);
     fn close(&self, mode: CloseMode);
+    /// T5 / worker exit: like `close(Abort)`, but writers then get
+    /// `StreamClosed("connection_closed")`. See `docs/deviations/W4.md`.
+    fn conn_closed(&self) {
+        self.close(CloseMode::Abort);
+    }
 }
 
 /// Frames moved by one mixer pull.
@@ -175,6 +191,14 @@ pub trait PcmProvider: Send + Sync + 'static {
     /// Called (atomics only) when the reader or decoder holding this provider is dropped, on the
     /// mixer, Idle task or DisposalThread (`reader_gone`, §7.4). See `docs/deviations/W4.md`.
     fn on_reader_drop(&self) {}
+    /// Called (atomics only) when a panic was caught in the reader or decoder: the source ends
+    /// after one silent tick (§5.7). See `docs/deviations/W4.md`.
+    fn on_poison(&self) {}
+    /// The producer failed and everything it produced was played: the decoder then returns a
+    /// decode error once, so songbird ends the track with `reason="error"` (§7.9). Atomics only.
+    fn failed(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
