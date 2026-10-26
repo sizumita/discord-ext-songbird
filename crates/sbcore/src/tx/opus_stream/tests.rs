@@ -79,6 +79,28 @@ fn packet_validation() {
     assert!(validate_opus_packet(&[]).is_err());
     assert!(validate_opus_packet(&[0xF8; 1_276]).is_err());
     assert!(validate_opus_packet(&SILENT_FRAME).is_ok());
+    // TOC and frame count say "one 20 ms frame" (`get_nb_samples` == 960), but the code-3 padding
+    // length runs past the end: libopus cannot decode it, and one such packet would end the whole
+    // track the first time it is mixed.
+    let malformed = [0xFB, 0x41, 0xFF];
+    assert_eq!(
+        opus::packet::get_nb_samples(&malformed, 48_000).ok(),
+        Some(960)
+    );
+    assert!(matches!(
+        validate_opus_packet(&malformed),
+        Err(CoreError::InvalidAudio(_))
+    ));
+    // Code 1 (two equal 10 ms frames, 960 samples) with an odd payload: not two equal frames.
+    let odd = [0xF1, 0x00, 0x01, 0x02];
+    assert_eq!(opus::packet::get_nb_samples(&odd, 48_000).ok(), Some(960));
+    assert!(matches!(
+        validate_opus_packet(&odd),
+        Err(CoreError::InvalidAudio(_))
+    ));
+    let mut dec = opus::Decoder::new(48_000, opus::Channels::Stereo).unwrap();
+    let mut out = vec![0f32; 960 * 2];
+    assert!(dec.decode_float(&malformed, &mut out, false).is_err());
     let p20 = opus_packets(1, 960);
     assert!(validate_opus_packet(&p20[0]).is_ok());
     let p10 = opus_packets(1, 480);
@@ -236,12 +258,14 @@ fn a_close_before_attach_is_applied_when_the_track_attaches() {
         volume: 1.0,
     };
     let muted = Arc::new(AtomicBool::new(false));
-    // Never sent (paused), drain-closed before the attach: it can never drain, so it stops.
+    // Never sent (paused), drain-closed before the attach: nothing to drain, so it is resumed and
+    // ends at the next pull (EOF → `finished`, not `stopped`).
     let q = OpusQueue::new(&spec, hub.alloc().unwrap(), muted.clone()).unwrap();
     LiveSource::close(&*q, CloseMode::Drain);
     let log = Rec::default();
     q.attach_track(Box::new(log.clone()));
-    assert_eq!(log.calls(), vec!["stop"]);
+    assert_eq!(log.calls(), vec!["play"]);
+    assert!(q.should_end());
     // Closed by T5 before the attach.
     let q = OpusQueue::new(&spec, hub.alloc().unwrap(), muted.clone()).unwrap();
     q.conn_closed();
@@ -274,4 +298,112 @@ fn abandon_aborts_an_open_stream_but_lets_a_drain_finish() {
     assert!(r.next().is_some());
     assert!(r.next().is_some());
     assert!(r.next().is_none());
+}
+
+/// `TrackHandle.pause()` is the stream's own user pause: the next `send` (which resumes an
+/// idle-paused stream) and the idle pause do not undo it, and only `resume()` plays again.
+#[test]
+fn a_user_pause_survives_sends_and_the_idle_pause() {
+    let mut r = orig(10);
+    let t0 = Instant::now();
+    let pk = opus_packets(3, 960);
+    // Paused before the first packet: the send that would resume the stream keeps it paused.
+    assert!(LiveSource::set_user_paused(&*r.q, true));
+    r.q.send(&pk[0]).unwrap();
+    assert!(r.log.calls().is_empty(), "still paused");
+    // Resumed: plays.
+    assert!(LiveSource::set_user_paused(&*r.q, false));
+    assert_eq!(r.log.calls(), vec!["play"]);
+    assert_eq!(&*r.next().unwrap(), &pk[0][..]);
+    // Paused while empty, then idle for longer than OPUS_IDLE_MS: a later send keeps it paused.
+    assert!(LiveSource::set_user_paused(&*r.q, true));
+    r.q.housekeep_at(t0);
+    r.q.housekeep_at(t0 + Duration::from_millis(400));
+    r.q.send(&pk[1]).unwrap();
+    assert_eq!(r.log.calls(), vec!["play", "pause"]);
+    assert!(LiveSource::set_user_paused(&*r.q, false));
+    assert_eq!(r.log.calls(), vec!["play", "pause", "play"]);
+}
+
+/// A drain-close of a stream that went idle ends it naturally (EOF → `finished`); one a user
+/// pause holds with packets left can never drain and is stopped (`aclose(drain=True)` would
+/// otherwise wait forever).
+#[test]
+fn drain_close_resumes_an_idle_stream_and_stops_a_user_paused_one() {
+    let mut r = orig(10);
+    let t0 = Instant::now();
+    let pk = opus_packets(2, 960);
+    r.q.send(&pk[0]).unwrap();
+    r.q.housekeep_at(t0);
+    r.next().unwrap();
+    r.q.housekeep_at(t0 + Duration::from_millis(20));
+    r.q.housekeep_at(t0 + Duration::from_millis(400));
+    assert_eq!(r.log.calls(), vec!["play", "pause"], "idle-paused");
+    LiveSource::close(&*r.q, CloseMode::Drain);
+    assert_eq!(r.log.calls(), vec!["play", "pause", "play"]);
+    assert!(r.next().is_none(), "EOF at the next pull");
+    // User-paused with packets left.
+    let r = orig(10);
+    r.q.send(&pk[0]).unwrap();
+    assert!(LiveSource::set_user_paused(&*r.q, true));
+    LiveSource::close(&*r.q, CloseMode::Drain);
+    assert_eq!(r.log.calls(), vec!["play", "pause", "stop"]);
+    // User-paused and empty: nothing would be discarded, so it ends naturally.
+    let mut r = orig(10);
+    assert!(LiveSource::set_user_paused(&*r.q, true));
+    LiveSource::close(&*r.q, CloseMode::Drain);
+    assert_eq!(r.log.calls(), vec!["play"]);
+    assert!(r.next().is_none());
+}
+
+/// The allocation-free framing check agrees with libopus `opus_packet_parse` on every 20 ms
+/// packet: real encoder output, and random bytes behind every TOC code (VBR/CBR, padding).
+#[test]
+fn framing_check_matches_libopus_parse() {
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut compared = 0;
+    let mut rejected = 0;
+    for p in opus_packets(20, 960) {
+        assert!(opus_framing_ok(&p));
+        assert!(validate_opus_packet(&p).is_ok());
+    }
+    // 20 ms TOCs: CELT FB 20 ms (31) code 0..3, and 10 ms / 2.5 ms configs with code 1..3.
+    let tocs = [
+        0xF8u8, 0xF9, 0xFA, 0xFB, 0xF1, 0xF2, 0xF3, 0xE3, 0x0B, 0x4B, 0x7A,
+    ];
+    for _ in 0..200_000 {
+        let r = next();
+        let len = 1
+            + (r % 64) as usize
+            + if r & (1 << 40) != 0 {
+                (r >> 48) as usize % 1_200
+            } else {
+                0
+            };
+        let mut p: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+        p[0] = tocs[(r >> 8) as usize % tocs.len()];
+        if p.len() > 1 && p[0] & 3 == 3 {
+            // A frame count that makes 20 ms for this config, with random VBR/padding bits.
+            let spf = opus::packet::get_samples_per_frame(&p, 48_000).unwrap();
+            p[1] = (p[1] & 0xC0) | (960 / spf) as u8;
+        }
+        if opus::packet::get_nb_samples(&p, 48_000).ok() != Some(960) {
+            continue;
+        }
+        compared += 1;
+        let ours = opus_framing_ok(&p);
+        let libopus = opus::packet::parse(&p).is_ok();
+        assert_eq!(ours, libopus, "{p:02x?}");
+        rejected += usize::from(!ours);
+    }
+    assert!(
+        compared > 50_000 && rejected > 1_000,
+        "{compared} {rejected}"
+    );
 }

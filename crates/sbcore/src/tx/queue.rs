@@ -1063,11 +1063,11 @@ impl PcmQueue {
         {
             let mut g = lock_checked(&self.inner);
             self.sync_track(&mut g);
-            // Same rule as `close()`: a drain-closed track that is not playing (paused, idle or
-            // never written) can never drain, so it is stopped.
+            // Same rule as `close()`: a drain-closed track plays its rest (an empty one ends at
+            // the next pull), unless a user pause holds audio that can then never drain.
             let stop = match g.closed {
                 Some(CloseMode::Abort) => true,
-                Some(CloseMode::Drain) => self.drain_cannot_play(&g),
+                Some(CloseMode::Drain) => self.settle_drain(&mut g),
                 None => false,
             };
             if stop && !g.stop_sent {
@@ -1078,9 +1078,21 @@ impl PcmQueue {
         self.finish(after);
     }
 
-    /// Whether a drain-closed track can never play its rest (so it is stopped): it is not playing,
-    /// unless it is an encoded stream's queue that a user pause holds with audio left.
-    fn drain_cannot_play(&self, g: &QueueInner) -> bool {
+    /// A drain-close (`close(Drain)`, or one recorded before the track was attached): returns
+    /// whether the track must be stopped because it can never play its rest.
+    ///
+    /// The idle auto-pause only waits for more audio, and none can come now, so it is lifted: the
+    /// track plays its rest, and an empty queue ends at the next pull (EOF → `TrackEnded`
+    /// `"finished"`, not the `"stopped"` a `stop()` would report). With nothing queued a user pause
+    /// holds nothing either, so it is lifted too. A user pause with audio left is kept: a
+    /// `PlaybackStream` is then stopped (its rest discarded), while an encoded stream's internal
+    /// queue holds it until the entry's `resume()` plays it out (`hold_paused_drain`).
+    fn settle_drain(&self, g: &mut QueueInner) -> bool {
+        g.paused_idle = false;
+        if g.queued_frames == 0 {
+            g.paused_user = false;
+        }
+        self.sync_track(g);
         !g.track_playing && !(self.hold_paused_drain && g.paused_user && g.queued_frames > 0)
     }
 
@@ -1503,9 +1515,9 @@ impl LiveSource for PcmQueue {
             }
             g.closed = Some(mode);
             g.gate.armed = false;
-            // A paused (idle or user) track is never pulled, so it cannot drain: stop it. A
-            // playing one returns EOF once empty.
-            let nothing_to_drain = self.drain_cannot_play(&g);
+            // A paused track is never pulled: an idle-paused one is resumed so it drains (and an
+            // empty one returns EOF at once); one a user pause holds with audio left is stopped.
+            let cannot_drain = mode == CloseMode::Drain && self.settle_drain(&mut g);
             if mode == CloseMode::Abort {
                 self.abort_locked(&mut g, &mut after);
             } else if std::mem::take(&mut g.space_wanted) > 0 || std::mem::take(&mut g.idle_waiting)
@@ -1513,7 +1525,7 @@ impl LiveSource for PcmQueue {
                 after.ring = true;
             }
             // Without an attached track the stop is left to `attach_track` (it would be lost).
-            if (mode == CloseMode::Abort || nothing_to_drain)
+            if (mode == CloseMode::Abort || cannot_drain)
                 && !g.stop_sent
                 && self.track.get().is_some()
             {
@@ -1543,6 +1555,14 @@ impl LiveSource for PcmQueue {
 
     fn set_source_volume(&self, v: f32) -> bool {
         self.set_volume(v).is_ok()
+    }
+
+    fn source_volume(&self) -> Option<f32> {
+        Some(self.volume())
+    }
+
+    fn is_released(&self) -> bool {
+        self.st.end_flags.load(Ordering::Acquire) & (END_ABORT | END_CONN_CLOSED) != 0
     }
 }
 

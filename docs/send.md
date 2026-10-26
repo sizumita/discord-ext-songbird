@@ -139,7 +139,10 @@ natural end (`"finished"`), `stop()` / `stop_all()` (`"stopped"`), a decode erro
 connection closing (`"disconnected"`).
 
 songbird processes track commands only while its mixer is live (something is playing); `seek()`
-and `info()` raise `TimeoutError` while it is parked.
+and `info()` raise `TimeoutError` while it is parked. `stop()` of a memory/file track still ends it
+(`"stopped"`) at once, also while the voice link is down; songbird lets go of the track once the
+link is up. A live stream's `pause()`/`resume()` is kept by the stream itself, so new audio does not
+undo it.
 
 ## The queue
 
@@ -169,12 +172,18 @@ async with vc.open_opus_stream(max_packets=250) as opus:
 ```
 
 Both start paused and resume on the first audio; an Opus stream pauses again after 250 ms without
-packets, so an idle stream sends no RTP.
+packets, so an idle stream sends no RTP. Leaving the `async with` block normally drains the stream
+(bounded: an Opus stream waits at most `buffered_ms + 2 s`, an encoded stream as long as audio keeps
+playing and at most 2 s without progress, e.g. while self-muted); leaving it with an exception or a
+cancellation closes the stream at once. A chained Ogg stream (Icecast radio) plays every song.
 
 ## Limits
 
-16 live sources (playbacks + encoded + Opus streams) and 32 playing memory tracks per connection;
-16 encoded-stream decode threads per process. Every size is checked before anything is allocated
+16 open live sources (playbacks + encoded + Opus streams; a closed one no longer counts) and 32
+playing memory tracks per connection; 16 encoded-stream decode threads per process. songbird holds
+at most 48 tracks per connection: while the voice link is down (joining, reconnecting) closed streams
+and stopped tracks stay in its mixer until the link is up, and beyond 48 `play()`/`open_*` raise
+`LimitExceeded("resident_tracks")`. Every size is checked before anything is allocated
 (`LimitExceeded`): a single `write()` larger than the whole buffer is rejected before any buffer
 type (`bytes`, `bytearray`, `memoryview`, numpy, `AudioChunk`) is copied.
 

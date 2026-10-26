@@ -11,7 +11,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::Mutex;
 use songbird::tracks::{PlayMode, TrackHandle, TrackState};
 
-use super::flags::{DoneGuard, PANICKED, TrackEndReason, TrackFlags, TrackKind, TrackRef};
+use super::flags::{DROPPED, DoneGuard, PANICKED, TrackEndReason, TrackFlags, TrackKind, TrackRef};
 use crate::sync::lock_checked;
 
 /// Registry of a connection's tracks (L10).
@@ -21,6 +21,10 @@ pub struct TrackRegistry {
     list: Mutex<Vec<Weak<TrackFlags>>>,
     /// L10: songbird uuid (`as_u128`) → flags, for Dispatch track events.
     map: Mutex<HashMap<u128, Weak<TrackFlags>>>,
+    /// L10: every started track whose input songbird may still hold (no `DROPPED` hint yet),
+    /// resolved or not: a track stopped or closed while the mixer is parked stays in the mixer
+    /// until the mixer is live again (`resident`, bounded by `PREALLOCATED_TRACKS`).
+    resident: Mutex<Vec<Weak<TrackFlags>>>,
     next_id: AtomicU64,
     conn_closing: Arc<AtomicBool>,
     /// Tracks whose reader, decoder or decode thread caught a panic (`PANICKED`), counted when
@@ -34,6 +38,7 @@ impl TrackRegistry {
         TrackRegistry {
             list: Mutex::new(Vec::new()),
             map: Mutex::new(HashMap::new()),
+            resident: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
             conn_closing,
             panics: AtomicU64::new(0),
@@ -70,7 +75,23 @@ impl TrackRegistry {
     /// polling it.
     pub(crate) fn mark_started(&self, r: &TrackRef) {
         r.flags.mark_started();
+        {
+            let mut v = lock_checked(&self.resident);
+            v.retain(is_resident);
+            v.push(Arc::downgrade(&r.flags));
+        }
         self.watch(&r.flags);
+    }
+
+    /// Started tracks whose input songbird may still hold (live and memory, resolved or not): a
+    /// track's input is gone once its `DoneGuard` dropped (`DROPPED`). Bounded by
+    /// `PREALLOCATED_TRACKS` at admission, because `MAX_LIVE_SOURCES_PER_CONN` counts only open
+    /// streams and `playing()` only unresolved tracks, while a parked mixer keeps every closed
+    /// stream and stopped track until it is live again.
+    pub fn resident(&self) -> usize {
+        let mut v = lock_checked(&self.resident);
+        v.retain(is_resident);
+        v.len()
     }
 
     /// Polls `flags` until its `TrackEnded` was reported (e.g. a pending entry the queue resolved).
@@ -157,6 +178,11 @@ impl TrackRegistry {
     }
 }
 
+/// Whether songbird may still hold the input of this started track (its `DoneGuard` lives).
+fn is_resident(w: &Weak<TrackFlags>) -> bool {
+    w.upgrade().is_some_and(|f| f.hints() & DROPPED == 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +250,29 @@ mod tests {
         keep[0].0.flags.resolve(TrackEndReason::Stopped, None);
         assert_eq!(r.playing(), 1);
         drop(pending);
+    }
+
+    #[test]
+    fn resident_counts_started_tracks_until_their_input_is_dropped() {
+        let (r, _) = reg();
+        let (a, ga) = r.register(TrackKind::File);
+        let (b, gb) = r.register(TrackKind::Playback);
+        let (_pending, _gp) = r.register(TrackKind::Pcm);
+        r.mark_started(&a);
+        r.mark_started(&b);
+        assert_eq!(r.resident(), 2, "pending entries are not resident");
+        // A stop resolved locally (parked mixer): no longer playing, still in songbird.
+        a.flags.resolve(TrackEndReason::Stopped, None);
+        let mut out = Vec::new();
+        r.poll_ended(0, &mut out);
+        assert_eq!(out, vec![(a.flags.id, TrackEndReason::Stopped)]);
+        assert_eq!(r.playing(), 0);
+        assert_eq!(r.resident(), 2, "reported, but its input is still held");
+        drop(ga); // songbird disposed of the input
+        assert_eq!(r.resident(), 1);
+        drop(gb);
+        drop(b);
+        assert_eq!(r.resident(), 0);
     }
 
     #[test]

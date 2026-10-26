@@ -164,6 +164,12 @@ impl TrackFlags {
         self.hints.fetch_or(bit, Ordering::AcqRel);
     }
 
+    /// Clears a hint bit; atomics only (mixer-safe). A memory reader clears `EOF_SEEN` when songbird
+    /// seeks it (a loop rewinds it to the start, so the end it saw is no longer its end).
+    pub fn clear_hint(&self, bit: u8) {
+        self.hints.fetch_and(!bit, Ordering::AcqRel);
+    }
+
     /// The recorded hint bits.
     pub fn hints(&self) -> u8 {
         self.hints.load(Ordering::Acquire)
@@ -282,10 +288,13 @@ impl Drop for DoneGuard {
 pub struct TrackRef {
     pub flags: Arc<TrackFlags>,
     pub handle: Arc<OnceLock<songbird::tracks::TrackHandle>>,
-    /// Live sources (`open_playback`, `open_encoded`, lazy encoded queue entries): the source
-    /// itself owns its track's play/pause state (§4.9: it pauses when idle and resumes on new
-    /// audio), so `pause`/`resume`/`set_volume` go through it instead of the songbird handle,
-    /// whose direct pause the source would undo at its next resume.
+    /// Live sources (`open_playback`, `open_encoded`, `open_opus_stream`, lazy encoded queue
+    /// entries): the source itself owns its track's play/pause state (§4.9: it pauses when idle
+    /// and resumes on new audio), so `pause`/`resume`/`set_volume` go through it instead of the
+    /// songbird handle, whose direct pause the source would undo at its next resume. It is the
+    /// queue the track's reader pulls from (for an encoded stream its internal `PcmQueue`, not the
+    /// `EncodedShared`, which is freed once its decode thread and sink are gone), so it stays
+    /// reachable for as long as the track can play.
     pub live: Arc<OnceLock<Weak<dyn LiveSource>>>,
     /// Detached connections (§13.2): the `FakeTrackControl` standing in for the handle.
     #[cfg(feature = "test-hooks")]
@@ -364,8 +373,27 @@ impl TrackRef {
     }
 
     /// `TrackHandle.stop()` (songbird fires `End(Stop)`; the fake resolves `stopped` directly).
+    ///
+    /// A memory/file track (`play()`, a queue entry) is resolved `stopped` at once, like
+    /// `TrackQueue::skip`: songbird runs track commands only on a live mixer, so while the mixer is
+    /// parked (joining, connecting, reconnecting) the stop would otherwise wait for the link, and
+    /// the track would keep counting towards `MAX_PLAYING_TRACKS_PER_CONN` and never report
+    /// `TrackEnded`. songbird still holds the track until it processes the stop; the connection
+    /// bounds such resident tracks separately (`resident_tracks`). Live sources end through their
+    /// source (`close()`), so their stop stays songbird's to report.
     pub fn stop(&self) -> Result<(), CoreError> {
-        self.control(|h| h.stop().map_err(control_err), |f| f.stop())
+        self.control(|h| h.stop().map_err(control_err), |f| f.stop())?;
+        if !self.flags.kind.is_live() && !self.flags.conn_closing() {
+            // Once the connection closes, T8 resolves it `disconnected` instead.
+            self.flags.resolve(TrackEndReason::Stopped, None);
+        }
+        Ok(())
+    }
+
+    /// The volume a live source applies itself (its decoder), which songbird's `TrackState`
+    /// does not see (the track stays at 1.0); `None` for songbird-applied volumes.
+    pub fn source_volume(&self) -> Option<f32> {
+        self.live_source().and_then(|s| s.source_volume())
     }
 
     /// `0.0..=4.0`; applied by songbird's live mixer, or by the decoder of a live PCM source

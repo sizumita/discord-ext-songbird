@@ -339,3 +339,139 @@ fn abandon_after_finish_lets_the_stream_play_out() {
     assert_eq!(r.shared.pcm().stats().played_ms, 100);
     assert!(!r.log.calls().contains(&"stop"));
 }
+
+/// Ogg's CRC-32 (polynomial 0x04C11DB7, MSB first, no reflection, init 0).
+#[cfg(any(feature = "codec-full", feature = "format-ogg"))]
+fn ogg_crc(data: &[u8]) -> u32 {
+    let mut crc = 0u32;
+    for &b in data {
+        crc ^= u32::from(b) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ 0x04C1_1DB7
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// One Ogg page holding whole `packets`.
+#[cfg(any(feature = "codec-full", feature = "format-ogg"))]
+fn ogg_page(serial: u32, seq: u32, flags: u8, granule: u64, packets: &[&[u8]]) -> Vec<u8> {
+    let mut lacing = Vec::new();
+    for p in packets {
+        lacing.extend(std::iter::repeat_n(255u8, p.len() / 255));
+        lacing.push((p.len() % 255) as u8);
+    }
+    let mut page = Vec::new();
+    page.extend_from_slice(b"OggS");
+    page.push(0);
+    page.push(flags);
+    page.extend_from_slice(&granule.to_le_bytes());
+    page.extend_from_slice(&serial.to_le_bytes());
+    page.extend_from_slice(&seq.to_le_bytes());
+    page.extend_from_slice(&[0; 4]);
+    page.push(lacing.len() as u8);
+    page.extend_from_slice(&lacing);
+    for p in packets {
+        page.extend_from_slice(p);
+    }
+    let crc = ogg_crc(&page);
+    page[22..26].copy_from_slice(&crc.to_le_bytes());
+    page
+}
+
+/// A complete Ogg Opus physical stream (one "song") of `packets` 20 ms stereo packets.
+#[cfg(any(feature = "codec-full", feature = "format-ogg"))]
+fn ogg_opus(serial: u32, packets: &[Vec<u8>]) -> Vec<u8> {
+    const PRE_SKIP: u16 = 312;
+    let mut head = b"OpusHead".to_vec();
+    head.push(1);
+    head.push(2);
+    head.extend_from_slice(&PRE_SKIP.to_le_bytes());
+    head.extend_from_slice(&48_000u32.to_le_bytes());
+    head.extend_from_slice(&0i16.to_le_bytes());
+    head.push(0);
+    let mut tags = b"OpusTags".to_vec();
+    tags.extend_from_slice(&4u32.to_le_bytes());
+    tags.extend_from_slice(b"test");
+    tags.extend_from_slice(&0u32.to_le_bytes());
+    let mut out = ogg_page(serial, 0, 0x02, 0, &[&head]);
+    out.extend(ogg_page(serial, 1, 0, 0, &[&tags]));
+    let pages: Vec<&[Vec<u8>]> = packets.chunks(10).collect();
+    let mut granule = u64::from(PRE_SKIP);
+    for (i, chunk) in pages.iter().enumerate() {
+        granule += 960 * chunk.len() as u64;
+        let flags = if i + 1 == pages.len() { 0x04 } else { 0 };
+        let refs: Vec<&[u8]> = chunk.iter().map(Vec::as_slice).collect();
+        out.extend(ogg_page(serial, 2 + i as u32, flags, granule, &refs));
+    }
+    out
+}
+
+/// A chained Ogg stream (one physical stream per song, as Icecast Ogg radio sends) switches songs
+/// with a new BOS page, which symphonia reports as `ResetRequired`. The decode thread picks the
+/// new stream's track and keeps playing: neither a mid-stream `error` end (a live feed) nor a
+/// silently dropped second song (a finished input).
+#[test]
+#[cfg(any(feature = "codec-full", feature = "format-ogg"))]
+fn a_chained_ogg_stream_plays_every_link() {
+    use crate::tx::opus_stream::tests::opus_packets;
+    let _s = SERIAL.lock();
+    for finish_first in [false, true] {
+        let mut r = erig(64 << 10).unwrap();
+        let mut bytes = ogg_opus(0x1111, &opus_packets(50, 960));
+        bytes.extend(ogg_opus(0x2222, &opus_packets(50, 960)));
+        r.shared.write(&bytes).unwrap();
+        if finish_first {
+            r.shared.finish();
+        }
+        // Play as the mixer would; past the first song's end the second one must follow.
+        let mut p = r.p.take().unwrap();
+        let mut ticks = 0;
+        while r.shared.pcm().stats().played_ms < 1_500 {
+            assert!(
+                ticks < 5_000,
+                "stuck at {} ms",
+                r.shared.pcm().stats().played_ms
+            );
+            let pkt = p.format.next_packet().expect("ended at the song change");
+            assert!(p.decoder.decode(&pkt).is_ok(), "failed at the song change");
+            ticks += 1;
+            if r.shared.pcm().queued_frames() == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(r.flags.hints() & DECODE_ERROR, 0);
+        r.shared.finish();
+        r.p = Some(p);
+        let (_, errors) = r.play_out(10_000);
+        assert_eq!(errors, 0);
+        assert_eq!(r.shared.pcm().stats().played_ms, 2_000, "both songs played");
+        assert_eq!(r.flags.hints() & DECODE_ERROR, 0);
+        assert!(!r.log.calls().contains(&"stop"));
+    }
+}
+
+/// An input that decodes to nothing ends naturally at its end of input (`finished`, through
+/// EOF), not through a `stop()` (which songbird would report as `stopped`).
+#[test]
+fn an_empty_decoded_stream_ends_through_eof_not_a_stop() {
+    let _s = SERIAL.lock();
+    let mut r = erig(64 << 10).unwrap();
+    r.shared.write(&wav(48_000, 2, &[])).unwrap();
+    r.shared.finish();
+    wait_until("decoded", || r.shared.pcm().is_closed());
+    wait_until("thread exited", || Arc::strong_count(&r.shared) == 1);
+    assert_eq!(r.flags.hints() & DECODE_ERROR, 0);
+    assert_eq!(
+        r.log.calls(),
+        vec!["play"],
+        "resumed to reach EOF, never stopped"
+    );
+    let (ticks, errors) = r.play_out(10);
+    assert_eq!((ticks, errors), (0, 0), "EOF at the first pull");
+    assert_ne!(r.flags.hints() & crate::tracks::flags::EOF_SEEN, 0);
+}

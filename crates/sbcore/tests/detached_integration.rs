@@ -942,6 +942,91 @@ fn a_paused_encoded_entry_holds_its_audio_until_resumed() {
     r.conn.close(CloseReason::Requested);
 }
 
+/// The paused entry's `EncodedShared` is freed once its decode thread reached the end of input and
+/// Python dropped the stream (an `enqueue_stream` feed task that returned): `resume()` and
+/// `set_volume()` still reach the internal queue the reader plays, so the held audio plays out
+/// and the track ends `finished`, instead of a songbird `play()` that left the queue user-paused
+/// (silent RTP forever, `wait_ended()` never resolving, the queue never advancing).
+#[test]
+fn a_paused_encoded_entry_resumes_after_its_stream_is_freed() {
+    let _serial = serial();
+    let r = Rig::new();
+    r.connect();
+    let entry = r
+        .conn
+        .queue()
+        .enqueue(
+            SourceSpec::Encoded(EncodedFactory {
+                spec: EncodedSpec {
+                    max_buffer_bytes: 1 << 20,
+                    volume: 1.0,
+                },
+            }),
+            PlayOpts {
+                paused: true,
+                ..PlayOpts::default()
+            },
+            r.conn.tracks(),
+        )
+        .unwrap();
+    r.step(20);
+    let stream = r.conn.queue_take_stream(&entry).unwrap();
+    let id = stream.id();
+    stream
+        .write(&wav(48_000, 2, &sine_48k_stereo(300, 500.0, 0.5)))
+        .unwrap();
+    stream.finish();
+    assert!(wait_real(Duration::from_secs(5), || stream.is_closed()));
+    // The decode thread exits; then the last strong reference (the Python sink) goes.
+    assert!(wait_real(Duration::from_secs(5), || Arc::strong_count(
+        &stream
+    ) == 1));
+    let weak = Arc::downgrade(&stream);
+    drop(stream);
+    assert!(weak.upgrade().is_none(), "the EncodedShared is freed");
+    r.step(40);
+    let mh = MixerHarness::take_source(id).unwrap();
+    assert!(pull(&mh, 5).iter().all(|s| *s == 0.0), "held while paused");
+    // Volume and resume go through the internal queue (songbird's track stays at 1.0).
+    entry.set_volume(0.5).unwrap();
+    assert_eq!(entry.source_volume(), Some(0.5));
+    entry.resume().unwrap();
+    assert_eq!(testing::track_log(&entry), vec!["play"]);
+    let out = pull(&mh, 10);
+    let level = db(rms(&out[960 * 2..9 * 960 * 2]));
+    let want = db(0.5 * 0.5 / 2f64.sqrt());
+    assert!((level - want).abs() < 0.5, "{level} vs {want}");
+    let _ = pull(&mh, 10);
+    assert!(mh.ended(), "EOF once the held audio played out");
+    r.step(80);
+    assert_eq!(entry.flags.ended(), Some(TrackEndReason::Finished));
+    assert!(r.conn.queue().current().is_none(), "the queue moved on");
+    r.conn.close(CloseReason::Requested);
+}
+
+/// `TrackInfo.volume` of a live PCM source is the volume its decoder applies (its songbird track
+/// stays at 1.0): `TrackRef::source_volume`, which `start_track_info` reports.
+#[test]
+fn live_pcm_sources_report_their_own_volume() {
+    let _serial = serial();
+    let r = Rig::new();
+    let (pb, track) = r.conn.open_playback(playback_spec(PCM16_24K)).unwrap();
+    assert_eq!(track.source_volume(), Some(1.0));
+    track.set_volume(0.25).unwrap();
+    assert_eq!(track.source_volume(), Some(0.25));
+    assert_eq!(pb.volume(), 0.25);
+    // Opus streams are decoded by songbird, which applies (and reports) their volume.
+    let (_q, opus) = r
+        .conn
+        .open_opus_stream(OpusStreamSpec {
+            max_packets: 10,
+            volume: 1.0,
+        })
+        .unwrap();
+    assert_eq!(opus.source_volume(), None);
+    r.conn.close(CloseReason::Requested);
+}
+
 // ── limits ──────────────────────────────────────────────────────────────────────────────────────────
 
 #[test]

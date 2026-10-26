@@ -7,7 +7,7 @@ use songbird::input::core::io::ReadBytes;
 use super::*;
 use crate::format::{F32_48K, PCM16_24K, PCM16_48K};
 use crate::runtime::{Role, set_role};
-use crate::tracks::flags::DROPPED;
+use crate::tracks::flags::{DROPPED, TrackEndReason};
 use crate::tx::decoder::tests::{guard, parsed};
 use crate::tx::opus_stream::tests::opus_packets;
 
@@ -265,8 +265,76 @@ fn done_source_records_eof_and_drop() {
     assert_eq!(src.read(&mut buf).unwrap(), 0);
     assert_ne!(flags.hints() & EOF_SEEN, 0);
     assert_eq!(src.seek(SeekFrom::Start(3)).unwrap(), 3);
+    assert_eq!(flags.hints() & EOF_SEEN, 0, "a seek makes the end stale");
     drop(src);
     assert_ne!(flags.hints() & DROPPED, 0);
+}
+
+/// songbird loops a memory track by seeking its reader back to 0 (`do_loop` → `pool.seek` →
+/// `format.seek`). The end the reader saw on the first pass must not survive the rewind:
+/// `stop_all()` (`Driver::stop`, no `End` event) during a later pass finalises through
+/// `finalise_dropped`, which reports `finished` whenever `EOF_SEEN` is set.
+#[test]
+fn a_loop_rewind_clears_eof_so_a_later_stop_all_reports_stopped() {
+    set_role(Role::Harness);
+    let rewind = || SeekTo::Time {
+        time: songbird::input::core::units::Time::default(),
+        track_id: None,
+    };
+    let pcm = Arc::new(MemPcm::from_i16(PCM16_48K, vec![100; 1_920]).unwrap());
+    let opus =
+        Arc::new(OpusFrames::from_packets(opus_packets(2, 960).iter().map(Vec::as_slice)).unwrap());
+    let file = Arc::new(EncodedBytes::new(wav(48_000, 1, &[300i16; 1_920])).unwrap());
+    for (name, stopped_mid_loop) in [
+        ("pcm", true),
+        ("opus", true),
+        ("file", true),
+        ("pcm", false),
+    ] {
+        let (done, flags) = guard();
+        let mut p = match name {
+            "pcm" => parsed(pcm.to_input(done).unwrap()),
+            "opus" => parsed(opus.to_input(done).unwrap()),
+            _ => {
+                let Input::Live(live, None) = file.to_input(done) else {
+                    panic!("live input expected")
+                };
+                match live.promote(get_codec_registry(), get_probe()).unwrap() {
+                    LiveInput::Parsed(p) => p,
+                    _ => panic!("parsed expected"),
+                }
+            }
+        };
+        // First pass, to the end.
+        while let Ok(pkt) = p.format.next_packet() {
+            let _ = p.decoder.decode(&pkt);
+        }
+        if name == "file" {
+            // A WAV this small is read whole by the first read-ahead, and its reader stops at the
+            // data length without a 0-byte read: record the end as a longer file's read would.
+            flags.hint(EOF_SEEN);
+        }
+        assert_ne!(flags.hints() & EOF_SEEN, 0, "{name}");
+        if stopped_mid_loop {
+            // The loop: songbird rewinds the same reader, then plays a packet of pass two.
+            p.format.seek(SeekMode::Accurate, rewind()).unwrap();
+            p.decoder.reset();
+            assert_eq!(flags.hints() & EOF_SEEN, 0, "{name}: the rewind clears it");
+            let pkt = p.format.next_packet().unwrap();
+            let _ = p.decoder.decode(&pkt);
+        }
+        // `stop_all()`: SetTrack(None) drops the input without an `End` event.
+        drop(p);
+        assert!(!flags.finalise_dropped(1));
+        assert!(!flags.finalise_dropped(2));
+        assert!(flags.finalise_dropped(3));
+        let want = if stopped_mid_loop {
+            TrackEndReason::Stopped
+        } else {
+            TrackEndReason::Finished
+        };
+        assert_eq!(flags.ended(), Some(want), "{name}");
+    }
 }
 
 #[test]

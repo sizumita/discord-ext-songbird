@@ -360,6 +360,12 @@ impl EncodedSink {
         }
     }
 
+    /// Decoded audio played so far, in ms (frozen while paused, self-muted or the link is down).
+    #[getter]
+    fn played_ms(&self) -> u64 {
+        self.enc.played_ms()
+    }
+
     #[getter]
     fn wake_id(&self) -> u8 {
         self.enc.wake_id().0

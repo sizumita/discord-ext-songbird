@@ -192,6 +192,18 @@ pub trait LiveSource: Send + Sync {
     fn set_source_volume(&self, _v: f32) -> bool {
         false
     }
+    /// The volume the source applies itself (`TrackInfo.volume`; songbird's track stays at 1.0),
+    /// or `None` when songbird applies it.
+    fn source_volume(&self) -> Option<f32> {
+        None
+    }
+    /// Closed with abort or by the connection: its buffers are freed and it no longer counts
+    /// towards `MAX_LIVE_SOURCES_PER_CONN`, although songbird keeps its reader until a live mixer
+    /// processes the stop (a parked one holds it until the link is up, bounded by the
+    /// connection's `resident_tracks`). Atomics only.
+    fn is_released(&self) -> bool {
+        false
+    }
 }
 
 /// Frames moved by one mixer pull.

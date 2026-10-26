@@ -125,6 +125,10 @@ impl FormatReader for LiveReader {
             if let Some(actual) = self.p.seek_to_frame(frame) {
                 let ts = u128::from(actual) * u128::from(MIX_RATE) / u128::from(rate.max(1));
                 self.ts = u64::try_from(ts).unwrap_or(u64::MAX);
+                // songbird loops a track by seeking it back: the end this reader saw is no longer
+                // its end, so a later `stop_all()` (no `End` event) must not finalise as
+                // `finished`. Seeking to the end records it again at the next pull.
+                self.done.flags().clear_hint(EOF_SEEN);
             }
         }
         Ok(SeekedTo {

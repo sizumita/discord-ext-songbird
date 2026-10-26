@@ -39,6 +39,18 @@ fn format_arg(obj: &Bound<'_, PyAny>) -> PyResult<Format> {
     ))
 }
 
+/// Whether an Arrow sample array of `kind` holds samples in `enc` (§7.3, §9.8): Int16 ↔ pcm16le,
+/// Float32 ↔ f32le, UInt8 (raw bytes) ↔ any encoding. Anything else would be reinterpreted byte by
+/// byte (a Float32 array read as pcm16le plays as noise at twice its duration).
+fn arrow_kind_matches(kind: SampleKind, enc: Encoding) -> bool {
+    matches!(
+        (kind, enc),
+        (SampleKind::UInt8, _)
+            | (SampleKind::Int16, Encoding::Pcm16Le)
+            | (SampleKind::Float32, Encoding::F32Le)
+    )
+}
+
 /// An owned copy of raw audio bytes (`AudioFile` keeps them; a buffer's copy is reused).
 fn owned(data: AudioData<'_>) -> PyResult<Vec<u8>> {
     match data {
@@ -213,7 +225,14 @@ impl RawPcm {
         Ok(RawPcm { p: Arc::new(p) })
     }
 
-    /// ``[arrow]`` An Int16/Float32/UInt8 primitive array without nulls.
+    /// ``[arrow]`` An Int16/Float32/UInt8 primitive array without nulls, whose type matches
+    /// ``format``'s encoding: Int16 for ``pcm16le``, Float32 for ``f32le``, UInt8 (raw bytes) for
+    /// any encoding.
+    ///
+    /// Raises
+    /// ------
+    /// InvalidAudio
+    ///     The array type does not match the encoding (its bytes would be misread as samples).
     #[classmethod]
     fn from_arrow(
         _cls: &Bound<'_, PyType>,
@@ -223,7 +242,14 @@ impl RawPcm {
     ) -> PyResult<Self> {
         ensure_not_forked(py)?;
         let fmt = format_arg(format)?;
-        let (_kind, bytes) = import_samples(py, array).py(py)?;
+        let (kind, bytes) = import_samples(py, array).py(py)?;
+        if !arrow_kind_matches(kind, fmt.encoding) {
+            return Err(msg_exc(
+                py,
+                Exc::InvalidAudio,
+                "the Arrow array type does not match the encoding",
+            ));
+        }
         let p = py.detach(|| MemPcm::from_bytes(fmt, &bytes)).py(py)?;
         Ok(RawPcm { p: Arc::new(p) })
     }
@@ -259,11 +285,8 @@ impl RawPcm {
             || data.hasattr("__buffer__").unwrap_or(false);
         let audio = if !is_buffer && data.hasattr("__arrow_c_array__").unwrap_or(false) {
             let (kind, bytes) = import_samples(py, data).py(py)?;
-            let ok = matches!(
-                (kind, enc),
-                (SampleKind::Int16, Encoding::Pcm16Le) | (SampleKind::Float32, Encoding::F32Le)
-            );
-            if !ok {
+            // `from_samples` takes typed samples only (no raw UInt8 bytes).
+            if kind == SampleKind::UInt8 || !arrow_kind_matches(kind, enc) {
                 return Err(msg_exc(
                     py,
                     Exc::InvalidAudio,

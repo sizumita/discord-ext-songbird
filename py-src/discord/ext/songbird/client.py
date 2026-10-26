@@ -643,7 +643,9 @@ class SongbirdClient(discord.VoiceProtocol):
     def play(self, source: Source, *, volume: float = 1.0, loops: int | None = 0, paused: bool = False) -> TrackHandle:
         """Start a track now, mixed with the others. Synchronous and O(1).
 
-        ``loops=None`` loops forever. Raises ``LimitExceeded`` beyond 32 playing tracks.
+        ``loops=None`` loops forever. Raises ``LimitExceeded`` beyond 32 playing tracks, or beyond
+        48 tracks held by songbird (``resident_tracks``: while the voice link is down, stopped tracks
+        and closed streams stay in its mixer until the link is up).
         """
         conn, pump = self._require()
         return TrackHandle(conn.play(source, volume, loops, paused), pump)

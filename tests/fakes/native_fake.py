@@ -429,10 +429,72 @@ def _opus_size(n: int) -> None:
         raise _invalid(f"Opus packets must be 1..=1275 bytes (got {n})")
 
 
+def _opus_framing_ok(p: bytes) -> bool:
+    """RFC 6716 §3.2 framing (frame lengths and padding fit the packet), as libopus parses it."""
+
+    def size(at: int, n: int) -> tuple[int, int] | None:
+        if n >= 1 and p[at] < 252:
+            return p[at], 1
+        if n >= 2:
+            return 4 * p[at + 1] + p[at], 2
+        return None
+
+    code = p[0] & 3
+    at, n = 1, len(p) - 1
+    if code == 0:
+        last = n
+    elif code == 1:
+        if n % 2:
+            return False
+        last = n // 2
+    elif code == 2:
+        got = size(at, n)
+        if got is None or got[0] > n - got[1]:
+            return False
+        last = n - got[1] - got[0]
+    else:
+        if n < 1:
+            return False
+        ch, at, n = p[at], at + 1, n - 1
+        count = ch & 0x3F
+        if count == 0:
+            return False
+        if ch & 0x40:
+            while True:
+                if n <= 0:
+                    return False
+                b, at, n = p[at], at + 1, n - 1
+                n -= 254 if b == 255 else b
+                if b != 255:
+                    break
+        if n < 0:
+            return False
+        if ch & 0x80:
+            last = n
+            for _ in range(count - 1):
+                got = size(at, n)
+                if got is None:
+                    return False
+                n -= got[1]
+                if got[0] > n:
+                    return False
+                at += got[1]
+                last -= got[1] + got[0]
+            if last < 0:
+                return False
+        else:
+            last = n // count
+            if last * count != n:
+                return False
+    return last <= 1_275
+
+
 def _validate_opus(packet: bytes) -> None:
     _opus_size(len(packet))
     if _opus_samples(packet) != 960:
         raise _invalid("Opus packets must contain exactly 960 samples (20 ms at 48 kHz)")
+    if not _opus_framing_ok(packet):
+        raise _invalid("malformed Opus packet (its frame lengths or padding do not fit the packet)")
 
 
 # ── wake hub / doorbell ────────────────────────────────────────────────────────────────────────────
@@ -2177,12 +2239,18 @@ class EncodedSink:
         self._closed = False
         self._wanted = 0
         self._started = False
+        self._played_ms = 0
         self._lock = threading.Lock()
         self.wake_id = conn.wake.alloc()
 
     @property
     def track(self) -> NativeTrack:
         return NativeTrack(self._track)
+
+    @property
+    def played_ms(self) -> int:
+        """Decoded audio played so far (fake: 20 ms per tick that consumed bytes)."""
+        return self._played_ms
 
     def write(self, data: Any) -> None:
         raw = _buffer_bytes(data, None, ("write_bytes", self._max))
@@ -2222,6 +2290,8 @@ class EncodedSink:
             if self._buf and not self._started:
                 self._started = True
                 self._track.record("play")
+            if self._buf:
+                self._played_ms += 20
             del self._buf[:16_384]
             notify = self._wanted and self._max - len(self._buf) >= self._wanted
             if notify:
@@ -2243,12 +2313,18 @@ class OpusSink:
         self._q: deque[bytes] = deque()
         self._closed = False
         self._paused_idle = True
+        self._paused_user = False
         self._lock = threading.Lock()
         self.wake_id = conn.wake.alloc()
 
     @property
     def buffered_ms(self) -> int:
         return 20 * len(self._q)
+
+    def _set_user_paused(self, paused: bool) -> None:
+        """``TrackHandle.pause()/resume()``: the stream keeps the user pause (a send does not undo it)."""
+        with self._lock:
+            self._paused_user = paused
 
     @property
     def track(self) -> NativeTrack:
@@ -2265,7 +2341,8 @@ class OpusSink:
             self._q.append(raw)
             if self._paused_idle:
                 self._paused_idle = False
-                self._track.record("play")
+                if not self._paused_user:
+                    self._track.record("play")
 
     def arm_space(self) -> bool:
         return len(self._q) < self._max
@@ -2281,9 +2358,17 @@ class OpusSink:
             self._closed = True
             if not drain:
                 self._q.clear()
-        if not drain and self._track.ended is None:
+            empty = not self._q
+            held = drain and self._paused_user and not empty
+        if self._track.ended is not None:
+            return
+        if not drain or held:
+            # Aborted, or a user pause holds packets that can never drain.
             self._track.record("stop")
             self._track.resolve("stopped")
+        elif empty:
+            # Nothing to drain: the reader returns EOF at its next pull.
+            self._track.resolve("finished")
 
 
 # ── the connection ─────────────────────────────────────────────────────────────────────────────────
@@ -3066,6 +3151,9 @@ class _Conn:
             if q.track is t:
                 with q.lock:
                     q.paused_user = paused
+        for s in self.sinks:
+            if getattr(s, "_track", None) is t and hasattr(s, "_set_user_paused"):
+                s._set_user_paused(paused)
 
     def _on_track_stopped(self, t: _Track) -> None:
         for q in self.playbacks:

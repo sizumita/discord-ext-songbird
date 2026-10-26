@@ -65,17 +65,125 @@ pub struct OpusStreamSpec {
     pub volume: f32,
 }
 
-/// 1..=1275 bytes and exactly 960 samples at 48 kHz (`InvalidAudio` otherwise).
+/// 1..=1275 bytes, structurally valid, and exactly 960 samples at 48 kHz (`InvalidAudio`
+/// otherwise).
+///
+/// `get_nb_samples` reads only the TOC byte and the frame count, so a packet whose frame lengths or
+/// padding run past its end would pass it. songbird's decoder then fails on it (whenever the
+/// stream is mixed rather than passed through), and one decode error ends the whole track
+/// (`MixStatus::Errored`): the framing is checked up front instead ([`opus_framing_ok`]).
 pub fn validate_opus_packet(p: &[u8]) -> Result<(), CoreError> {
     if p.is_empty() || p.len() > MAX_OPUS_PACKET {
         return Err(CoreError::invalid(OPUS_PACKET_SIZE_MSG));
     }
     match opus::packet::get_nb_samples(p, 48_000) {
-        Ok(960) => Ok(()),
-        _ => Err(CoreError::invalid(
-            "an Opus packet must hold exactly 20 ms (960 samples at 48 kHz)",
-        )),
+        Ok(960) => {}
+        _ => {
+            return Err(CoreError::invalid(
+                "an Opus packet must hold exactly 20 ms (960 samples at 48 kHz)",
+            ));
+        }
     }
+    if !opus_framing_ok(p) {
+        return Err(CoreError::invalid(
+            "malformed Opus packet (its frame lengths or padding do not fit the packet)",
+        ));
+    }
+    Ok(())
+}
+
+/// One frame length of a code 2/3 packet (RFC 6716 §3.2.1): `(length, bytes used)`.
+fn frame_size(d: &[u8]) -> Option<(isize, isize)> {
+    match d {
+        [a, ..] if *a < 252 => Some((isize::from(*a), 1)),
+        [a, b, ..] => Some((4 * isize::from(*b) + isize::from(*a), 2)),
+        _ => None,
+    }
+}
+
+/// Whether `p`'s framing (RFC 6716 §3.2: frame count, frame lengths, padding) fits the packet,
+/// exactly as libopus `opus_packet_parse` (non-self-delimited) decides, without its per-call
+/// allocation (`OpusPackets` validates up to `MAX_OPUS_PACKETS` packets in one buffer).
+pub(crate) fn opus_framing_ok(p: &[u8]) -> bool {
+    let Some((&toc, payload)) = p.split_first() else {
+        return false;
+    };
+    // `len`: payload bytes left (padding excluded); `at`: index of the next unread byte.
+    let mut len = payload.len() as isize;
+    let mut at = 1usize;
+    let rest = |at: usize, len: isize| p.get(at..at.saturating_add(len.max(0) as usize));
+    let last = match toc & 3 {
+        0 => len,
+        1 => {
+            if len % 2 != 0 {
+                return false;
+            }
+            len / 2
+        }
+        2 => {
+            let Some((size, bytes)) = rest(at, len).and_then(frame_size) else {
+                return false;
+            };
+            len -= bytes;
+            if size > len {
+                return false;
+            }
+            len - size
+        }
+        _ => {
+            let Some(&ch) = p.get(at) else {
+                return false;
+            };
+            at += 1;
+            len -= 1;
+            let count = isize::from(ch & 0x3F);
+            if count == 0 || len < 0 {
+                return false;
+            }
+            if ch & 0x40 != 0 {
+                loop {
+                    let Some(&b) = p.get(at).filter(|_| len > 0) else {
+                        return false;
+                    };
+                    at += 1;
+                    len -= 1 + if b == 255 { 254 } else { isize::from(b) };
+                    if b != 255 {
+                        break;
+                    }
+                }
+            }
+            if len < 0 {
+                return false;
+            }
+            if ch & 0x80 != 0 {
+                // VBR: every frame length but the last is coded.
+                let mut last = len;
+                for _ in 1..count {
+                    let Some((size, bytes)) = rest(at, len).and_then(frame_size) else {
+                        return false;
+                    };
+                    len -= bytes;
+                    if size > len {
+                        return false;
+                    }
+                    at += bytes as usize;
+                    last -= bytes + size;
+                }
+                if last < 0 {
+                    return false;
+                }
+                last
+            } else {
+                // CBR: equal frames.
+                let last = len / count;
+                if last * count != len {
+                    return false;
+                }
+                last
+            }
+        }
+    };
+    last <= MAX_OPUS_PACKET as isize
 }
 
 /// Codec parameters of an Opus input (48 kHz stereo, 20 ms packets).
@@ -102,6 +210,9 @@ struct OpusInner {
     silent_reserve: Vec<Box<[u8]>>,
     space_waiting: bool,
     closed: Option<CloseMode>,
+    /// `TrackHandle.pause()` (through `TrackRef::live`): kept here, so neither the next `send` nor
+    /// the idle auto-pause's resume undoes it.
+    paused_user: bool,
     paused_idle: bool,
     track_playing: bool,
     stop_sent: bool,
@@ -196,7 +307,7 @@ impl OpusQueue {
     }
 
     fn sync_track(&self, g: &mut OpusInner) {
-        let desired = !g.paused_idle && g.closed != Some(CloseMode::Abort);
+        let desired = !g.paused_user && !g.paused_idle && g.closed != Some(CloseMode::Abort);
         if desired == g.track_playing {
             return;
         }
@@ -250,6 +361,27 @@ impl OpusQueue {
             g.space_waiting = true;
             false
         }
+    }
+
+    /// User pause (`TrackHandle.pause()/resume()`): packets are held (the track is paused, so
+    /// nothing is pulled) until resumed.
+    pub fn pause(&self, paused: bool) {
+        let mut g = lock_checked(&self.inner);
+        g.paused_user = paused;
+        self.sync_track(&mut g);
+    }
+
+    /// A drain-close (see `PcmQueue::settle_drain`): the idle pause is lifted (no packet can come
+    /// now), and a user pause too when nothing is queued, so the track plays its rest and an empty
+    /// queue ends at the next pull (EOF → `finished`, not the `stopped` a stop reports). Returns
+    /// whether it must be stopped instead: a user pause holds packets that can then never drain.
+    fn settle_drain(&self, g: &mut OpusInner) -> bool {
+        g.paused_idle = false;
+        if g.packets.is_empty() {
+            g.paused_user = false;
+        }
+        self.sync_track(g);
+        !g.track_playing
     }
 
     /// Discards queued packets; returns the milliseconds discarded.
@@ -308,10 +440,11 @@ impl OpusQueue {
         let stop = {
             let mut g = lock_checked(&self.inner);
             self.sync_track(&mut g);
-            // Same rule as `close()`: a drain-closed track that is not playing can never drain.
+            // Same rule as `close()`: a drain-closed track plays its rest (an empty one ends at the
+            // next pull), unless a user pause holds packets that can then never drain.
             let stop = match g.closed {
                 Some(CloseMode::Abort) => true,
-                Some(CloseMode::Drain) => !g.track_playing,
+                Some(CloseMode::Drain) => self.settle_drain(&mut g),
                 None => false,
             } && !g.stop_sent;
             g.stop_sent |= stop;
@@ -462,8 +595,9 @@ impl LiveSource for OpusQueue {
             } else {
                 VecDeque::new()
             };
+            let cannot_drain = mode == CloseMode::Drain && self.settle_drain(&mut g);
             // Without an attached track the stop is left to `attach_track` (it would be lost).
-            let stop = (mode == CloseMode::Abort || !g.track_playing)
+            let stop = (mode == CloseMode::Abort || cannot_drain)
                 && !g.stop_sent
                 && self.track.get().is_some();
             g.stop_sent |= stop;
@@ -482,6 +616,15 @@ impl LiveSource for OpusQueue {
         self.end_flags
             .fetch_or(END_CONN_CLOSED | END_ABORT, Ordering::AcqRel);
         LiveSource::close(self, CloseMode::Abort);
+    }
+
+    fn set_user_paused(&self, paused: bool) -> bool {
+        self.pause(paused);
+        true
+    }
+
+    fn is_released(&self) -> bool {
+        self.end_flags.load(Ordering::Acquire) & (END_ABORT | END_CONN_CLOSED) != 0
     }
 }
 

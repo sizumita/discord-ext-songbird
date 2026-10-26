@@ -143,7 +143,9 @@ impl NativeTrack {
         self.control(py, PendingChange::Paused(false), TrackRef::resume)
     }
 
-    /// Stops the track; a pending entry is removed with reason ``"stopped"``.
+    /// Stops the track; a pending entry is removed with reason ``"stopped"``. A memory/file track
+    /// resolves ``"stopped"`` at once (also while the mixer is parked); a live stream's track
+    /// when songbird processes the stop.
     fn stop(&self, py: Python<'_>) -> PyResult<()> {
         ensure_not_forked(py)?;
         if self.track.flags.ended().is_some() {

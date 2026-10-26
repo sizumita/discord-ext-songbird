@@ -28,6 +28,8 @@ from discord.ext.songbird import (
 
 SILENT_FRAME = b"\xf8\xff\xfe"
 TEN_MS_FRAME = b"\xf0\xff\xfe"  # CELT FB 10 ms: 480 samples
+# Code 3, one 20 ms frame, but its padding length runs past the end: libopus cannot parse it.
+MALFORMED_FRAME = b"\xfb\x41\xff"
 
 
 def wav_bytes(ms: int = 200, rate: int = 24_000) -> bytes:
@@ -101,11 +103,30 @@ def test_raw_pcm_from_samples_any_rate() -> None:
     assert RawPcm.from_samples(arr, 48_000, 1).duration_ms == 100
 
 
+def test_raw_pcm_from_arrow_checks_the_array_type() -> None:
+    pa = pytest.importorskip("pyarrow")
+    pcm16 = songbird.AudioFormat(48_000, 1, "pcm16le")
+    f32 = songbird.AudioFormat(48_000, 1, "f32le")
+    assert RawPcm.from_arrow(pa.array([0] * 960, pa.int16()), pcm16).duration_ms == 20
+    assert RawPcm.from_arrow(pa.array([0.5] * 960, pa.float32()), f32).duration_ms == 20
+    assert RawPcm.from_arrow(pa.array([0] * 1_920, pa.uint8()), pcm16).duration_ms == 20  # raw bytes
+    assert RawPcm.from_arrow(pa.array([0xFF] * 160, pa.uint8()), songbird.MULAW_8K).duration_ms == 20
+    # 20 ms of floats would otherwise be read as 40 ms of int16 noise (and int16 as G.711 bytes).
+    with pytest.raises(InvalidAudio):
+        RawPcm.from_arrow(pa.array([0.5] * 960, pa.float32()), pcm16)
+    with pytest.raises(InvalidAudio):
+        RawPcm.from_arrow(pa.array([0] * 960, pa.int16()), f32)
+    with pytest.raises(InvalidAudio):
+        RawPcm.from_arrow(pa.array([1] * 960, pa.int16()), songbird.MULAW_8K)
+
+
 def test_opus_packets() -> None:
     p = OpusPackets([SILENT_FRAME] * 5)
     assert len(p) == 5 and p.duration_ms == 100
     with pytest.raises(InvalidAudio):
         OpusPackets([TEN_MS_FRAME])
+    with pytest.raises(InvalidAudio):
+        OpusPackets([MALFORMED_FRAME])  # 960 samples by its TOC, but undecodable
     with pytest.raises(InvalidAudio):
         OpusPackets([b""])
     with pytest.raises(InvalidAudio):
@@ -360,6 +381,54 @@ async def test_encoded_stream_copies_each_write_at_most_once(connected_vc: Harne
     assert rec.writes[1] is rec.writes[2]
     assert rec.writes[2] == tail
     stream.close()
+
+
+async def test_opus_stream_user_pause_survives_sends(connected_vc: HarnessClient, testing: Any) -> None:
+    vc = connected_vc
+    stream = vc.open_opus_stream()
+    stream.track.pause()
+    stream.send_nowait(SILENT_FRAME)  # the send that resumes an idle stream keeps it paused
+    assert "play" not in testing.track_log(stream.track._native)
+    stream.track.resume()
+    assert testing.track_log(stream.track._native)[-1] == "play"
+    with pytest.raises(InvalidAudio):
+        stream.send_nowait(MALFORMED_FRAME)
+    # Paused with packets left: a drain-close can never drain, so it stops at once.
+    stream.track.pause()
+    await asyncio.wait_for(stream.aclose(), 2)
+    assert (await stream.track.wait_ended()).reason == "stopped"
+
+
+async def test_stream_drains_are_bounded(connected_vc: HarnessClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing pulls the tracks here (as while self-muted or with the link down): the default
+    drain gives up after the grace instead of waiting forever."""
+    from discord.ext.songbird import playback
+
+    monkeypatch.setattr(playback, "_DRAIN_GRACE_S", 0.1)
+    vc = connected_vc
+    opus = vc.open_opus_stream()
+    opus.send_nowait(SILENT_FRAME)
+    await asyncio.wait_for(opus.aclose(), 2)  # buffered_ms + grace
+    assert opus.track.ended
+    encoded = vc.open_encoded_stream(max_buffer_bytes=64 << 10)
+    encoded.write_nowait(wav_bytes(1_000))
+    await asyncio.wait_for(encoded.aclose(), 2)  # no progress for the grace
+    assert encoded.track.ended
+
+
+async def test_stream_context_exit_on_error_closes_without_draining(connected_vc: HarnessClient) -> None:
+    vc = connected_vc
+    for open_stream in (vc.open_opus_stream, vc.open_encoded_stream):
+        stream: Any = None
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                async with open_stream() as stream:
+                    if isinstance(stream, songbird.OpusPacketStream):
+                        stream.send_nowait(SILENT_FRAME)
+                    else:
+                        stream.write_nowait(wav_bytes(1_000))
+                    await asyncio.sleep(10)
+        assert stream is not None and stream.track.ended  # closed at once, not drained
 
 
 async def test_opus_stream_plumbing(connected_vc: HarnessClient, testing: Any) -> None:

@@ -32,7 +32,8 @@ ClearResult = native.ClearResult
 PlaybackStats = native.PlaybackStats
 SegmentProgress = native.SegmentProgress
 
-#: Extra grace for ``aclose(drain=True)`` beyond the buffered audio (§7.8).
+#: Extra grace for ``aclose(drain=True)`` beyond the buffered audio, and how long an encoded
+#: stream's drain may make no progress before it is closed instead (§7.8).
 _DRAIN_GRACE_S = 2.0
 #: Pause between retries when the needed space includes inserted gap silence (defensive).
 _RETRY_S = 0.02
@@ -42,6 +43,33 @@ async def _yield_before_retry(spins: int) -> None:
     """Pause before retrying a write that did not fit although space was reported: yield to the
     loop on the first retry, then wait one tick, so a retry loop can never starve the event loop."""
     await asyncio.sleep(0 if spins <= 1 else _RETRY_S)
+
+
+async def _wait_drained(
+    track: TrackHandle, timeout: float | None, abort: Callable[[], None], progress: Callable[[], int] | None = None
+) -> None:
+    """Wait for a drain-closed stream's track to end, then return; call ``abort`` instead on
+    ``timeout``, or (``timeout=None`` with ``progress``) once ``progress()`` has not changed for
+    ``_DRAIN_GRACE_S``. A drain never waits unboundedly: while self-muted, while the voice link is
+    down or while paused, nothing plays, and the track would not end."""
+    try:
+        if timeout is not None or progress is None:
+            async with asyncio.timeout(timeout):
+                await track.wait_ended()
+            return
+        last = progress()
+        while True:
+            try:
+                async with asyncio.timeout(_DRAIN_GRACE_S):
+                    await track.wait_ended()
+                return
+            except TimeoutError:
+                now = progress()
+                if now == last:
+                    raise
+                last = now
+    except TimeoutError:
+        abort()
 
 
 def _nbytes(data: Buffer) -> int:
@@ -412,24 +440,27 @@ class EncodedStream:
         self._sink.close(False)
 
     async def aclose(self, *, drain: bool = True, timeout: float | None = None) -> None:
-        """Close; with ``drain=True`` finish the input and wait (at most ``timeout`` s) for the
-        decoded audio to play."""
+        """Close; with ``drain=True`` finish the input and wait for the decoded audio to play, then
+        return.
+
+        The wait is bounded: by ``timeout`` seconds if given, otherwise for as long as audio keeps
+        playing. Once nothing has played for 2 s (self-muted, the voice link down, the track
+        paused) the stream is closed (stopped) instead.
+        """
         if not drain:
             self.close()
             return
         self._sink.finish()
         self._sink.close(True)
-        try:
-            async with asyncio.timeout(timeout):
-                await self.track.wait_ended()
-        except TimeoutError:
-            self.close()
+        await _wait_drained(self.track, timeout, self.close, lambda: self._sink.played_ms)
 
     async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, *exc: object) -> None:
-        await self.aclose()
+    async def __aexit__(self, exc_type: type[BaseException] | None, *exc: object) -> None:
+        """``aclose()`` (drain, bounded) on a normal exit; ``close()`` at once when the block
+        raised or was cancelled, so a cancellation or timeout is not held up by the drain."""
+        await self.aclose(drain=exc_type is None)
 
 
 class OpusPacketStream:
@@ -490,19 +521,22 @@ class OpusPacketStream:
         self._sink.close(False)
 
     async def aclose(self, *, drain: bool = True, timeout: float | None = None) -> None:
-        """Close; with ``drain=True`` wait (at most ``timeout`` s) for the queued packets to play."""
+        """Close; with ``drain=True`` wait for the queued packets to play (at most ``timeout`` s,
+        default ``buffered_ms + 2 s``), then stop.
+
+        A paused stream with packets left cannot drain and is stopped at once.
+        """
         if not drain:
             self.close()
             return
+        deadline = timeout if timeout is not None else self._sink.buffered_ms / 1000 + _DRAIN_GRACE_S
         self._sink.close(True)
-        try:
-            async with asyncio.timeout(timeout):
-                await self.track.wait_ended()
-        except TimeoutError:
-            self.close()
+        await _wait_drained(self.track, deadline, self.close)
 
     async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, *exc: object) -> None:
-        await self.aclose()
+    async def __aexit__(self, exc_type: type[BaseException] | None, *exc: object) -> None:
+        """``aclose()`` (drain, bounded) on a normal exit; ``close()`` at once when the block
+        raised or was cancelled, so a cancellation or timeout is not held up by the drain."""
+        await self.aclose(drain=exc_type is None)

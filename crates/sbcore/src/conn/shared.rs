@@ -36,8 +36,8 @@ use crate::ctrl::{Control, CtrlQueue};
 use crate::error::{CloseReason, CoreError};
 use crate::events::{EventData, EventHub, EventQueue, KindMask};
 use crate::limits::{
-    MAX_LIVE_SOURCES_PER_CONN, MAX_PLAYING_TRACKS_PER_CONN, MAX_SUBS_PER_CONN, SEEK_S,
-    TICK_CHANNEL_CAP, TICK_MS, VOLUME, check,
+    MAX_LIVE_SOURCES_PER_CONN, MAX_PLAYING_TRACKS_PER_CONN, MAX_SUBS_PER_CONN, PREALLOCATED_TRACKS,
+    SEEK_S, TICK_CHANNEL_CAP, TICK_MS, VOLUME, check,
 };
 use crate::runtime::{self, LiveCounter, live};
 use crate::rx::pipeline::{RxConfig, RxPipeline};
@@ -82,10 +82,12 @@ pub(crate) enum Exec {
 /// One registered live source.
 struct SourceEntry {
     src: Weak<dyn LiveSource>,
-    /// Counted towards `MAX_LIVE_SOURCES_PER_CONN` (`open_*`). A lazy `Encoded` queue entry is a
-    /// live source too, but it is the queue's current entry and counts towards
-    /// `MAX_PLAYING_TRACKS_PER_CONN` instead, so songbird never holds more than
-    /// `MAX_LIVE_SOURCES_PER_CONN + MAX_PLAYING_TRACKS_PER_CONN` (= the 48 preallocated) tracks.
+    /// Counted towards `MAX_LIVE_SOURCES_PER_CONN` (`open_*`) until it is released (closed with
+    /// abort). A lazy `Encoded` queue entry is a live source too, but it is the queue's current
+    /// entry and counts towards `MAX_PLAYING_TRACKS_PER_CONN` instead; an encoded stream's
+    /// internal queue is registered uncounted next to its `EncodedShared` (T5 and `stop_all` reach
+    /// it after the `EncodedShared` is gone). Whatever these user-facing caps count, songbird
+    /// never holds more than `PREALLOCATED_TRACKS` (48) tracks: `resident_tracks`.
     counted: bool,
 }
 
@@ -135,6 +137,9 @@ pub struct ConnShared {
     /// admitted by `WorkerShared::reserve_sub`, which router-created streams share).
     playing_adm: Admission,
     live_adm: Admission,
+    /// `PREALLOCATED_TRACKS` tracks resident in songbird (`TrackRegistry::resident`), reserved
+    /// with either of the two above.
+    resident_adm: Admission,
     routers_adm: Admission,
     #[cfg(feature = "test-hooks")]
     pub(super) det: super::detached::DetachedState,
@@ -275,6 +280,7 @@ impl ConnShared {
                 stats: ConnStats::default(),
                 playing_adm: Admission::new(),
                 live_adm: Admission::new(),
+                resident_adm: Admission::new(),
                 routers_adm: Admission::new(),
                 #[cfg(feature = "test-hooks")]
                 det: super::detached::DetachedState::new(),
@@ -574,9 +580,11 @@ impl ConnShared {
             }
         };
         shared.attach_track(ctl);
-        let weak: Weak<dyn LiveSource> = Arc::downgrade(&shared) as Weak<dyn LiveSource>;
-        track.set_live(weak.clone());
-        self.add_source(weak, true);
+        // Pause, resume and volume go to the internal queue, which the reader keeps alive: the
+        // `EncodedShared` is freed once its decode thread and the Python sink are gone.
+        track.set_live(shared.live_queue());
+        self.add_source(Arc::downgrade(&shared) as Weak<dyn LiveSource>, true);
+        self.add_source(shared.live_queue(), false);
         Ok((shared, track))
     }
 
@@ -603,6 +611,9 @@ impl ConnShared {
         };
         q.attach_track(ctl);
         let weak: Weak<dyn LiveSource> = Arc::downgrade(&q) as Weak<dyn LiveSource>;
+        // The user pause lives in the queue: a direct songbird pause would be undone by the next
+        // `send` (or the idle pause's resume).
+        track.set_live(weak.clone());
         self.add_source(weak, true);
         Ok((q, track))
     }
@@ -701,9 +712,17 @@ impl ConnShared {
     pub fn start_track_info(&self, t: &TrackRef, timeout: Duration) -> Result<u32, CoreError> {
         self.ensure_open()?;
         let h = Self::songbird_handle(t)?;
+        // A live PCM source applies its volume in its decoder (its songbird track stays at 1.0).
+        let track = t.clone();
         let id = self.ops.start(&self.wake, async move {
             match tokio::time::timeout(timeout, h.get_info()).await {
-                Ok(Ok(state)) => OpResult::Info(TrackInfoData::from_state(&state)),
+                Ok(Ok(state)) => {
+                    let mut info = TrackInfoData::from_state(&state);
+                    if let Some(v) = track.source_volume() {
+                        info.volume = v;
+                    }
+                    OpResult::Info(info)
+                }
                 Ok(Err(e)) => OpResult::Err(CoreError::Track(e.to_string().into())),
                 Err(_) => OpResult::TimedOut,
             }
@@ -1155,9 +1174,11 @@ impl ConnShared {
             stream.pause(true);
         }
         // Registered first, so T5 closes it (or `add_source` does, if the connection is closing).
-        let weak: Weak<dyn LiveSource> = Arc::downgrade(&stream) as Weak<dyn LiveSource>;
-        track.set_live(weak.clone());
-        self.add_source(weak, false);
+        // Control goes to the internal queue, which outlives the `EncodedShared` (see
+        // `open_encoded`).
+        track.set_live(stream.live_queue());
+        self.add_source(Arc::downgrade(&stream) as Weak<dyn LiveSource>, false);
+        self.add_source(stream.live_queue(), false);
         match self.start_live(track, input, Some(stream.id()), 1.0) {
             Ok(ctl) => {
                 stream.attach_track(ctl);
@@ -1198,25 +1219,57 @@ impl ConnShared {
         g.as_mut().map(f)
     }
 
-    /// One of `MAX_LIVE_SOURCES_PER_CONN` (dead sources are pruned); hold the reservation until
-    /// `add_source` has registered the source.
-    fn reserve_live(&self) -> Result<Reservation<'_>, CoreError> {
-        self.live_adm
+    /// One of `MAX_LIVE_SOURCES_PER_CONN` open streams (dead and released sources are not
+    /// counted), plus one of the `PREALLOCATED_TRACKS` songbird-resident tracks; hold the
+    /// reservations until `add_source` has registered the source.
+    fn reserve_live(&self) -> Result<(Reservation<'_>, Reservation<'_>), CoreError> {
+        let live = self
+            .live_adm
             .reserve("live_sources", MAX_LIVE_SOURCES_PER_CONN, || {
-                let mut v = lock_checked(&self.sources);
-                v.retain(|e| e.src.strong_count() > 0);
-                v.iter().filter(|e| e.counted).count()
-            })
+                self.open_live_sources()
+            })?;
+        Ok((live, self.reserve_resident()?))
+    }
+
+    /// Registered `open_*` streams that still count: not released (closed with abort). A closed
+    /// stream's reader may stay in a parked mixer until the link is up; `resident_tracks` bounds
+    /// those.
+    fn open_live_sources(&self) -> usize {
+        let held: Vec<Arc<dyn LiveSource>> = {
+            let mut v = lock_checked(&self.sources);
+            v.retain(|e| e.src.strong_count() > 0);
+            v.iter()
+                .filter(|e| e.counted)
+                .filter_map(|e| e.src.upgrade())
+                .collect()
+        };
+        // Checked (and the upgraded `Arc`s dropped) after L10 is released.
+        held.iter().filter(|s| !s.is_released()).count()
     }
 
     /// One of `MAX_PLAYING_TRACKS_PER_CONN` (`play()` tracks plus the current queue entry, also a
-    /// lazy encoded stream); hold the reservation until the track is started
-    /// (`TrackRegistry::playing` or `TrackQueue::live_current` counts it).
-    pub(crate) fn reserve_playing(&self) -> Result<Reservation<'_>, CoreError> {
-        self.playing_adm
-            .reserve("playing_tracks", MAX_PLAYING_TRACKS_PER_CONN, || {
-                // Two leaf locks, one after the other (never nested).
-                self.tracks.playing() + self.queue.live_current()
+    /// lazy encoded stream), plus one of the `PREALLOCATED_TRACKS` songbird-resident tracks; hold
+    /// the reservations until the track is started (`TrackRegistry::playing` or
+    /// `TrackQueue::live_current` counts it).
+    pub(crate) fn reserve_playing(&self) -> Result<(Reservation<'_>, Reservation<'_>), CoreError> {
+        let playing =
+            self.playing_adm
+                .reserve("playing_tracks", MAX_PLAYING_TRACKS_PER_CONN, || {
+                    // Two leaf locks, one after the other (never nested).
+                    self.tracks.playing() + self.queue.live_current()
+                })?;
+        Ok((playing, self.reserve_resident()?))
+    }
+
+    /// One of the `PREALLOCATED_TRACKS` (48) tracks songbird may hold (its mixer is sized for
+    /// them, §4.8): started tracks whose input it has not dropped yet. Within the two caps above
+    /// this only binds while the mixer is parked (joining, connecting, reconnecting): songbird runs
+    /// track commands only on a live mixer, so every stream closed and track stopped meanwhile
+    /// stays resident until the link is up. `LimitExceeded("resident_tracks")`.
+    fn reserve_resident(&self) -> Result<Reservation<'_>, CoreError> {
+        self.resident_adm
+            .reserve("resident_tracks", usize::from(PREALLOCATED_TRACKS), || {
+                self.tracks.resident()
             })
     }
 

@@ -8,17 +8,17 @@
 use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 use smallvec::SmallVec;
 use songbird::input::codecs::{get_codec_registry, get_probe};
 use songbird::input::core::audio::SampleBuffer;
-use songbird::input::core::codecs::DecoderOptions;
+use songbird::input::core::codecs::{Decoder, DecoderOptions};
 use songbird::input::core::errors::Error as SymphError;
-use songbird::input::core::formats::FormatOptions;
+use songbird::input::core::formats::{FormatOptions, FormatReader, Track};
 use songbird::input::core::io::{MediaSource, MediaSourceStream};
 use songbird::input::core::meta::MetadataOptions;
 use songbird::input::core::probe::Hint;
@@ -225,6 +225,20 @@ impl EncodedShared {
         &self.pcm
     }
 
+    /// The internal decoded-audio queue as the track's live source (`TrackRef::live`, T5,
+    /// `stop_all`). Unlike this `EncodedShared` (held by the decode thread, which exits at end of
+    /// input, and by the Python sink), it lives as long as the songbird reader does, so the
+    /// track's pause, resume and volume keep reaching it for the whole track: a user pause set
+    /// before the input ended can still be lifted.
+    pub(crate) fn live_queue(&self) -> Weak<dyn LiveSource> {
+        Arc::downgrade(&self.pcm) as Weak<dyn LiveSource>
+    }
+
+    /// Real audio of this stream played so far, in ms (the drain progress `aclose` watches).
+    pub fn played_ms(&self) -> u64 {
+        self.pcm.stats().played_ms
+    }
+
     /// Attaches songbird's track (or a `FakeTrackControl`), once (`ConnShared::open_encoded` and
     /// the queue's lazy `Encoded` entries). The first decoded frame resumes it.
     pub(crate) fn attach_track(&self, t: Box<dyn TrackControl>) {
@@ -362,6 +376,14 @@ impl LiveSource for EncodedShared {
 
     fn set_source_volume(&self, v: f32) -> bool {
         self.pcm.set_volume(v).is_ok()
+    }
+
+    fn source_volume(&self) -> Option<f32> {
+        Some(self.pcm.volume())
+    }
+
+    fn is_released(&self) -> bool {
+        LiveSource::is_released(&*self.pcm)
     }
 }
 
@@ -568,6 +590,22 @@ impl BadPackets {
     }
 }
 
+/// A decoder for the reader's default track, else for its first decodable one, and that track's
+/// id (as songbird picks a file's track).
+fn pick_decoder(format: &dyn FormatReader) -> Option<(Box<dyn Decoder>, u32)> {
+    let registry = get_codec_registry();
+    let make = |t: &Track| {
+        registry
+            .make(&t.codec_params, &DecoderOptions::default())
+            .ok()
+            .map(|d| (d, t.id))
+    };
+    format
+        .default_track()
+        .and_then(make)
+        .or_else(|| format.tracks().iter().find_map(make))
+}
+
 /// The body of a decode thread.
 fn decode_loop(shared: &Arc<EncodedShared>) -> Outcome {
     // A stream closed before its first byte (never written, a queue entry skipped or the connection
@@ -605,24 +643,7 @@ fn decode_loop(shared: &Arc<EncodedShared>) -> Outcome {
         Err(_) => return closed_or(Outcome::Failed),
     };
     let mut format = probed.format;
-    let registry = get_codec_registry();
-    let picked = format
-        .default_track()
-        .and_then(|t| {
-            registry
-                .make(&t.codec_params, &DecoderOptions::default())
-                .ok()
-                .map(|d| (d, t.id))
-        })
-        .or_else(|| {
-            format.tracks().iter().find_map(|t| {
-                registry
-                    .make(&t.codec_params, &DecoderOptions::default())
-                    .ok()
-                    .map(|d| (d, t.id))
-            })
-        });
-    let Some((mut decoder, track_id)) = picked else {
+    let Some((mut decoder, mut track_id)) = pick_decoder(&*format) else {
         return closed_or(Outcome::Failed);
     };
     let mut pusher = Pusher {
@@ -639,6 +660,23 @@ fn decode_loop(shared: &Arc<EncodedShared>) -> Outcome {
         }
         let pkt = match format.next_packet() {
             Ok(p) => p,
+            Err(SymphError::ResetRequired) => {
+                // A chained Ogg stream (one physical stream per song, as Icecast radio sends)
+                // began a new physical stream: its tracks replace the old ones, so pick the
+                // decodable one again and carry on. The pusher keeps its resampler (it flushes
+                // and rebuilds it if the rate changed).
+                if shared.closed.load(Ordering::Acquire) {
+                    return Outcome::Closed;
+                }
+                let Some((d, id)) = pick_decoder(&*format) else {
+                    return closed_or(Outcome::Failed);
+                };
+                decoder = d;
+                track_id = id;
+                sbuf = None;
+                bad_packets = BadPackets::default();
+                continue;
+            }
             Err(e) => {
                 if shared.closed.load(Ordering::Acquire) {
                     return Outcome::Closed;

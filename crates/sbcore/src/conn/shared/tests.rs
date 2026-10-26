@@ -497,5 +497,76 @@ fn entries_enqueued_while_closing_always_end() {
     }
 }
 
+/// songbird runs track commands only on a live mixer, and a connection that is joining (or
+/// reconnecting) has none: every closed stream and stopped track stays in the parked mixer. The
+/// user-facing caps count only what is still open or playing (a closed stream frees its buffer;
+/// a stopped memory track resolves `stopped` at once, like `TrackQueue::skip`, so `wait_ended()`
+/// and `TrackEnded` do not wait for the link), and `resident_tracks` keeps songbird within its 48
+/// preallocated tracks.
+#[test]
+fn a_parked_mixer_keeps_closed_streams_and_stopped_tracks_off_the_user_caps() {
+    use crate::format::{PCM16_24K, PCM16_48K};
+    use crate::limits::{MAX_LIVE_SOURCES_PER_CONN, PREALLOCATED_TRACKS};
+    use crate::tx::memory::MemPcm;
+    use crate::tx::queue::tests::spec;
+    let _serial = TEST_LOCK.lock();
+    let (b, _peer) = bell();
+    let conn = ConnShared::new(params(Clock::Real, RawVoiceSettings::default()), b).unwrap();
+    let events = conn.subscribe_events(256, KindMask::ALL).unwrap();
+    conn.request_join(NonZeroU64::new(10).unwrap(), false, false);
+    assert_eq!(conn.status().state, "joining");
+    // One playback per utterance, each closed: none is open, so the 17th opens.
+    for _ in 0..=MAX_LIVE_SOURCES_PER_CONN {
+        let (q, _track) = conn.open_playback(spec(PCM16_24K)).unwrap();
+        LiveSource::close(&*q, CloseMode::Abort);
+    }
+    assert_eq!(conn.open_live_sources(), 0);
+    assert_eq!(conn.tracks.resident(), MAX_LIVE_SOURCES_PER_CONN + 1);
+    // Short clips played and stopped: resolved `stopped` now, off `MAX_PLAYING_TRACKS_PER_CONN`.
+    let clip = SourceSpec::Pcm(Arc::new(
+        MemPcm::from_i16(PCM16_48K, vec![0; 9_600]).unwrap(),
+    ));
+    let free = usize::from(PREALLOCATED_TRACKS) - conn.tracks.resident();
+    let mut stopped = Vec::new();
+    for _ in 0..free {
+        let t = conn.play(&clip, PlayOpts::default()).unwrap();
+        t.stop().unwrap();
+        assert_eq!(t.flags.ended(), Some(TrackEndReason::Stopped));
+        stopped.push(t);
+    }
+    assert_eq!(conn.tracks.playing(), 0);
+    // songbird still holds all of them: the 49th track is refused, as `resident_tracks`.
+    assert_eq!(conn.tracks.resident(), usize::from(PREALLOCATED_TRACKS));
+    for r in [
+        conn.play(&clip, PlayOpts::default()).map(drop),
+        conn.open_playback(spec(PCM16_24K)).map(drop),
+    ] {
+        match r {
+            Err(CoreError::Limit(e)) => assert_eq!(e.what, "resident_tracks"),
+            other => panic!("{other:?}"),
+        }
+    }
+    // Every stop is reported while the link is still down.
+    let mut ended = 0;
+    assert!(wait_until(Duration::from_secs(5), || {
+        while let Pop::Item(e) = events.try_pop() {
+            if let EventData::TrackEnded {
+                reason: TrackEndReason::Stopped,
+                ..
+            } = e
+            {
+                ended += 1;
+            }
+        }
+        ended == stopped.len()
+    }));
+    conn.close(CloseReason::Requested);
+    assert!(
+        stopped
+            .iter()
+            .all(|t| t.flags.ended() == Some(TrackEndReason::Stopped))
+    );
+}
+
 #[cfg(feature = "test-hooks")]
 mod detached;

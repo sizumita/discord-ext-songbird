@@ -936,10 +936,48 @@ fn close_modes_and_reader_end() {
         r.write(&r.audio(20)),
         Err(CoreError::StreamClosed(CloseReason::ConnectionClosed))
     ));
-    // A drain-close of an idle (paused) stream stops it at once.
+    // A drain-close of a never-written (paused) stream resumes it: the reader returns EOF at the
+    // next pull, so the track ends `finished` (a `stop()` would report `stopped`).
     let r = Rig::new(spec(PCM16_24K));
     LiveSource::close(&*r.q, CloseMode::Drain);
-    assert_eq!(r.log(), vec!["stop"]);
+    assert_eq!(r.log(), vec!["play"]);
+    assert!(PcmProvider::should_end(&*r.q));
+}
+
+/// A stream that played out and auto-paused (idle) is drain-closed later (e.g. the provider's
+/// done-signal arrived after `idle_ms`): nothing is left to drain, so it ends naturally (EOF →
+/// `finished`) instead of being stopped (`stopped`). A user pause with nothing queued is lifted
+/// the same way; one with audio left is stopped (a `PlaybackStream`'s rest is discarded).
+#[test]
+fn a_drain_close_after_the_idle_pause_ends_naturally() {
+    let mut r = Rig::new(spec(PCM16_24K));
+    r.write(&r.audio(40)).unwrap();
+    r.tick();
+    r.tick();
+    r.advance(300);
+    r.house();
+    assert_eq!(r.log(), vec!["play", "pause"], "idle auto-pause");
+    LiveSource::close(&*r.q, CloseMode::Drain);
+    assert_eq!(
+        r.log(),
+        vec!["play", "pause", "play"],
+        "resumed, not stopped"
+    );
+    assert!(PcmProvider::should_end(&*r.q), "EOF at the next pull");
+    // User-paused with nothing queued: nothing is discarded, so it ends naturally too.
+    let mut r = Rig::new(spec(PCM16_24K));
+    r.write(&r.audio(20)).unwrap();
+    r.tick();
+    r.q.pause(true);
+    LiveSource::close(&*r.q, CloseMode::Drain);
+    assert_eq!(r.log(), vec!["play", "pause", "play"]);
+    assert!(PcmProvider::should_end(&*r.q));
+    // User-paused with audio left: it can never drain, so it is stopped.
+    let r = Rig::new(spec(PCM16_24K));
+    r.write(&r.audio(100)).unwrap();
+    r.q.pause(true);
+    LiveSource::close(&*r.q, CloseMode::Drain);
+    assert_eq!(r.log(), vec!["play", "pause", "stop"]);
 }
 
 #[test]
@@ -998,8 +1036,18 @@ fn unattached(spec: PlaybackSpec) -> (Arc<PcmQueue>, Arc<WakeHub>, UnixStream) {
 
 #[test]
 fn a_close_before_attach_is_applied_when_the_track_attaches() {
-    // Never written (paused), drain-closed before the attach: it can never drain, so it stops.
+    // Never written (paused), drain-closed before the attach: nothing to drain, so it is resumed
+    // and ends at the next pull (EOF → `finished`).
     let (q, _hub, _bell) = unattached(spec(PCM16_24K));
+    LiveSource::close(&*q, CloseMode::Drain);
+    let log = Rec::default();
+    q.attach_track(Box::new(log.clone()));
+    assert_eq!(log.calls(), vec!["play"]);
+    assert!(PcmProvider::should_end(&*q));
+    // User-paused with audio, drain-closed before the attach: it can never drain, so it stops.
+    let (q, _hub, _bell) = unattached(spec(PCM16_24K));
+    q.write(&[1, 0, 2, 0], WriteMeta::default()).unwrap();
+    q.pause(true);
     LiveSource::close(&*q, CloseMode::Drain);
     let log = Rec::default();
     q.attach_track(Box::new(log.clone()));

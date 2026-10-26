@@ -696,6 +696,11 @@ class EncodedSink:
     already called: the decoded audio then plays out and the track ends on its own.
     """
     @property
+    def played_ms(self) -> builtins.int:
+        r"""
+        Decoded audio played so far, in ms (frozen while paused, self-muted or the link is down).
+        """
+    @property
     def wake_id(self) -> builtins.int: ...
     @property
     def track(self) -> NativeTrack: ...
@@ -801,7 +806,9 @@ class NativeTrack:
     def resume(self) -> None: ...
     def stop(self) -> None:
         r"""
-        Stops the track; a pending entry is removed with reason ``"stopped"``.
+        Stops the track; a pending entry is removed with reason ``"stopped"``. A memory/file track
+        resolves ``"stopped"`` at once (also while the mixer is parked); a live stream's track
+        when songbird processes the stop.
         """
     def set_volume(self, volume: builtins.float) -> None:
         r"""
@@ -1048,7 +1055,14 @@ class RawPcm:
     @classmethod
     def from_arrow(cls, array: object, format: AudioFormat | str) -> RawPcm:
         r"""
-        ``[arrow]`` An Int16/Float32/UInt8 primitive array without nulls.
+        ``[arrow]`` An Int16/Float32/UInt8 primitive array without nulls, whose type matches
+        ``format``'s encoding: Int16 for ``pcm16le``, Float32 for ``f32le``, UInt8 (raw bytes) for
+        any encoding.
+        
+        Raises
+        ------
+        InvalidAudio
+            The array type does not match the encoding (its bytes would be misread as samples).
         """
     @classmethod
     def from_samples(cls, data: collections.abc.Buffer | object, sample_rate: builtins.int, channels: builtins.int = 2, encoding: typing.Literal['pcm16le', 'f32le'] = "f32le") -> RawPcm:

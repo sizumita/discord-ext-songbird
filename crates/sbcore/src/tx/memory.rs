@@ -105,7 +105,11 @@ impl<M: MediaSource> Read for DoneSource<M> {
 
 impl<M: MediaSource> Seek for DoneSource<M> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.inner.seek(pos)
+        let at = self.inner.seek(pos)?;
+        // A seek (songbird looping the track, a user seek, a demuxer re-reading the file) makes
+        // the end a previous read reached stale; reading to the end records it again.
+        self.done.flags().clear_hint(EOF_SEEN);
+        Ok(at)
     }
 }
 
@@ -635,6 +639,8 @@ impl FormatReader for MemOpusReader {
         self.idx = usize::try_from(idx)
             .unwrap_or(usize::MAX)
             .min(self.frames.len());
+        // songbird loops by seeking back: the end seen before is stale (see `LiveReader::seek`).
+        self.done.flags().clear_hint(EOF_SEEN);
         Ok(SeekedTo {
             track_id: 0,
             required_ts,

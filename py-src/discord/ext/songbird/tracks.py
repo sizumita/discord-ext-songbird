@@ -139,7 +139,9 @@ class TrackHandle:
         return self._native.pending
 
     def pause(self) -> None:
-        """Pause (file tracks: applied by songbird's live mixer; pending entries: when they start)."""
+        """Pause (file tracks: applied by songbird's live mixer; live streams: held by the stream
+        itself until :meth:`resume`, whatever is written or sent meanwhile; pending entries: when
+        they start)."""
         self._native.pause()
 
     def resume(self) -> None:
@@ -147,7 +149,13 @@ class TrackHandle:
         self._native.resume()
 
     def stop(self) -> None:
-        """Stop the track (a pending queue entry is removed); it ends with ``"stopped"``."""
+        """Stop the track (a pending queue entry is removed); it ends with ``"stopped"``.
+
+        A memory/file track (``play()``, a queue entry) ends at once, also while the voice link is
+        down. songbird drops it from its mixer only once the link is up, and holds at most 48
+        tracks per connection (``LimitExceeded("resident_tracks")``). A live stream's track ends
+        once songbird processes the stop; use the stream's ``close()`` to end the stream itself.
+        """
         self._native.stop()
 
     def set_volume(self, volume: float) -> None:
