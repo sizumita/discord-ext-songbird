@@ -378,8 +378,8 @@ fn clear_and_close_never_wait_for_a_parsing_writer() {
 }
 
 #[test]
-fn gap_fill_regression_idle_pause_then_on_time_delta() {
-    // 1000 ms played, 250 ms idle with auto-pause, then a delta at at_ms = 2500 arriving at wall
+fn gap_fill_regression_idle_pause_then_on_time_write() {
+    // 1000 ms played, 250 ms idle with auto-pause, then a write at at_ms = 2500 arriving at wall
     // t0 + 2500: at most one tick of silence.
     let mut r = Rig::new(spec(PCM16_24K));
     let t0 = r.clock.now();
@@ -407,7 +407,7 @@ fn gap_fill_regression_idle_pause_then_on_time_delta() {
 }
 
 #[test]
-fn gap_fill_regression_early_delta_waits() {
+fn gap_fill_regression_early_write_waits() {
     let mut r = Rig::new(spec(PCM16_24K));
     let a = r.audio(1_000);
     r.write_at(&a, None, Some(0)).unwrap();
@@ -512,12 +512,12 @@ fn gap_silence_is_excluded_from_tags_and_played() {
         WriteOutcome::Accepted { gap_frames, .. } => assert_eq!(gap_frames, 9_600),
         o => panic!("{o:?}"),
     }
-    assert_eq!(r.q.item("x").unwrap().written_ms, 200);
+    assert_eq!(r.q.segment("x").unwrap().written_ms, 200);
     assert_eq!(r.q.stats().buffered_ms, 600);
     while r.queued() > 0 {
         r.tick();
     }
-    let it = r.q.item("x").unwrap();
+    let it = r.q.segment("x").unwrap();
     assert_eq!(it.played_ms, 200);
     assert_eq!(r.q.stats().played_ms, 200);
     assert_eq!(r.q.stats().gap_filled_ms, 400);
@@ -527,7 +527,7 @@ fn gap_silence_is_excluded_from_tags_and_played() {
 fn prebuffer_gate() {
     let mut s = spec(PCM16_24K);
     s.prebuffer_ms = 100; // 2400 frames, 5 ticks
-    // A reply shorter than the prebuffer plays after prebuffer_ticks.
+    // A segment shorter than the prebuffer plays after prebuffer_ticks.
     let mut r = Rig::new(s);
     r.write(&r.audio(40)).unwrap();
     for _ in 0..5 {
@@ -539,16 +539,16 @@ fn prebuffer_gate() {
     r.write(&r.audio(40)).unwrap();
     r.write(&r.audio(80)).unwrap();
     assert_eq!(r.tick().1.consumed, 480);
-    // drain() and end_item() release it.
+    // drain() and end_segment() release it.
     let mut r = Rig::new(s);
     r.write(&r.audio(40)).unwrap();
     assert!(!r.q.arm_drain());
     assert_eq!(r.tick().1.consumed, 480);
     let mut r = Rig::new(s);
     r.write_at(&r.audio(40), Some("i"), None).unwrap();
-    r.q.end_item("i");
+    r.q.end_segment("i");
     assert_eq!(r.tick().1.consumed, 480);
-    // A later write in the same turn does not re-arm it.
+    // A later write in the same segment does not re-arm it.
     r.write(&r.audio(40)).unwrap();
     assert_eq!(r.tick().1.consumed, 480);
 }
@@ -574,48 +574,48 @@ fn clear_frees_capacity_immediately_without_a_pull() {
 }
 
 #[test]
-fn clear_reports_an_underrun_item_and_rejects_its_late_deltas() {
+fn clear_reports_an_underrun_segment_and_rejects_its_late_writes() {
     let mut r = Rig::new(spec(PCM16_24K));
-    r.write_at(&r.audio(40), Some("item1"), None).unwrap();
+    r.write_at(&r.audio(40), Some("seg1"), None).unwrap();
     for _ in 0..3 {
         r.tick(); // 2 real ticks + 1 underrun tick; the tag is still open
     }
     assert!(r.q.stats().underrun_ms >= 20);
-    r.advance(100); // well past output_latency: only "open" keeps it in `items`
+    r.advance(100); // well past output_latency: only "open" keeps it in `segments`
     let res = r.q.clear(ClearOpts::default()).unwrap();
-    let it = res.items.iter().find(|i| &*i.tag == "item1").unwrap();
+    let it = res.segments.iter().find(|i| &*i.tag == "seg1").unwrap();
     assert_eq!(it.written_ms, 40);
     assert_eq!(it.played_ms, 40);
     assert_eq!(it.heard_ms, 40);
     assert!(!it.complete);
     assert_eq!(
-        r.write_at(&r.audio(20), Some("item1"), None).unwrap(),
+        r.write_at(&r.audio(20), Some("seg1"), None).unwrap(),
         WriteOutcome::Rejected { frames: 480 }
     );
     assert_eq!(r.q.stats().rejected_ms, 20);
     // Other tags and untagged writes still play.
     assert!(matches!(
-        r.write_at(&r.audio(20), Some("item2"), None).unwrap(),
+        r.write_at(&r.audio(20), Some("seg2"), None).unwrap(),
         WriteOutcome::Accepted { .. }
     ));
 }
 
 #[test]
-fn clear_reports_recently_pulled_closed_items_with_heard_ms() {
+fn clear_reports_recently_pulled_closed_segments_with_heard_ms() {
     let mut r = Rig::new(spec(PCM16_24K));
     r.write_at(&r.audio(40), Some("a"), None).unwrap();
-    r.q.end_item("a"); // closed, but pulled within output_latency_ms
+    r.q.end_segment("a"); // closed, but pulled within output_latency_ms
     r.tick();
     r.tick();
     let res = r.q.clear(ClearOpts::default()).unwrap();
-    let it = res.items.iter().find(|i| &*i.tag == "a").unwrap();
+    let it = res.segments.iter().find(|i| &*i.tag == "a").unwrap();
     assert!(it.complete);
     assert!(it.heard_ms < it.played_ms, "{it:?}");
     assert!(it.heard_ms <= it.written_ms);
 }
 
 #[test]
-fn tags_close_at_turn_end_and_are_not_reported_later() {
+fn tags_close_when_playback_goes_idle_and_are_not_reported_later() {
     let mut r = Rig::new(spec(PCM16_24K));
     r.write_at(&r.audio(40), Some("t1"), None).unwrap();
     for _ in 0..20 {
@@ -623,8 +623,8 @@ fn tags_close_at_turn_end_and_are_not_reported_later() {
     }
     assert!(r.q.stats().idle);
     let res = r.q.clear(ClearOpts::default()).unwrap();
-    assert!(res.items.is_empty(), "{:?}", res.items);
-    // Not rejected: the turn was over before the clear.
+    assert!(res.segments.is_empty(), "{:?}", res.segments);
+    // Not rejected: playback had gone idle before the clear.
     assert!(matches!(
         r.write_at(&r.audio(20), Some("t1"), None).unwrap(),
         WriteOutcome::Accepted { .. }
@@ -632,27 +632,27 @@ fn tags_close_at_turn_end_and_are_not_reported_later() {
 }
 
 #[test]
-fn end_item_completes_once_played_and_played_never_exceeds_written() {
+fn end_segment_completes_once_played_and_played_never_exceeds_written() {
     let mut r = Rig::new(spec(PCM16_24K));
     r.write_at(&r.audio(40), Some("e"), None).unwrap();
-    r.q.end_item("e");
-    assert!(!r.q.item("e").unwrap().complete);
+    r.q.end_segment("e");
+    assert!(!r.q.segment("e").unwrap().complete);
     r.tick();
-    assert!(!r.q.item("e").unwrap().complete);
+    assert!(!r.q.segment("e").unwrap().complete);
     r.tick();
-    let it = r.q.item("e").unwrap();
+    let it = r.q.segment("e").unwrap();
     assert!(it.complete);
     assert_eq!(it.played_ms, it.written_ms);
     for _ in 0..5 {
         r.tick();
-        let it = r.q.item("e").unwrap();
+        let it = r.q.segment("e").unwrap();
         assert!(it.played_ms <= it.written_ms);
     }
-    assert!(r.q.item("missing").is_none());
+    assert!(r.q.segment("missing").is_none());
 }
 
 #[test]
-fn reject_until_gap_ms_drops_contiguous_timed_deltas() {
+fn reject_until_gap_ms_drops_contiguous_timed_writes() {
     let r = Rig::new(spec(PCM16_24K));
     let d = r.audio(100);
     for at in [0, 100, 200] {
@@ -678,12 +678,12 @@ fn reject_until_gap_ms_drops_contiguous_timed_deltas() {
         r.write(&d).unwrap(),
         WriteOutcome::Accepted { .. }
     ));
-    // 700 + 250 = 950 > 900: still contiguous with the interrupted utterance.
+    // 700 + 250 = 950 > 900: still contiguous with the cleared audio.
     assert!(matches!(
         r.write_at(&d, None, Some(900)).unwrap(),
         WriteOutcome::Rejected { .. }
     ));
-    // The first delta after a real gap is accepted and ends the window.
+    // The first write after a real gap is accepted and ends the window.
     assert!(matches!(
         r.write_at(&d, None, Some(1_300)).unwrap(),
         WriteOutcome::Accepted { .. }
@@ -747,8 +747,8 @@ fn the_257th_tag_evicts_one_entry() {
         r.write_at(&[1, 0], Some(&format!("tag{i}")), None).unwrap();
     }
     assert_eq!(r.q.stats().tags_evicted, 1);
-    assert!(r.q.item("tag0").is_none());
-    assert!(r.q.item("tag256").is_some());
+    assert!(r.q.segment("tag0").is_none());
+    assert!(r.q.segment("tag256").is_some());
 }
 
 #[test]
@@ -761,16 +761,16 @@ fn heard_ms_converges_after_output_latency() {
     let s = r.q.stats();
     assert_eq!(s.played_ms, 100);
     assert!(s.heard_ms < 100 && s.heard_ms >= 60, "{}", s.heard_ms);
-    assert!(r.q.item("h").unwrap().heard_ms < 100);
+    assert!(r.q.segment("h").unwrap().heard_ms < 100);
     r.advance(40);
     assert_eq!(r.q.stats().heard_ms, 100);
-    assert_eq!(r.q.item("h").unwrap().heard_ms, 100);
+    assert_eq!(r.q.segment("h").unwrap().heard_ms, 100);
     // ... and it stays there through idle and auto-pause.
     for _ in 0..20 {
         r.idle_tick();
     }
     assert!(r.q.stats().idle);
-    assert_eq!(r.q.item("h").unwrap().heard_ms, 100);
+    assert_eq!(r.q.segment("h").unwrap().heard_ms, 100);
     assert_eq!(r.q.stats().heard_ms, 100);
 }
 
@@ -1034,7 +1034,7 @@ fn connection_close_wakes_and_resolves_an_end_waiter() {
 }
 
 #[test]
-fn link_down_discard_starts_a_new_turn() {
+fn link_down_discard_starts_a_new_segment() {
     let mut s = spec(PCM16_24K);
     s.when_disconnected = DisconnectPolicy::Discard;
     s.prebuffer_ms = 100;
@@ -1047,7 +1047,7 @@ fn link_down_discard_starts_a_new_turn() {
     );
     LiveSource::on_link(&*r.q, false);
     LiveSource::on_link(&*r.q, true);
-    // The next reply prebuffers again, as after clear().
+    // The next segment prebuffers again, as after clear().
     r.write(&r.audio(40)).unwrap();
     assert_eq!(r.pull().1.consumed, 0);
 }

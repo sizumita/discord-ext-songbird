@@ -12,9 +12,9 @@ use crate::errors::{CoreResultExt, Exc, ensure_not_forked, msg_exc};
 ///
 /// Parameters
 /// ----------
-/// sample_rate : int, default 24000
+/// sample_rate : int
 ///     One of 8000, 16000, 24000, 48000.
-/// channels : int, default 1
+/// channels : int
 ///     1 or 2.
 /// encoding : {"pcm16le", "f32le", "mulaw", "alaw"}, default "pcm16le"
 ///     ``"mulaw"``/``"alaw"`` (G.711) require 8000 Hz mono.
@@ -55,7 +55,7 @@ fn invalid(py: Python<'_>, msg: &str) -> PyErr {
 #[pymethods]
 impl PyAudioFormat {
     #[new]
-    #[pyo3(signature = (sample_rate = 24_000, channels = 1, encoding = "pcm16le"))]
+    #[pyo3(signature = (sample_rate, channels, encoding = "pcm16le"))]
     fn py_new(
         py: Python<'_>,
         sample_rate: i64,
@@ -88,9 +88,9 @@ impl PyAudioFormat {
     /// Parameters
     /// ----------
     /// spec : str
-    ///     ``'pcm16_24k'``, ``'pcm16_48k_stereo'``, ``'f32_48k'``, ``'mulaw'``, ``'alaw'``,
-    ///     ``'pcm16le/24000/1'``, a preset name such as ``'PCM16_48K_STEREO'``, or a MIME type as
-    ///     returned by :attr:`mime_type`.
+    ///     ``'pcm16_48k_stereo'``, ``'pcm16_16k'``, ``'f32_48k'``, ``'mulaw'``, ``'alaw'``,
+    ///     ``'pcm16le/48000/2'`` (encoding/rate/channels) or a preset name such as
+    ///     ``'PCM16_48K_STEREO'``.
     ///
     /// Returns
     /// -------
@@ -138,17 +138,10 @@ impl PyAudioFormat {
         self.fmt.frame_bytes()
     }
 
-    /// Exact bytes per millisecond (48 for PCM16 24 kHz mono).
+    /// Exact bytes per millisecond (192 for PCM16 48 kHz stereo).
     #[getter]
     fn bytes_per_ms(&self) -> usize {
         self.fmt.bytes_per_ms()
-    }
-
-    /// MIME type: ``'audio/pcm;rate=24000'``, ``'audio/pcmu'``, ``'audio/pcma'`` or
-    /// ``'audio/x-f32le;rate=48000'`` (stereo formats append ``';channels=2'``).
-    #[getter]
-    fn mime_type(&self) -> String {
-        self.fmt.mime_type().into_owned()
     }
 
     /// Exact byte length of ``ms`` milliseconds.

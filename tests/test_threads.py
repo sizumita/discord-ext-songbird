@@ -121,7 +121,7 @@ async def test_writers_and_clear_race_the_mixer(connected_vc: HarnessClient, tes
     assert not errors, errors
     st = pb.stats()
     assert st.played_ms <= st.written_ms
-    assert all(i.played_ms <= i.written_ms for i in pb.clear().items)
+    assert all(i.played_ms <= i.written_ms for i in pb.clear().segments)
     pb.close()
 
 

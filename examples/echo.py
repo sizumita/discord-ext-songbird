@@ -24,7 +24,7 @@ from typing import Any
 
 import discord
 from discord.ext import songbird
-from discord.ext.songbird import PCM16_48K_STEREO, PlaybackFull
+from discord.ext.songbird import PCM16_48K_STEREO, PlaybackFull, StreamClosed
 
 FMT = PCM16_48K_STEREO  # the default of listen_*() and open_playback(); spelled out for clarity
 DELAY_MS = 500  # 0..=1000
@@ -53,6 +53,8 @@ async def echo(vc: songbird.SongbirdClient, user: Any, stop: asyncio.Event, *, d
                     speaker.write_nowait(chunk)  # buffer protocol: no intermediate bytes object
                 except PlaybackFull:
                     pass  # the buffer is bounded; drop rather than fall further behind
+                except StreamClosed:
+                    break  # the connection closed while chunks were still queued: nothing plays now
             st.cancel()
         await speaker.drain(timeout=delay_ms / 1000 + 1)
         return speaker.written_ms

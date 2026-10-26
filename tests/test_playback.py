@@ -12,7 +12,7 @@ import sys
 from typing import Any
 
 import pytest
-from conftest import HarnessClient, pump_settle, tone
+from conftest import HarnessClient, drain, inject_ticks, pump_settle, tone
 from discord.ext import songbird
 from discord.ext.songbird import InvalidAudio, LimitExceeded, PlaybackFull, PlaybackStream, StreamClosed, VoiceEvent
 
@@ -124,6 +124,34 @@ async def test_buffer_types(connected_vc: HarnessClient) -> None:
     f32.close()
 
 
+async def test_chunk_must_match_the_playback_format(connected_vc: HarnessClient, testing: Any) -> None:
+    """A received chunk carries its format; the buffer code alone ('h') cannot tell 24 kHz mono from
+    48 kHz stereo, so a chunk of another format is rejected instead of playing as noise."""
+    vc = connected_vc
+    s24 = vc.listen_mixed(songbird.PCM16_24K, chunk_ms=40)
+    s_mulaw = vc.listen_mixed(songbird.MULAW_8K, chunk_ms=40)
+    inject_ticks(vc, testing, 2)
+    (chunk,) = drain(s24)
+    (mulaw,) = drain(s_mulaw)
+    default = vc.open_playback()  # PCM16_48K_STEREO
+    for wrong, pb in ((chunk, default), (mulaw, vc.open_playback(songbird.PCM16_8K))):
+        with pytest.raises(InvalidAudio, match="does not match the stream format"):
+            pb.write_nowait(wrong)
+        with pytest.raises(InvalidAudio):
+            await pb.write(wrong)
+        assert pb.written_ms == 0 and pb.buffered_ms == 0  # nothing consumed
+        pb.close()
+    with pytest.raises(InvalidAudio):
+        songbird.RawPcm(chunk, songbird.PCM16_48K_STEREO)
+    same = vc.open_playback(songbird.PCM16_24K)
+    same.write_nowait(chunk)
+    assert same.written_ms == 40
+    same.write_nowait(bytes(chunk))  # plain bytes are the caller's responsibility
+    assert same.written_ms == 80
+    assert songbird.RawPcm(chunk, songbird.PCM16_24K).duration_ms == 40
+    same.close()
+
+
 async def test_full_then_await_write(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
     pb = vc.open_playback(FMT, max_buffer_ms=100, max_gap_ms=40)
@@ -158,54 +186,54 @@ async def test_clear_is_immediate(connected_vc: HarnessClient, testing: Any) -> 
     vc = connected_vc
     pb = vc.open_playback(FMT)
     mh = mixer(testing, pb)
-    pb.write_nowait(pcm(1_000), tag="item-1")
+    pb.write_nowait(pcm(1_000), tag="seg-1")
     assert any(floats(tick(vc, mh)))
     res = pb.clear()
     assert res.discarded_ms == 980
     assert pb.buffered_ms == 0
     assert not any(floats(mh.pull(1)))  # silent at the next pull
-    (item,) = res.items
+    (seg,) = res.segments
     # Equal, not identical: native objects are built per access (no Python object is kept in Rust
     # state, I1).
-    by_tag = res.item("item-1")
-    assert by_tag is not None and (by_tag.tag, by_tag.played_ms) == (item.tag, item.played_ms)
-    assert item.tag == "item-1"
-    assert item.played_ms == 20 and item.heard_ms <= item.written_ms == 1_000
+    by_tag = res.segment("seg-1")
+    assert by_tag is not None and (by_tag.tag, by_tag.played_ms) == (seg.tag, seg.played_ms)
+    assert seg.tag == "seg-1"
+    assert seg.played_ms == 20 and seg.heard_ms <= seg.written_ms == 1_000
     assert res.generation >= 1
     assert pb.stats().clears == 1
     pb.close()
 
 
-async def test_underrun_item_is_reported_and_rejected(connected_vc: HarnessClient, testing: Any) -> None:
+async def test_underrun_segment_is_reported_and_rejected(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
     pb = vc.open_playback(FMT)
     mh = mixer(testing, pb)
     pb.write_nowait(pcm(40), tag="a")
     tick(vc, mh, 3)  # fully played, then one underrun tick; the tag is still open
     res = pb.clear()
-    assert [i.tag for i in res.items] == ["a"]
-    assert res.items[0].played_ms == res.items[0].written_ms == 40
-    pb.write_nowait(pcm(40), tag="a")  # a late delta of the cancelled item
+    assert [s.tag for s in res.segments] == ["a"]
+    assert res.segments[0].played_ms == res.segments[0].written_ms == 40
+    pb.write_nowait(pcm(40), tag="a")  # a late write of the cleared tag
     assert pb.written_ms == 40
     assert pb.stats().rejected_ms == 40
-    pb.write_nowait(pcm(40), tag="b")  # a new item plays
+    pb.write_nowait(pcm(40), tag="b")  # a new segment plays
     assert pb.written_ms == 80
     pb.close()
 
 
-async def test_end_item_complete(connected_vc: HarnessClient, testing: Any) -> None:
+async def test_end_segment_complete(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
     pb = vc.open_playback(FMT)
     mh = mixer(testing, pb)
     pb.write_nowait(pcm(40), tag="x")
-    pb.end_item("x")
-    item = pb.item("x")
-    assert item is not None and not item.complete
+    pb.end_segment("x")
+    seg = pb.segment("x")
+    assert seg is not None and not seg.complete
     tick(vc, mh, 2)
-    item = pb.item("x")
-    assert item is not None and item.complete and item.played_ms == 40
+    seg = pb.segment("x")
+    assert seg is not None and seg.complete and seg.played_ms == 40
     assert pb.played_ms_of("x") == 40 and pb.played_ms_of("nope") == 0
-    assert pb.item("nope") is None
+    assert pb.segment("nope") is None
     pb.close()
 
 
@@ -215,10 +243,10 @@ async def test_reject_until_gap(connected_vc: HarnessClient, testing: Any) -> No
     for at in (0, 100, 200):
         pb.write_nowait(pcm(100), at_ms=at)
     pb.clear(reject_until_gap_ms=250)
-    pb.write_nowait(pcm(100), at_ms=300)  # contiguous with the interrupted utterance
+    pb.write_nowait(pcm(100), at_ms=300)  # contiguous with the cleared audio
     pb.write_nowait(pcm(100), at_ms=450)  # still within the window
     assert pb.written_ms == 300
-    pb.write_nowait(pcm(100), at_ms=900)  # starts ≥ 250 ms after the cut: a new reply
+    pb.write_nowait(pcm(100), at_ms=900)  # starts ≥ 250 ms after the cut: a new segment
     assert pb.written_ms == 400
     pb.close()
 
@@ -245,13 +273,13 @@ async def test_gap_fill_after_idle_pause(connected_vc: HarnessClient, testing: A
     tick(vc, mh, 14)  # 280 ms idle → auto-pause
     assert pb.is_idle
     assert testing.track_log(pb.track._native)[-1] == "pause"
-    vc.harness.step(2_500 - 1_280)  # the next delta arrives on time, at t0 + 2500 ms
+    vc.harness.step(2_500 - 1_280)  # the next write arrives on time, at t0 + 2500 ms
     pb.write_nowait(pcm(100), at_ms=2_500)
     assert pb.buffered_ms <= 100 + 20
     pb.close()
 
 
-async def test_gap_fill_for_an_early_delta(connected_vc: HarnessClient, testing: Any) -> None:
+async def test_gap_fill_for_an_early_write(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
     pb = vc.open_playback(FMT)
     mh = mixer(testing, pb)
@@ -265,7 +293,7 @@ async def test_gap_fill_for_an_early_delta(connected_vc: HarnessClient, testing:
     pb.close()
 
 
-async def test_late_delta_appends(connected_vc: HarnessClient) -> None:
+async def test_late_write_appends(connected_vc: HarnessClient) -> None:
     vc = connected_vc
     pb = vc.open_playback(FMT)
     pb.write_nowait(pcm(200), at_ms=1_000)
@@ -277,7 +305,7 @@ async def test_late_delta_appends(connected_vc: HarnessClient) -> None:
     pb.close()
 
 
-async def test_prebuffer_shorter_reply_still_plays(connected_vc: HarnessClient, testing: Any) -> None:
+async def test_prebuffer_shorter_segment_still_plays(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
     pb = vc.open_playback(FMT, prebuffer_ms=200)
     mh = mixer(testing, pb)
@@ -289,12 +317,12 @@ async def test_prebuffer_shorter_reply_still_plays(connected_vc: HarnessClient, 
     pb.close()
 
 
-async def test_prebuffer_released_by_end_item(connected_vc: HarnessClient, testing: Any) -> None:
+async def test_prebuffer_released_by_end_segment(connected_vc: HarnessClient, testing: Any) -> None:
     vc = connected_vc
     pb = vc.open_playback(FMT, prebuffer_ms=200)
     mh = mixer(testing, pb)
     pb.write_nowait(pcm(60), tag="t")
-    pb.end_item("t")
+    pb.end_segment("t")
     tick(vc, mh, 3)
     assert pb.played_ms == 60
     pb.close()

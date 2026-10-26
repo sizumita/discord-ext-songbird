@@ -29,7 +29,7 @@ def test_presets(name: str, spec: tuple[int, int, Any]) -> None:
     assert (fmt.sample_rate, fmt.channels, fmt.encoding) == spec
     assert AudioFormat(*spec) == fmt
     assert AudioFormat.parse(name) == fmt
-    assert AudioFormat.parse(fmt.mime_type) == fmt
+    assert AudioFormat.parse(f"{fmt.encoding}/{fmt.sample_rate}/{fmt.channels}") == fmt
 
 
 def test_only_neutral_presets_are_exported() -> None:
@@ -54,12 +54,9 @@ def test_default_format_is_discord_native(method: str) -> None:
         ("f32_48k", (48_000, 1, "f32le")),
         ("mulaw", (8_000, 1, "mulaw")),
         ("alaw", (8_000, 1, "alaw")),
-        ("g711_ulaw", (8_000, 1, "mulaw")),
         ("pcm16le/24000/1", (24_000, 1, "pcm16le")),
         ("pcm16le/48000/2", (48_000, 2, "pcm16le")),
         ("  PCM16_16K ", (16_000, 1, "pcm16le")),
-        ("audio/pcm;rate=24000", (24_000, 1, "pcm16le")),
-        ("audio/pcmu", (8_000, 1, "mulaw")),
     ],
 )
 def test_parse(spec: str, expected: tuple[int, int, str]) -> None:
@@ -69,7 +66,23 @@ def test_parse(spec: str, expected: tuple[int, int, str]) -> None:
 
 @pytest.mark.parametrize(
     "spec",
-    ["pcm16", "pcm16_12k", "pcm16_44.1k", "pcm16_24", "pcm16_24k_quad", "pcm16le/24000/3", "mulaw_16k", "nope", ""],
+    [
+        "pcm16",
+        "pcm16_12k",
+        "pcm16_44.1k",
+        "pcm16_24",
+        "pcm16_24k_quad",
+        "pcm16le/24000/3",
+        "mulaw_16k",
+        "nope",
+        "",
+        # Only this library's own spellings: no MIME types, no protocol-specific aliases.
+        "audio/pcm;rate=24000",
+        "audio/L16;rate=16000",
+        "audio/pcmu",
+        "g711_ulaw",
+        "g711_alaw",
+    ],
 )
 def test_parse_rejects(spec: str) -> None:
     with pytest.raises(InvalidAudio):
@@ -91,9 +104,19 @@ def test_unknown_encoding() -> None:
         AudioFormat(24_000, 1, "opus")  # type: ignore
 
 
-def test_defaults_and_aliases() -> None:
-    assert AudioFormat() == songbird.PCM16_24K
+def test_rate_and_channels_are_required() -> None:
+    with pytest.raises(TypeError):
+        AudioFormat()  # type: ignore
+    with pytest.raises(TypeError):
+        AudioFormat(48_000)  # type: ignore
+    assert AudioFormat(48_000, 2) == songbird.PCM16_48K_STEREO
+
+
+def test_encoding_aliases() -> None:
     assert AudioFormat(8_000, 1, "ulaw") == songbird.MULAW_8K  # type: ignore
+    assert AudioFormat(8_000, 1, "pcma") == songbird.ALAW_8K  # type: ignore
+    with pytest.raises(InvalidAudio):
+        AudioFormat(8_000, 1, "g711_ulaw")  # type: ignore
     assert AudioFormat(48_000, 1, "float32") == songbird.F32_48K  # type: ignore
 
 
@@ -141,14 +164,9 @@ def test_silence_stereo_limit() -> None:
         songbird.F32_48K_STEREO.silence(10**10)
 
 
-def test_mime_type() -> None:
-    assert songbird.PCM16_24K.mime_type == "audio/pcm;rate=24000"
-    assert songbird.MULAW_8K.mime_type == "audio/pcmu"
-    assert songbird.ALAW_8K.mime_type == "audio/pcma"
-    assert songbird.F32_48K.mime_type == "audio/x-f32le;rate=48000"
-    assert songbird.PCM16_16K.mime_type == "audio/pcm;rate=16000"
-    assert songbird.PCM16_48K_STEREO.mime_type == "audio/pcm;rate=48000;channels=2"
-    assert AudioFormat.parse("audio/pcm;rate=48000;channels=2") == songbird.PCM16_48K_STEREO
+def test_no_mime_type() -> None:
+    # Protocols spell formats differently; build the string from sample_rate/channels/encoding.
+    assert not hasattr(songbird.PCM16_48K_STEREO, "mime_type")
 
 
 def test_eq_hash_immutable() -> None:

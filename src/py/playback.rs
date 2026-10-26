@@ -1,5 +1,5 @@
 //! `native.Playback`, `native.EncodedSink`, `native.OpusSink`, `native.ClearResult`,
-//! `native.ItemProgress` and `native.PlaybackStats` (W4, §7, §12.6).
+//! `native.SegmentProgress` and `native.PlaybackStats` (W4, §7, §12.6).
 //!
 //! Writes are synchronous and all-or-nothing; audio is extracted (bytes borrowed, other buffers
 //! copied and released) **before** any sbcore call (I8).
@@ -15,11 +15,11 @@ use sbcore::tracks::TrackRef;
 use sbcore::tx::encoded::EncodedShared;
 use sbcore::tx::opus_stream::OpusQueue;
 use sbcore::tx::queue::{
-    ClearOpts, ClearSummary, ItemProgressData, PcmQueue, PlaybackStatsData, WriteMeta,
+    ClearOpts, ClearSummary, PcmQueue, PlaybackStatsData, SegmentProgressData, WriteMeta,
 };
 use sbcore::tx::{CloseMode, LiveSource, PcmProvider};
 
-use crate::convert::{extract_audio, extract_bytes, int_arg};
+use crate::convert::{MaxBytes, check_chunk_format, extract_audio, extract_bytes, int_arg};
 use crate::errors::{CoreResultExt, ensure_not_forked};
 use crate::py::tracks::NativeTrack;
 
@@ -83,7 +83,8 @@ impl Playback {
     /// data : collections.abc.Buffer
     ///     ``bytes`` or any C-contiguous buffer whose format matches the stream encoding.
     /// tag : str or None, default None
-    ///     Application-defined segment tag (at most 128 bytes) used by ``item()`` / ``end_item()``.
+    ///     Application-defined segment tag (at most 128 bytes), used by ``segment()`` and
+    ///     ``end_segment()``.
     /// at_ms : int or None, default None
     ///     Source-timeline timestamp in ms; a gap since the previous timed write is filled with
     ///     silence (up to ``max_gap_ms``).
@@ -95,7 +96,10 @@ impl Playback {
     /// PlaybackFull
     ///     Not enough space (nothing consumed).
     /// InvalidAudio
-    ///     A typed buffer whose format does not match the encoding, or a bad tag.
+    ///     A typed buffer whose format does not match the encoding, an ``AudioChunk`` of another
+    ///     format, or a bad tag.
+    /// LimitExceeded
+    ///     The write is larger than the whole buffer (checked before anything is copied).
     /// StreamClosed
     ///     The playback or connection is closed.
     #[pyo3(signature = (data, tag = None, at_ms = None))]
@@ -108,7 +112,13 @@ impl Playback {
         at_ms: Option<i64>,
     ) -> PyResult<()> {
         ensure_not_forked(py)?;
-        let audio = extract_audio(data, PcmProvider::format(&*self.q).encoding)?;
+        let fmt = PcmProvider::format(&*self.q);
+        check_chunk_format(data, fmt)?;
+        let max = MaxBytes {
+            what: "write_bytes",
+            max: self.q.max_write_bytes(),
+        };
+        let audio = extract_audio(data, fmt.encoding, max)?;
         self.q
             .write(audio.bytes(), WriteMeta { tag, at_ms })
             .py(py)?;
@@ -168,15 +178,15 @@ impl Playback {
 
     /// The application finished writing this tagged segment: closes the tag and releases the
     /// prebuffer gate.
-    fn end_item(&self, py: Python<'_>, tag: &str) -> PyResult<()> {
+    fn end_segment(&self, py: Python<'_>, tag: &str) -> PyResult<()> {
         ensure_not_forked(py)?;
-        self.q.end_item(tag);
+        self.q.end_segment(tag);
         Ok(())
     }
 
-    /// Progress of one tag.
-    fn item(&self, tag: &str) -> Option<ItemProgress> {
-        self.q.item(tag).map(ItemProgress::new)
+    /// Progress of the tagged segment ``tag``, if it is known.
+    fn segment(&self, tag: &str) -> Option<SegmentProgress> {
+        self.q.segment(tag).map(SegmentProgress::new)
     }
 
     fn pause(&self, py: Python<'_>) -> PyResult<()> {
@@ -481,40 +491,43 @@ impl ClearResult {
 
     /// Every open tag plus every tag pulled within the last ``output_latency_ms``.
     #[getter]
-    #[gen_stub(override_return_type(type_repr = "tuple[ItemProgress, ...]"))]
-    fn items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+    #[gen_stub(override_return_type(type_repr = "tuple[SegmentProgress, ...]"))]
+    fn segments<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         PyTuple::new(
             py,
-            self.s.items.iter().map(|d| ItemProgress::new(d.clone())),
+            self.s
+                .segments
+                .iter()
+                .map(|d| SegmentProgress::new(d.clone())),
         )
     }
 
-    /// The item of ``tag``, if it is in ``items``.
-    fn item(&self, tag: &str) -> Option<ItemProgress> {
+    /// The progress of ``tag``, if it is in ``segments``.
+    fn segment(&self, tag: &str) -> Option<SegmentProgress> {
         self.s
-            .items
+            .segments
             .iter()
             .find(|d| d.tag.as_ref() == tag)
-            .map(|d| ItemProgress::new(d.clone()))
+            .map(|d| SegmentProgress::new(d.clone()))
     }
 }
 
 /// Playback progress of one tagged segment (§7.7).
 #[gen_stub_pyclass]
 #[pyclass(module = "discord.ext.songbird.native", frozen)]
-pub struct ItemProgress {
-    d: Arc<ItemProgressData>,
+pub struct SegmentProgress {
+    d: Arc<SegmentProgressData>,
 }
 
-impl ItemProgress {
-    fn new(d: ItemProgressData) -> Self {
-        ItemProgress { d: Arc::new(d) }
+impl SegmentProgress {
+    fn new(d: SegmentProgressData) -> Self {
+        SegmentProgress { d: Arc::new(d) }
     }
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
-impl ItemProgress {
+impl SegmentProgress {
     #[getter]
     fn tag(&self) -> &str {
         &self.d.tag
@@ -536,7 +549,7 @@ impl ItemProgress {
         self.d.heard_ms
     }
 
-    /// ``end_item(tag)`` was called and everything written has been played.
+    /// ``end_segment(tag)`` was called and everything written has been played.
     #[getter]
     fn complete(&self) -> bool {
         self.d.complete
@@ -544,7 +557,7 @@ impl ItemProgress {
 
     fn __repr__(&self) -> String {
         format!(
-            "<ItemProgress tag={:?} written_ms={} played_ms={} heard_ms={} complete={}>",
+            "<SegmentProgress tag={:?} written_ms={} played_ms={} heard_ms={} complete={}>",
             self.d.tag, self.d.written_ms, self.d.played_ms, self.d.heard_ms, self.d.complete
         )
     }

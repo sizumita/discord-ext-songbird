@@ -57,7 +57,14 @@ from .formats import (
 from .formats import (
     FormatLike as FormatLike,
 )
-from .playback import ClearResult, EncodedStream, ItemProgress, OpusPacketStream, PlaybackStats, PlaybackStream
+from .playback import (
+    ClearResult,
+    EncodedStream,
+    OpusPacketStream,
+    PlaybackStats,
+    PlaybackStream,
+    SegmentProgress,
+)
 from .streams import (
     AudioChunk,
     AudioStream,
@@ -123,7 +130,7 @@ __all__ = [
     "PlaybackStream",
     "PlaybackStats",
     "ClearResult",
-    "ItemProgress",
+    "SegmentProgress",
     "EncodedStream",
     "OpusPacketStream",
     "AudioFile",

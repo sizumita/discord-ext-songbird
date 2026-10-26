@@ -138,15 +138,15 @@ impl Default for ClearOpts {
     }
 }
 
-/// `native.ItemProgress` data.
+/// `native.SegmentProgress` data.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ItemProgressData {
+pub struct SegmentProgressData {
     pub tag: Arc<str>,
     pub written_ms: u64,
     /// Clamped to `written_ms`.
     pub played_ms: u64,
     pub heard_ms: u64,
-    /// `end_item(tag)` was called and everything written has been played.
+    /// `end_segment(tag)` was called and everything written has been played.
     pub complete: bool,
 }
 
@@ -159,7 +159,7 @@ pub struct ClearSummary {
     pub position_ms: u64,
     pub generation: u64,
     /// Every open tag plus every tag pulled within the last `output_latency_ms`.
-    pub items: Vec<ItemProgressData>,
+    pub segments: Vec<SegmentProgressData>,
 }
 
 /// `native.PlaybackStats` data (+ positions).
@@ -258,7 +258,7 @@ pub(crate) struct QueueInner {
     pub(crate) end_waiting: bool,
     pub(crate) active: bool,
     /// The next accepted write starts a segment (never written, idle, or cleared since).
-    pub(crate) fresh_turn: bool,
+    pub(crate) fresh_segment: bool,
     /// Wall time of the last accepted write or clear (idle detection).
     pub(crate) last_activity: Instant,
     pub(crate) write_seq: u64,
@@ -416,7 +416,7 @@ impl PcmQueue {
             idle_waiting: false,
             end_waiting: false,
             active: false,
-            fresh_turn: true,
+            fresh_segment: true,
             last_activity: now,
             write_seq: 0,
             paused_user: false,
@@ -507,6 +507,14 @@ impl PcmQueue {
             .store(u8::try_from(w.len()).unwrap_or(0), Ordering::Release);
     }
 
+    /// The largest write `write()` accepts, in bytes (the buffer capacity, `max_buffer_ms`); a
+    /// longer one raises `LimitExceeded` (`write_bytes`) before it is parsed.
+    pub fn max_write_bytes(&self) -> u64 {
+        self.lim
+            .cap_frames
+            .saturating_mul(self.fmt.frame_bytes() as u64)
+    }
+
     /// All-or-nothing write (§7.3) of raw bytes in the stream encoding: parse outside locks, L6w
     /// splice, L6 commit. `PlaybackFull` consumes nothing.
     pub fn write(&self, data: &[u8], meta: WriteMeta<'_>) -> Result<WriteOutcome, CoreError> {
@@ -516,10 +524,7 @@ impl PcmQueue {
         {
             return Err(CoreError::invalid("tag must be at most 128 bytes"));
         }
-        let cap_bytes = self
-            .lim
-            .cap_frames
-            .saturating_mul(self.fmt.frame_bytes() as u64);
+        let cap_bytes = self.max_write_bytes();
         let ch = self.channels();
         let mut parsed = parse_write(
             &self.parser,
@@ -759,13 +764,13 @@ impl PcmQueue {
         self.st.written.fetch_add(frames, Ordering::Relaxed);
         self.st.queued.store(g.queued_frames, Ordering::Release);
         // e. Start.
-        if queued_before == 0 && g.fresh_turn && self.lim.prebuffer_frames > 0 {
+        if queued_before == 0 && g.fresh_segment && self.lim.prebuffer_frames > 0 {
             g.gate = Prebuffer {
                 armed: true,
                 ticks_left: self.lim.prebuffer_ticks,
             };
         }
-        g.fresh_turn = false;
+        g.fresh_segment = false;
         g.active = true;
         self.st.active.store(true, Ordering::Release);
         g.last_activity = now;
@@ -886,10 +891,10 @@ impl PcmQueue {
         played_ms - hold
     }
 
-    fn item_of(&self, e: &super::tags::TagEntry, now: Instant) -> ItemProgressData {
+    fn segment_of(&self, e: &super::tags::TagEntry, now: Instant) -> SegmentProgressData {
         let written_ms = self.ms(e.written);
         let played_ms = self.ms(e.played.min(e.written));
-        ItemProgressData {
+        SegmentProgressData {
             tag: e.name.clone(),
             written_ms,
             played_ms,
@@ -907,16 +912,16 @@ impl PcmQueue {
         let now = self.clock.now();
         let lat = u64::from(self.lim.output_latency_ms);
         let mut after = After::default();
-        let (discarded, generation, items) = {
+        let (discarded, generation, segments) = {
             let mut g = lock_checked(&self.inner);
-            let mut items = Vec::new();
+            let mut segments = Vec::new();
             let mut open_names: SmallVec<[Arc<str>; 8]> = SmallVec::new();
             for e in g.tags.iter() {
                 let recent = e
                     .last_pull
                     .is_some_and(|p| self.since_pull_ms(p, now) < lat);
                 if e.open || recent {
-                    items.push(self.item_of(e, now));
+                    segments.push(self.segment_of(e, now));
                 }
                 if e.open {
                     open_names.push(e.name.clone());
@@ -938,8 +943,8 @@ impl PcmQueue {
                 for name in open_names {
                     g.rejected.insert(name);
                 }
-                for it in &items {
-                    g.rejected.insert(it.tag.clone());
+                for s in &segments {
+                    g.rejected.insert(s.tag.clone());
                 }
             }
             g.tags.close_all();
@@ -952,9 +957,9 @@ impl PcmQueue {
             if hold_ms > 0 {
                 g.hold_until = now.checked_add(Duration::from_millis(u64::from(hold_ms)));
             }
-            g.fresh_turn = true;
+            g.fresh_segment = true;
             g.last_activity = now;
-            (discarded, g.generation, items)
+            (discarded, g.generation, segments)
         };
         self.st.clears.fetch_add(1, Ordering::Relaxed);
         self.finish(after);
@@ -967,12 +972,12 @@ impl PcmQueue {
             heard_ms: self.heard_ms(played_ms, (last > 0).then_some(last), now),
             position_ms: self.ms(self.st.position.load(Ordering::Acquire)),
             generation,
-            items,
+            segments,
         })
     }
 
     /// Closes the tag, sets `ended`, releases the prebuffer gate.
-    pub fn end_item(&self, tag: &str) {
+    pub fn end_segment(&self, tag: &str) {
         let mut g = lock_checked(&self.inner);
         if let Some(id) = g.tags.find(tag)
             && let Some(e) = g.tags.get_mut(id)
@@ -1002,11 +1007,11 @@ impl PcmQueue {
     }
 
     /// Progress of one tag.
-    pub fn item(&self, tag: &str) -> Option<ItemProgressData> {
+    pub fn segment(&self, tag: &str) -> Option<SegmentProgressData> {
         let now = self.clock.now();
         let g = lock_checked(&self.inner);
         let id = g.tags.find(tag)?;
-        g.tags.get(id).map(|e| self.item_of(e, now))
+        g.tags.get(id).map(|e| self.segment_of(e, now))
     }
 
     pub fn stats(&self) -> PlaybackStatsData {
@@ -1246,7 +1251,7 @@ impl PcmQueue {
                 {
                     g.active = false;
                     self.st.active.store(false, Ordering::Release);
-                    g.fresh_turn = true;
+                    g.fresh_segment = true;
                     g.tags.close_all();
                     if h.announced {
                         h.announced = false;
@@ -1475,7 +1480,7 @@ impl LiveSource for PcmQueue {
                 self.abort_locked(&mut g, &mut after);
                 g.anchor = None;
                 // Like clear(): the next accepted write starts a segment (prebuffer gate re-armed).
-                g.fresh_turn = true;
+                g.fresh_segment = true;
                 g.generation += 1;
                 self.st.generation.store(g.generation, Ordering::Release);
             }

@@ -14,13 +14,20 @@ use sbcore::tx::memory::{EncodedBytes, MemPcm, OpusFrames, read_file};
 use sbcore::tx::source::SourceSpec;
 use sbcore::{Encoding, Format, LimitError, LimitNum};
 
-use crate::convert::{AudioData, extract_audio, extract_bytes, int_arg};
+use crate::convert::{
+    AudioData, MaxBytes, check_chunk_format, extract_audio, extract_bytes, int_arg,
+};
 use crate::errors::{CoreResultExt, Exc, ensure_not_forked, limit_exc, msg_exc};
 use crate::py::arrow::{SampleKind, import_binary, import_bytes, import_samples};
 use crate::py::format::PyAudioFormat;
 
 /// Inputs above this size are parsed with the thread state detached (§5.2).
 const DETACH_ABOVE: usize = 1 << 20;
+/// Raw PCM sources are limited to `MAX_SOURCE_BYTES`; checked before a buffer is copied.
+const SOURCE_MAX: MaxBytes = MaxBytes {
+    what: "source_bytes",
+    max: MAX_SOURCE_BYTES as u64,
+};
 
 /// `AudioFormat | str` → `Format`.
 fn format_arg(obj: &Bound<'_, PyAny>) -> PyResult<Format> {
@@ -196,7 +203,8 @@ impl RawPcm {
     ) -> PyResult<Self> {
         ensure_not_forked(py)?;
         let fmt = format_arg(format)?;
-        let bytes = owned(extract_audio(data, fmt.encoding)?)?;
+        check_chunk_format(data, fmt)?;
+        let bytes = owned(extract_audio(data, fmt.encoding, SOURCE_MAX)?)?;
         let p = if bytes.len() > DETACH_ABOVE {
             py.detach(|| MemPcm::from_bytes(fmt, &bytes))
         } else {
@@ -265,7 +273,7 @@ impl RawPcm {
             }
             bytes
         } else {
-            owned(extract_audio(data, enc)?)?
+            owned(extract_audio(data, enc, SOURCE_MAX)?)?
         };
         let p = py
             .detach(|| MemPcm::from_any_rate(sample_rate, channels, enc, &bytes))

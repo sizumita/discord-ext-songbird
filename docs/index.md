@@ -86,8 +86,10 @@ Invalid values raise `LimitExceeded` (a `ValueError`) when the config is constru
 ## Audio formats
 
 Every receive stream and playback has one `AudioFormat` (sample rate, channels, encoding). The
-default everywhere is **`PCM16_48K_STEREO`, Discord's native format** (48 kHz, 2 channels,
-16-bit little-endian PCM): no resampling or channel conversion happens in either direction. Pass
+default of every receive stream and playback is **`PCM16_48K_STEREO`, Discord's native format**
+(48 kHz, 2 channels, 16-bit little-endian PCM): no resampling or channel conversion happens in
+either direction. `AudioFormat(sample_rate, channels, encoding="pcm16le")` has no default rate or
+channel count. Pass
 any other format (an `AudioFormat`, a preset such as `PCM16_16K`, or a string such as
 `"pcm16_24k"`) and the library converts in Rust: receive streams are resampled, down- or
 up-mixed and re-encoded before they reach Python, and playback input is converted to 48 kHz stereo
@@ -121,39 +123,56 @@ library is specific to one service:
    If the service timestamps its audio, pass `at_ms=` so gaps are filled with silence.
 4. **Call `clear()` on interruption** (for example when the service reports that the user started
    talking): queued audio is discarded and playback is silent within 40 ms.
-5. **Use tags and `item()` to know how much was played.** Write each reply segment with
-   `tag=<segment id>`, call `end_item(tag)` when it is fully written, and read
-   `item(tag).played_ms` / `heard_ms` (or the `items` of the `ClearResult` returned by `clear()`)
-   to tell the service how much of a segment the listeners actually heard.
+5. **Use tags and `segment()` to know how much was played.** Write each segment of returned audio
+   with `tag=<segment id>`, call `end_segment(tag)` when it is fully written, and read
+   `segment(tag).played_ms` / `heard_ms` (or the `segments` of the `ClearResult` returned by
+   `clear()`) to tell the service how much of a segment the listeners actually heard. Use a new
+   tag for every segment: a tag interrupted by `clear()` stays rejected (dropped writes show up in
+   `stats().rejected_ms`).
+6. **Expect either side to end first.** When the voice connection closes, receive streams still
+   deliver what was queued and then end, while writes to the playback raise `StreamClosed`; when the
+   service closes the socket, sends raise its library's closed-connection error. Handle both, and
+   stop the other direction when one ends.
 
 ```python
 import asyncio
 
+import websockets
 from websockets.asyncio.client import connect as ws_connect
-from discord.ext.songbird import PCM16_24K, PlaybackFull
+from discord.ext.songbird import PCM16_16K, PlaybackFull, StreamClosed
 
 async with (
     ws_connect(url) as ws,
-    vc.listen_mixed(PCM16_24K, chunk_ms=40, policy="floor") as mic,
-    vc.open_playback(PCM16_24K) as speaker,
+    vc.listen_mixed(PCM16_16K, chunk_ms=40, policy="floor") as mic,
+    vc.open_playback(PCM16_16K) as speaker,
 ):
     mic.skip_to_live()
 
     async def uplink() -> None:
-        async for chunk in mic:
-            await ws.send(bytes(chunk))
+        try:
+            async for chunk in mic:  # ends after the voice connection closes
+                await ws.send(bytes(chunk))
+        except websockets.ConnectionClosed:
+            pass  # the service closed the socket
 
-    async with asyncio.TaskGroup() as tg:
-        up = tg.create_task(uplink())
-        async for message in ws:
-            if message == "clear":
-                speaker.clear()
-            elif isinstance(message, bytes):
-                try:
-                    speaker.write_nowait(message)
-                except PlaybackFull:
-                    pass  # overrun: drop rather than block the reader
-        up.cancel()
+    async def downlink() -> None:
+        try:
+            async for message in ws:  # ends when the service closes the socket
+                if message == "clear":
+                    speaker.clear()
+                elif isinstance(message, bytes):
+                    try:
+                        speaker.write_nowait(message)
+                    except PlaybackFull:
+                        pass  # overrun: drop rather than block the reader
+        except (websockets.ConnectionClosed, StreamClosed):
+            pass  # the socket dropped, or the voice connection closed
+
+    tasks = [asyncio.create_task(uplink()), asyncio.create_task(downlink())]
+    await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)  # one side ended: stop both
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 ```
 
 [`examples/websocket_bridge.py`](../examples/websocket_bridge.py) is a complete, tested version of

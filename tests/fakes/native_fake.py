@@ -172,10 +172,8 @@ _ENCODINGS = {
     "mulaw": "mulaw",
     "ulaw": "mulaw",
     "pcmu": "mulaw",
-    "g711_ulaw": "mulaw",
     "alaw": "alaw",
     "pcma": "alaw",
-    "g711_alaw": "alaw",
 }
 _WIDTH = {"pcm16le": 2, "f32le": 4, "mulaw": 1, "alaw": 1}
 _RATES = (8_000, 16_000, 24_000, 48_000)
@@ -183,8 +181,8 @@ _RATES = (8_000, 16_000, 24_000, 48_000)
 
 def _bad_spec(spec: str) -> Exception:
     return _invalid(
-        f"unrecognised audio format {spec!r}; expected e.g. 'pcm16_24k', 'pcm16_48k_stereo', 'f32_48k', "
-        "'mulaw', 'alaw' or 'pcm16le/24000/1'"
+        f"unrecognised audio format {spec!r}; expected e.g. 'pcm16_48k_stereo', 'pcm16_16k', 'f32_48k', "
+        "'mulaw', 'alaw' or 'pcm16le/48000/2'"
     )
 
 
@@ -193,7 +191,7 @@ class AudioFormat:
 
     __slots__ = ("_rate", "_channels", "_encoding")
 
-    def __init__(self, sample_rate: int = 24_000, channels: int = 1, encoding: str = "pcm16le") -> None:
+    def __init__(self, sample_rate: int, channels: int, encoding: str = "pcm16le") -> None:
         _ensure_not_forked()
         enc = _ENCODINGS.get(encoding) if isinstance(encoding, str) else None
         if enc is None:
@@ -217,11 +215,6 @@ class AudioFormat:
         s = spec.strip().lower()
         if s.upper() in _PRESETS:
             return _PRESETS[s.upper()]
-        if s.startswith("audio/"):
-            f = _parse_mime(s[len("audio/") :])
-            if f is None:
-                raise _bad_spec(spec)
-            return f
         enc = _ENCODINGS.get(s)
         if enc in ("mulaw", "alaw"):
             return cls(8_000, 1, enc)
@@ -271,17 +264,6 @@ class AudioFormat:
     def bytes_per_ms(self) -> int:
         return self._rate // 1_000 * self.frame_bytes
 
-    @property
-    def mime_type(self) -> str:
-        ch = ";channels=2" if self._channels == 2 else ""
-        if self._encoding == "mulaw":
-            return "audio/pcmu"
-        if self._encoding == "alaw":
-            return "audio/pcma"
-        if self._encoding == "pcm16le":
-            return f"audio/pcm;rate={self._rate}{ch}"
-        return f"audio/x-f32le;rate={self._rate}{ch}"
-
     def bytes_for(self, ms: int) -> int:
         _check_int("ms", ms, 0, 2**32 - 1)
         return ms * self.bytes_per_ms
@@ -310,36 +292,6 @@ class AudioFormat:
 
     def __reduce__(self) -> Any:
         return (AudioFormat, (self._rate, self._channels, self._encoding))
-
-
-def _parse_mime(mime: str) -> AudioFormat | None:
-    parts = [p.strip() for p in mime.split(";")]
-    base, rate, ch = parts[0], None, 1
-    for p in parts[1:]:
-        k, sep, v = p.partition("=")
-        if not sep:
-            return None
-        try:
-            if k.strip() == "rate":
-                rate = int(v)
-            elif k.strip() == "channels":
-                ch = int(v)
-            else:
-                return None
-        except ValueError:
-            return None
-    try:
-        if base == "pcmu":
-            return AudioFormat(8_000, 1, "mulaw")
-        if base == "pcma":
-            return AudioFormat(8_000, 1, "alaw")
-        if base in ("pcm", "l16") and rate is not None:
-            return AudioFormat(rate, ch, "pcm16le")
-        if base == "x-f32le" and rate is not None:
-            return AudioFormat(rate, ch, "f32le")
-    except Exception:
-        return None
-    return None
 
 
 _PRESETS = {
@@ -404,8 +356,11 @@ _PCM16_CODES = {"h", "<h", "=h", "@h"}
 _F32_CODES = {"f", "<f", "=f", "@f"}
 
 
-def _buffer_bytes(data: Any, encoding: str | None) -> bytes:
+def _buffer_bytes(data: Any, encoding: str | None, max_bytes: tuple[str, int] | None = None) -> bytes:
+    """Like the native ``extract_audio``: the size is checked against ``max_bytes`` before copying."""
     if isinstance(data, bytes):
+        if max_bytes is not None:
+            _check_int(max_bytes[0], len(data), 0, max_bytes[1])
         return data
     try:
         mv = memoryview(data)
@@ -420,7 +375,19 @@ def _buffer_bytes(data: Any, encoding: str | None) -> bytes:
         )
         if not allowed:
             raise _invalid(f"buffer format {code!r} does not match the stream encoding {encoding}")
+        if max_bytes is not None:
+            _check_int(max_bytes[0], mv.nbytes, 0, max_bytes[1])
         return mv.tobytes()
+
+
+def _check_chunk_format(data: Any, fmt: AudioFormat) -> None:
+    """An ``AudioChunk`` must be written to a stream of its own format."""
+    if isinstance(data, AudioChunk) and data.format != fmt:
+        got = data.format
+        raise _invalid(
+            f"AudioChunk format {got.encoding}/{got.sample_rate}/{got.channels} does not match the "
+            f"stream format {fmt.encoding}/{fmt.sample_rate}/{fmt.channels}"
+        )
 
 
 # ── Opus TOC (RFC 6716 §3.1) ──────────────────────────────────────────────────────────────────────
@@ -709,7 +676,7 @@ class TrackInfo:
 
 
 @dataclasses.dataclass(frozen=True)
-class ItemProgress:
+class SegmentProgress:
     tag: str
     written_ms: int
     played_ms: int
@@ -725,20 +692,20 @@ class ClearResult:
         heard_ms: int,
         position_ms: int,
         generation: int,
-        items: tuple[ItemProgress, ...],
+        segments: tuple[SegmentProgress, ...],
     ) -> None:
         self.discarded_ms = discarded_ms
         self.played_ms = played_ms
         self.heard_ms = heard_ms
         self.position_ms = position_ms
         self.generation = generation
-        self.items = items
+        self.segments = segments
 
-    def item(self, tag: str) -> ItemProgress | None:
-        return next((i for i in self.items if i.tag == tag), None)
+    def segment(self, tag: str) -> SegmentProgress | None:
+        return next((i for i in self.segments if i.tag == tag), None)
 
     def __repr__(self) -> str:
-        return f"ClearResult(discarded_ms={self.discarded_ms}, items={self.items!r})"
+        return f"ClearResult(discarded_ms={self.discarded_ms}, segments={self.segments!r})"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1003,8 +970,8 @@ class AudioFile:
             return cls(f.read())
 
     @classmethod
-    def from_arrow(cls, array_obj: Any) -> AudioFile:
-        kind, data = _arrow_bytes(array_obj, allow_binary_scalar=True)
+    def from_arrow(cls, array: Any) -> AudioFile:
+        kind, data = _arrow_bytes(array, allow_binary_scalar=True)
         if kind not in ("uint8", "binary"):
             raise _invalid("AudioFile.from_arrow expects a UInt8 array or a one-value Binary array")
         return cls(data)
@@ -1038,17 +1005,17 @@ class RawPcm:
         fmt = _as_format(format)
         if isinstance(data, str):
             raise TypeError("audio must be a bytes-like object, not str")
-        raw = _buffer_bytes(data, fmt.encoding)
-        _check_int("source_bytes", len(raw), 0, 1 << 30)
+        _check_chunk_format(data, fmt)
+        raw = _buffer_bytes(data, fmt.encoding, ("source_bytes", 1 << 30))
         frames = len(raw) // fmt.frame_bytes
         self._fmt = fmt
         self._frames = frames
         self._rate = fmt.sample_rate
 
     @classmethod
-    def from_arrow(cls, array_obj: Any, format: Any) -> RawPcm:
+    def from_arrow(cls, array: Any, format: Any) -> RawPcm:
         fmt = _as_format(format)
-        kind, data = _arrow_bytes(array_obj, allow_binary_scalar=False)
+        kind, data = _arrow_bytes(array, allow_binary_scalar=False)
         expected = {"pcm16le": "int16", "f32le": "float32"}.get(fmt.encoding)
         if kind not in ("uint8", expected):
             raise _invalid(f"an Arrow {kind} array does not match encoding {fmt.encoding}")
@@ -1065,7 +1032,9 @@ class RawPcm:
             if kind != {"pcm16le": "int16", "f32le": "float32"}[encoding]:
                 raise _invalid(f"an Arrow {kind} array does not match encoding {encoding}")
         else:
-            raw = _buffer_bytes(data, encoding)
+            if isinstance(data, str):
+                raise TypeError("audio must be a bytes-like object, not str")
+            raw = _buffer_bytes(data, encoding, ("source_bytes", 1 << 30))
         width = _WIDTH[encoding]
         frames = len(raw) // (width * channels)
         stored = sample_rate if sample_rate in _RATES else 48_000
@@ -1099,10 +1068,10 @@ class OpusPackets:
         self._packets = out
 
     @classmethod
-    def from_arrow(cls, array_obj: Any) -> OpusPackets:
+    def from_arrow(cls, array: Any) -> OpusPackets:
         import pyarrow as pa
 
-        arr = array_obj if isinstance(array_obj, pa.Array) else pa.array(array_obj)
+        arr = array if isinstance(array, pa.Array) else pa.array(array)
         if not (pa.types.is_binary(arr.type) or pa.types.is_large_binary(arr.type)):
             raise _invalid("OpusPackets.from_arrow expects a Binary/LargeBinary array")
         if arr.null_count:
@@ -1735,7 +1704,9 @@ class _PcmQueue:
     def write(self, data: Any, tag: str | None, at_ms: int | None) -> None:
         if isinstance(data, str):
             raise TypeError("audio must be a bytes-like object, not str")
-        payload = _buffer_bytes(data, self.fmt.encoding)
+        _check_chunk_format(data, self.fmt)
+        cap_bytes = self.cap * self.fmt.frame_bytes
+        payload = _buffer_bytes(data, self.fmt.encoding, ("write_bytes", cap_bytes))
         if self.closed is not None:
             raise _errors().StreamClosed(self.end_reason or "closed")
         if self.conn.closing:
@@ -1744,9 +1715,6 @@ class _PcmQueue:
             raise _invalid("tags are at most 128 bytes")
         if at_ms is not None:
             _check_int("at_ms", at_ms, -(2**63), 2**63 - 1)
-        cap_bytes = self.cap * self.fmt.frame_bytes
-        if len(payload) > cap_bytes:
-            raise _limit("write_bytes", len(payload), 0, cap_bytes)
         fb = self.fmt.frame_bytes
         with self.wlock:
             if self.carry_gen != self.generation:
@@ -1769,7 +1737,7 @@ class _PcmQueue:
                     self.space_wanted = min(gap + frames, self.cap)
                     free = self.cap - self.queued
                     raise _errors().PlaybackFull(self.ms(gap + frames), self.ms(free))
-                turn_start = self.queued == 0 and not self.active
+                segment_start = self.queued == 0 and not self.active
                 if gap > 0:
                     self.segs.append([None, 0, gap, None])
                     self.queued += gap
@@ -1789,7 +1757,7 @@ class _PcmQueue:
                 self.carry_gen = self.generation
                 if frames:
                     self.drain_pulls = 0
-                    if turn_start:
+                    if segment_start:
                         self.active = True
                         if self.prebuffer > 0:
                             self.gate = True
@@ -2028,13 +1996,13 @@ class Playback:
         with q.lock:
             now = q.conn.clock.now()
             lat = q.spec["output_latency_ms"] / 1000
-            items = []
+            segments = []
             for name, t in q.tags.items():
                 recent = t.last_pull_t is not None and now - t.last_pull_t <= lat
                 if t.open or recent:
                     played = min(t.played, t.written)
-                    items.append(
-                        ItemProgress(
+                    segments.append(
+                        SegmentProgress(
                             name,
                             q.ms(t.written),
                             q.ms(played),
@@ -2053,7 +2021,7 @@ class Playback:
             q.clears += 1
             if reject_late:
                 for name, t in q.tags.items():
-                    if t.open or any(i.tag == name for i in items):
+                    if t.open or any(i.tag == name for i in segments):
                         if name not in q.rejected:
                             q.rejected.append(name)
             for t in q.tags.values():
@@ -2069,13 +2037,13 @@ class Playback:
                 q.ms(q.heard(q.played_real, q.last_real_pull_t, now)),
                 q.ms(q.position),
                 q.generation,
-                tuple(items),
+                tuple(segments),
             )
         if wake:
             q.conn.wake.notify(q.wake_id)
         return res
 
-    def end_item(self, tag: str) -> None:
+    def end_segment(self, tag: str) -> None:
         q = self._q
         with q.lock:
             q.gate = False
@@ -2084,7 +2052,7 @@ class Playback:
                 t.open = False
                 t.ended = True
 
-    def item(self, tag: str) -> ItemProgress | None:
+    def segment(self, tag: str) -> SegmentProgress | None:
         q = self._q
         with q.lock:
             t = q.tags.get(tag)
@@ -2092,7 +2060,7 @@ class Playback:
                 return None
             played = min(t.played, t.written)
             now = q.conn.clock.now()
-            return ItemProgress(
+            return SegmentProgress(
                 tag,
                 q.ms(t.written),
                 q.ms(played),

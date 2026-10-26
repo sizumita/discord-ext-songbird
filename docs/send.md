@@ -31,8 +31,12 @@ async with vc.open_playback(PCM16_24K) as speaker:     # any other format is con
   `write*` take raw audio in the stream's format: `bytes`, `bytearray`, `memoryview`, an
   `AudioChunk`, or any C-contiguous buffer. Typed buffers must match the encoding (`'h'` arrays for
   pcm16le, `'f'` for f32le, or raw bytes): writing a float32 numpy array to a pcm16le stream raises
-  `InvalidAudio` instead of playing noise. A `str` raises `TypeError`; decode text-encoded audio
-  first (see [Streaming to external services](index.md#streaming-to-external-services)).
+  `InvalidAudio` instead of playing noise. An `AudioChunk` carries its format and must be written
+  to a playback of exactly that format (a `PCM16_16K` chunk into the default 48 kHz stereo
+  playback raises `InvalidAudio`); open the playback with `chunk.format`, or with the format you
+  passed to `listen*`. Other buffers carry no rate or channel count, so they are taken to be in the
+  stream format. A `str` raises `TypeError`; decode text-encoded audio first (see
+  [Streaming to external services](index.md#streaming-to-external-services)).
 - **Backpressure.** The buffer holds `max_buffer_ms` (60 s). `write_nowait` raises
   `PlaybackFull(needed_ms, free_ms)` with nothing consumed; `await write()` waits for space.
   In a task that reads a network connection, always use `write_nowait`.
@@ -52,13 +56,14 @@ that was idle-paused does not accumulate stale silence.
 
 ```python
 result = speaker.clear()                 # discard everything queued, now; any thread
-for item in result.items:                # open segments and segments heard in the last output_latency_ms
-    report_heard(item.tag, item.heard_ms)  # ≤ written_ms by construction
+for seg in result.segments:              # open segments and segments heard in the last output_latency_ms
+    report_heard(seg.tag, seg.heard_ms)  # ≤ written_ms by construction
 ```
 
 - Capacity is released immediately; the cut is audible at the next pull (≤ 40 ms plus network).
 - **`reject_late=True`** (default) drops later writes for every open or interrupted tag: audio of
-  a cut-off segment that is still arriving never plays.
+  a cut-off segment that is still arriving never plays. The 256 most recently rejected tags stay
+  rejected for the life of the stream (see [Tagged segments](#tagged-segments)).
 - **`reject_until_gap_ms=N`** (timed writes without tags): later *timed* writes contiguous with
   the cleared audio are dropped until one starts at least `N` ms after it.
 - **`hold_ms`** drops *all* writes for a while — a fallback for untimed, untagged writes only.
@@ -66,10 +71,16 @@ for item in result.items:                # open segments and segments heard in t
 ### Tagged segments
 
 A tag (`tag=`, at most 128 bytes) is an application-defined segment id: a sentence, a message, a
-reply — whatever unit you need positions for. A tag is open from its first write until
-`end_item(tag)` (call it once the segment is fully written), `clear()`, or the next idle period.
-`item(tag)` returns an `ItemProgress(tag, written_ms, played_ms, heard_ms, complete)`; `complete`
-becomes true once `end_item` was called and everything written has played.
+paragraph — whatever unit you need positions for. A tag is open from its first write until
+`end_segment(tag)` (call it once the segment is fully written), `clear()`, or the next idle period.
+`segment(tag)` returns a `SegmentProgress(tag, written_ms, played_ms, heard_ms, complete)`;
+`complete` becomes true once `end_segment` was called and everything written has played.
+
+**Use a new tag for every segment.** A tag that `clear()` interrupted stays rejected for the life
+of the stream (the 256 most recent such tags are remembered), so its late writes never play. A
+reused tag is therefore dropped silently; the dropped audio is counted in `stats().rejected_ms`, the
+place to look when audio goes missing after an interruption. A counter or an id from your source
+(`f"seg-{n}"`) works well.
 
 ### Positions
 
@@ -88,10 +99,11 @@ becomes true once `end_item` was called and everything written has played.
 ### Other controls
 
 - `prebuffer_ms`: after an idle period or `clear()`, hold playback until this much is buffered (or
-  the same time has passed), smoothing bursty sources. `drain()`, `end_item()` and
+  the same time has passed), smoothing bursty sources. `drain()`, `end_segment()` and
   `aclose(drain=True)` release it.
-- `await wait_idle()`: wait until playback goes idle (everything played and nothing new for
-  `idle_ms`), for sources without an explicit end-of-segment signal.
+- `await wait_idle()`: wait until playback is idle (everything played and nothing new for
+  `idle_ms`), for sources without an explicit end-of-segment signal; returns at once if nothing is
+  playing.
 - `pause()`/`resume()`, `volume` (0.0–4.0, 5 ms ramp), `close()`, `await aclose(drain=True)`.
 - `when_disconnected="discard"` drops buffered audio while the voice link is down instead of
   playing it after reconnect.
@@ -163,7 +175,8 @@ packets, so an idle stream sends no RTP.
 
 16 live sources (playbacks + encoded + Opus streams) and 32 playing memory tracks per connection;
 16 encoded-stream decode threads per process. Every size is checked before anything is allocated
-(`LimitExceeded`).
+(`LimitExceeded`): a single `write()` larger than the whole buffer is rejected before any buffer
+type (`bytes`, `bytearray`, `memoryview`, numpy, `AudioChunk`) is copied.
 
 Note that an open live source keeps songbird's mixer live even while auto-paused: open a playback
 for as long as audio is expected (a session, a conversation), not for the bot's whole lifetime.

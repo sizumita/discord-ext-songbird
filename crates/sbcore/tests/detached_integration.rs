@@ -605,7 +605,7 @@ fn playback_is_pulled_exactly_at_48k_and_resampled_from_24k() {
     );
     assert_eq!(q.stats().played_ms, 200);
 
-    // The housekeeper reports the turn: started, then idle after `idle_ms`, and pauses the track.
+    // The housekeeper reports the playback: started, then idle after `idle_ms`, and pauses the track.
     r.step(200);
     let evs = drain_events(&events);
     let id = LiveSource::id(&*q);

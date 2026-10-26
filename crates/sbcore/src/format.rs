@@ -73,8 +73,8 @@ impl Encoding {
         match name.trim().to_ascii_lowercase().as_str() {
             "pcm16le" | "pcm16" | "pcm_s16le" | "s16le" | "int16" => Some(Encoding::Pcm16Le),
             "f32le" | "f32" | "pcm_f32le" | "float32" => Some(Encoding::F32Le),
-            "mulaw" | "ulaw" | "pcmu" | "g711_ulaw" => Some(Encoding::MuLaw),
-            "alaw" | "pcma" | "g711_alaw" => Some(Encoding::ALaw),
+            "mulaw" | "ulaw" | "pcmu" => Some(Encoding::MuLaw),
+            "alaw" | "pcma" => Some(Encoding::ALaw),
             _ => None,
         }
     }
@@ -133,8 +133,8 @@ pub const PRESETS: [(&str, Format); 9] = [
 
 fn bad_spec(spec: &str) -> CoreError {
     CoreError::InvalidAudio(Cow::Owned(format!(
-        "unrecognised audio format {spec:?}; expected e.g. 'pcm16_24k', 'pcm16_48k_stereo', 'f32_48k', \
-         'mulaw', 'alaw' or 'pcm16le/24000/1'"
+        "unrecognised audio format {spec:?}; expected e.g. 'pcm16_48k_stereo', 'pcm16_16k', 'f32_48k', \
+         'mulaw', 'alaw' or 'pcm16le/48000/2'"
     )))
 }
 
@@ -163,9 +163,8 @@ impl Format {
         })
     }
 
-    /// Parses `'pcm16_24k'`, `'pcm16_48k_stereo'`, `'f32_48k'`, `'mulaw'`, `'alaw'`,
-    /// `'pcm16le/24000/1'`, a preset name (`'PCM16_48K_STEREO'`), or a MIME type from
-    /// [`Format::mime_type`].
+    /// Parses `'pcm16_48k_stereo'`, `'pcm16_16k'`, `'f32_48k'`, `'mulaw'`, `'alaw'`,
+    /// `'pcm16le/48000/2'` or a preset name (`'PCM16_48K_STEREO'`).
     pub fn parse(spec: &str) -> Result<Self, CoreError> {
         let s = spec.trim().to_ascii_lowercase();
         if let Some((_, f)) = PRESETS
@@ -173,9 +172,6 @@ impl Format {
             .find(|(name, _)| name.eq_ignore_ascii_case(&s))
         {
             return Ok(*f);
-        }
-        if let Some(mime) = s.strip_prefix("audio/") {
-            return Self::parse_mime(mime).ok_or_else(|| bad_spec(spec));
         }
         if let Some(enc) = Encoding::parse(&s).filter(|e| e.is_g711()) {
             return Format::new(8_000, 1, enc);
@@ -224,27 +220,6 @@ impl Format {
         )
     }
 
-    fn parse_mime(mime: &str) -> Option<Self> {
-        let mut parts = mime.split(';').map(str::trim);
-        let base = parts.next()?;
-        let (mut rate, mut channels) = (None, 1u8);
-        for p in parts {
-            let (k, v) = p.split_once('=')?;
-            match k.trim() {
-                "rate" => rate = v.trim().parse().ok(),
-                "channels" => channels = v.trim().parse().ok()?,
-                _ => return None,
-            }
-        }
-        match base {
-            "pcmu" => Format::new(8_000, 1, Encoding::MuLaw).ok(),
-            "pcma" => Format::new(8_000, 1, Encoding::ALaw).ok(),
-            "pcm" | "l16" => Format::new(rate?, channels, Encoding::Pcm16Le).ok(),
-            "x-f32le" => Format::new(rate?, channels, Encoding::F32Le).ok(),
-            _ => None,
-        }
-    }
-
     pub const fn sample_width(self) -> usize {
         self.encoding.sample_width()
     }
@@ -257,7 +232,7 @@ impl Format {
         self.rate.frames_per_tick()
     }
 
-    /// Exact bytes per millisecond (48 for PCM16 24 kHz mono).
+    /// Exact bytes per millisecond (192 for PCM16 48 kHz stereo).
     pub const fn bytes_per_ms(self) -> usize {
         (self.rate.hz() / 1_000) as usize * self.frame_bytes()
     }
@@ -287,22 +262,6 @@ impl Format {
             Encoding::Pcm16Le | Encoding::F32Le => 0x00,
             Encoding::MuLaw => g711::ULAW_SILENCE,
             Encoding::ALaw => g711::ALAW_SILENCE,
-        }
-    }
-
-    /// `'audio/pcm;rate=24000'`, `'audio/pcmu'`, `'audio/pcma'`, `'audio/x-f32le;rate=48000'`
-    /// (stereo formats append `;channels=2`).
-    pub fn mime_type(self) -> Cow<'static, str> {
-        let ch = if self.channels == 2 {
-            ";channels=2"
-        } else {
-            ""
-        };
-        match self.encoding {
-            Encoding::MuLaw => Cow::Borrowed("audio/pcmu"),
-            Encoding::ALaw => Cow::Borrowed("audio/pcma"),
-            Encoding::Pcm16Le => Cow::Owned(format!("audio/pcm;rate={}{ch}", self.rate.hz())),
-            Encoding::F32Le => Cow::Owned(format!("audio/x-f32le;rate={}{ch}", self.rate.hz())),
         }
     }
 
@@ -650,7 +609,6 @@ mod tests {
             ("mulaw", MULAW_8K),
             ("alaw", ALAW_8K),
             ("mulaw_8k", MULAW_8K),
-            ("g711_ulaw", MULAW_8K),
             ("pcm16le/24000/1", PCM16_24K),
             ("pcm16le/48000/2", PCM16_48K_STEREO),
             ("f32le/48000", F32_48K),
@@ -658,9 +616,6 @@ mod tests {
             ("  Pcm16_16k ", PCM16_16K),
             ("PCM16_48K_STEREO", PCM16_48K_STEREO),
             ("alaw_8k", ALAW_8K),
-            ("audio/pcm;rate=24000", PCM16_24K),
-            ("audio/pcmu", MULAW_8K),
-            ("audio/x-f32le;rate=48000;channels=2", F32_48K_STEREO),
         ];
         for (s, f) in ok {
             assert_eq!(Format::parse(s).unwrap(), f, "{s}");
@@ -681,6 +636,10 @@ mod tests {
             "wav",
             "audio/ogg",
             "audio/pcm",
+            "audio/pcm;rate=24000",
+            "audio/L16;rate=16000",
+            "g711_ulaw",
+            "g711_alaw",
             "pcm16_99999999999k",
         ];
         for s in bad {
@@ -689,22 +648,6 @@ mod tests {
                 "{s}"
             );
         }
-    }
-
-    #[test]
-    fn mime_round_trips() {
-        for f in all_formats() {
-            assert_eq!(
-                Format::parse(&f.mime_type()).unwrap(),
-                f,
-                "{}",
-                f.mime_type()
-            );
-        }
-        assert_eq!(PCM16_24K.mime_type(), "audio/pcm;rate=24000");
-        assert_eq!(MULAW_8K.mime_type(), "audio/pcmu");
-        assert_eq!(ALAW_8K.mime_type(), "audio/pcma");
-        assert_eq!(F32_48K.mime_type(), "audio/x-f32le;rate=48000");
     }
 
     #[test]

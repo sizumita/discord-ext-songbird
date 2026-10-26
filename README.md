@@ -82,7 +82,7 @@ system) uses the same two calls with the format and chunk size that service expe
 | File | What it shows |
 |---|---|
 | [`examples/echo.py`](examples/echo.py) | Receive + playback streaming: a member's voice played back with a delay |
-| [`examples/websocket_bridge.py`](examples/websocket_bridge.py) | Generic bridge: raw PCM chunks out as binary WebSocket frames, replies played back, `"clear"` interrupts |
+| [`examples/websocket_bridge.py`](examples/websocket_bridge.py) | Generic bridge: raw PCM chunks out as binary WebSocket frames, returned audio played back, `"clear"` interrupts |
 | [`examples/record.py`](examples/record.py) | One timeline-aligned WAV per user plus a speaking-event log |
 | [`examples/music.py`](examples/music.py) | Music bot on the track queue, including queued HTTP streams |
 

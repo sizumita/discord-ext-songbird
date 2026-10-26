@@ -141,9 +141,10 @@ Joins are not observable through the voice connection; use discord.py's `on_voic
 `examples/record.py` writes one timeline-aligned WAV per user:
 
 ```python
+origin = vc.timeline_ms                 # one shared origin, read once before listening
 async with vc.listen_users(PCM16_48K, chunk_ms=200, max_queue_ms=10_000) as users:  # mono WAV files
     async for stream in users:          # one stream per user, as they first speak
-        tg.create_task(record_user(stream, out, origin=vc.timeline_ms))
+        tg.create_task(record_user(stream, out, origin))
 ```
 
 Each per-user stream starts at its user's first speech; pad the file with

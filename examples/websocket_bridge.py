@@ -7,8 +7,8 @@ The protocol is deliberately minimal and not tied to any particular service:
 * service -> bot: the text frame ``"clear"`` is an interruption: queued playback is discarded.
 
 Adapting it to a specific service usually only changes the framing (wrapping chunks in the
-service's own messages and unwrapping its replies); the library calls stay the same. Pick the
-formats and chunk size the service expects; 16 or 24 kHz mono PCM16 is common for speech.
+service's own messages and unwrapping the audio it sends back); the library calls stay the same.
+Pick the formats and chunk size the service expects; 16 or 24 kHz mono PCM16 is common for speech.
 
 Type ``!bridge`` while in a voice channel; ``!stop`` ends it. Environment: ``DISCORD_BOT_TOKEN``,
 ``BRIDGE_URL`` (e.g. ``ws://localhost:8765``), optionally ``BRIDGE_FORMAT`` (a format spec such as
@@ -26,10 +26,13 @@ from typing import Any
 import discord
 import websockets
 from discord.ext import songbird
-from discord.ext.songbird import PCM16_48K_STEREO, FormatLike, PlaybackFull, VoiceConfig
+from discord.ext.songbird import PCM16_48K_STEREO, FormatLike, PlaybackFull, StreamClosed, VoiceConfig
 from websockets.asyncio.client import connect as ws_connect
 
 log = logging.getLogger("websocket_bridge")
+
+#: When several ends happen together, report the first of these (deterministic).
+_REASONS = ("stopped", "voice_closed", "websocket_closed")
 
 
 async def bridge(
@@ -95,6 +98,8 @@ async def bridge(
                         log.warning("playback overrun; %d bytes dropped", len(message))
             except websockets.ConnectionClosed:
                 pass
+            except StreamClosed:
+                return "voice_closed"  # the voice connection closed while audio was arriving
             return "websocket_closed"
 
         async def stopped() -> str:
@@ -108,9 +113,9 @@ async def bridge(
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-        reason = next(iter(done)).result()
+        reason = min((t.result() for t in done), key=_REASONS.index)  # re-raises an unexpected error
         if reason == "websocket_closed":
-            await speaker.drain(timeout=5)  # let the last reply finish
+            await speaker.drain(timeout=5)  # let the audio already received finish playing
         return reason
 
 

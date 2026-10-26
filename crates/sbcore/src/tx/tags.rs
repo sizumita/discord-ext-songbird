@@ -1,8 +1,8 @@
-//! Item tags of a `PcmQueue` (W4, §7.7): ≤ `MAX_TAGS` live tags (eviction: oldest closed, else the
+//! Segment tags of a `PcmQueue` (W4, §7.7): ≤ `MAX_TAGS` live tags (eviction: oldest closed, else the
 //! least-recently-written open one) and a FIFO set of ≤ `MAX_REJECTED_TAGS` rejected names.
 //!
 //! Everything here runs under L6. Lookups scan at most `MAX_TAGS` entries (with a one-entry cache for
-//! the common "same item as the previous write" case); a new entry allocates its `Arc<str>` name only
+//! the common "same tag as the previous write" case); a new entry allocates its `Arc<str>` name only
 //! when the tag is first seen.
 
 use std::collections::VecDeque;
@@ -29,7 +29,7 @@ pub(crate) struct TagEntry {
     /// Write sequence of the last accepted write.
     pub(crate) last_write: u64,
     pub(crate) open: bool,
-    /// `end_item(tag)` was called.
+    /// `end_segment(tag)` was called.
     pub(crate) ended: bool,
 }
 

@@ -88,22 +88,32 @@ def test_mulaw_16k_is_invalid() -> None:
     assert "REJECTED InvalidAudio" in out, out
 
 
-def test_huge_write_is_rejected_before_parsing() -> None:
+#: 200 MiB payloads built without a transient copy (``ru_maxrss`` is a peak).
+HUGE_PAYLOADS = {
+    "bytes": 'b"\\x01" * (200 << 20)',
+    "bytearray": 'bytearray(b"\\x01") * (200 << 20)',
+    "memoryview": 'memoryview(bytearray(b"\\x01") * (200 << 20))',
+}
+
+
+@pytest.mark.parametrize("kind", HUGE_PAYLOADS)
+def test_huge_write_is_rejected_before_parsing(kind: str) -> None:
+    # bytes is borrowed; every other buffer would be copied, so its size is checked first too.
     proc = run_isolated(
         PRELUDE
-        + """
+        + f"""
 c = conn()
 pb = c.open_playback(songbird.PCM16_24K, 100, 0, 250, True, 0)
-payload = b"\\x01" * (200 << 20)
+payload = {HUGE_PAYLOADS[kind]}
 before = rss()
 try:
     pb.write(payload)
-except songbird.LimitExceeded:
-    print("REJECTED")
+except songbird.LimitExceeded as e:
+    print("REJECTED", e.what)
 print("GROWTH", rss() - before)
 """
     )
     assert proc.returncode == 0, proc.stderr
-    assert "REJECTED" in proc.stdout
+    assert "REJECTED write_bytes" in proc.stdout, proc.stdout
     growth = int(proc.stdout.split("GROWTH")[1])
     assert growth < 50 << 20, growth

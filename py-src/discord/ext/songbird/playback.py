@@ -22,15 +22,15 @@ if TYPE_CHECKING:
 __all__ = [
     "ClearResult",
     "EncodedStream",
-    "ItemProgress",
     "OpusPacketStream",
     "PlaybackStats",
     "PlaybackStream",
+    "SegmentProgress",
 ]
 
 ClearResult = native.ClearResult
-ItemProgress = native.ItemProgress
 PlaybackStats = native.PlaybackStats
+SegmentProgress = native.SegmentProgress
 
 #: Extra grace for ``aclose(drain=True)`` beyond the buffered audio (§7.8).
 _DRAIN_GRACE_S = 2.0
@@ -148,11 +148,13 @@ class PlaybackStream:
         ----------
         data : bytes-like
             Any size (a partial frame is carried to the next write). Typed buffers must match the
-            encoding (``'h'`` for pcm16le, ``'f'`` for f32le) or be raw bytes; ``AudioChunk`` works
-            directly. A ``str`` raises ``TypeError``.
+            encoding (``'h'`` for pcm16le, ``'f'`` for f32le) or be raw bytes. An ``AudioChunk`` can
+            be written directly when its format equals :attr:`format`. A ``str`` raises
+            ``TypeError``.
         tag : str or None
-            Application-defined segment tag (at most 128 bytes) for :meth:`clear`, :meth:`item`
-            and :meth:`end_item`, e.g. the id of the message or segment the audio belongs to.
+            Application-defined segment tag (at most 128 bytes) for :meth:`clear`, :meth:`segment`
+            and :meth:`end_segment`, e.g. the id of the message or segment the audio belongs to. Use a
+            new tag for each segment: a tag cut off by :meth:`clear` stays rejected (see :meth:`clear`).
         at_ms : int or None
             Source-timeline timestamp in ms. A gap since the previous timed write is filled with
             silence (up to ``max_gap_ms``), so audio stays aligned with the source's clock.
@@ -166,9 +168,10 @@ class PlaybackStream:
         StreamClosed
             The stream or connection is closed.
         InvalidAudio
-            A mismatched buffer format, or a tag longer than 128 bytes.
+            A mismatched buffer format, an ``AudioChunk`` of another format, or a tag longer than
+            128 bytes.
         LimitExceeded
-            The write can never fit the buffer.
+            The write can never fit the buffer (checked before anything is copied).
         """
         await self._write(lambda: self._pb.write(data, tag, at_ms), _nbytes(data), timeout)
 
@@ -208,7 +211,9 @@ class PlaybackStream:
         ----------
         reject_late : bool, default True
             Drop later writes for every open or interrupted tag (audio of a segment that was cut
-            off and is still arriving).
+            off and is still arriving). The stream remembers the 256 most recently rejected tags
+            for its whole lifetime, so never reuse a tag: a later write with a rejected tag is
+            dropped silently and only counted in ``stats().rejected_ms``.
         hold_ms : int, default 0
             Fallback for untimed writes: drop **all** writes for this long.
         reject_until_gap_ms : int or None
@@ -218,23 +223,23 @@ class PlaybackStream:
         Returns
         -------
         ClearResult
-            What was discarded, and per-tag progress (``items``): how much of each tagged segment
+            What was discarded, and per-tag progress (``segments``): how much of each tagged segment
             was actually played before the interruption.
         """
         return self._pb.clear(reject_late=reject_late, hold_ms=hold_ms, reject_until_gap_ms=reject_until_gap_ms)
 
-    def end_item(self, tag: str) -> None:
+    def end_segment(self, tag: str) -> None:
         """Mark the tagged segment ``tag`` as fully written: closes the tag and releases the
-        prebuffer gate; ``ItemProgress.complete`` becomes ``True`` once it has played."""
-        self._pb.end_item(tag)
+        prebuffer gate; ``SegmentProgress.complete`` becomes ``True`` once it has played."""
+        self._pb.end_segment(tag)
 
-    def item(self, tag: str) -> native.ItemProgress | None:
+    def segment(self, tag: str) -> native.SegmentProgress | None:
         """Progress of the tagged segment ``tag``, if it is known."""
-        return self._pb.item(tag)
+        return self._pb.segment(tag)
 
     def played_ms_of(self, tag: str) -> int:
-        """``item(tag).played_ms`` or 0 (clamped to ``written_ms``)."""
-        it = self._pb.item(tag)
+        """``segment(tag).played_ms`` or 0 (clamped to ``written_ms``)."""
+        it = self._pb.segment(tag)
         return 0 if it is None else it.played_ms
 
     # ── waiting ──────────────────────────────────────────────────────────────────────────────────

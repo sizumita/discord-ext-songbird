@@ -3,8 +3,11 @@
 //! * `bytes` is borrowed as `&[u8]` (zero copies): a plain borrow of an immutable object, released
 //!   by a decref after the sbcore call returns. `str` is never audio (`TypeError`).
 //! * Any other buffer-protocol object must be C-contiguous and its format code must match the stream
-//!   encoding. It is copied once into an owned `Vec<u8>` (`try_reserve` → `MemoryError`), and the
-//!   buffer is released **before** returning, so no `PyBuffer` ever overlaps a Rust lock.
+//!   encoding. Its size is checked against the caller's limit **before** anything is allocated
+//!   (`LimitExceeded`), then it is copied once into an owned `Vec<u8>` (`try_reserve` →
+//!   `MemoryError`), and the buffer is released **before** returning, so no `PyBuffer` ever overlaps
+//!   a Rust lock.
+//! * An `AudioChunk` carries its own format, which must equal the stream format (`InvalidAudio`).
 
 use std::ffi::CStr;
 use std::ops::RangeInclusive;
@@ -14,9 +17,35 @@ use pyo3::exceptions::{PyMemoryError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use sbcore::limits::{LimitScalar, check};
-use sbcore::{Encoding, LimitError, LimitNum};
+use sbcore::{Encoding, Format, LimitError, LimitNum};
 
 use crate::errors::{CoreResultExt, Exc, limit_exc, msg_exc};
+use crate::py::chunk::AudioChunk;
+
+/// The largest buffer a call accepts, checked before any copy (`LimitExceeded` naming `what`).
+#[derive(Clone, Copy, Debug)]
+pub struct MaxBytes {
+    pub what: &'static str,
+    pub max: u64,
+}
+
+impl MaxBytes {
+    fn check(self, py: Python<'_>, len: usize) -> PyResult<()> {
+        let len = len as u64;
+        if len <= self.max {
+            return Ok(());
+        }
+        Err(limit_exc(
+            py,
+            &LimitError {
+                what: self.what,
+                value: LimitNum::Int(i128::from(len)),
+                min: LimitNum::Int(0),
+                max: LimitNum::Int(i128::from(self.max)),
+            },
+        ))
+    }
+}
 
 /// Audio handed to sbcore: borrowed bytes or an owned copy of a buffer.
 #[derive(Debug)]
@@ -58,12 +87,14 @@ fn format_str(f: &CStr) -> String {
     f.to_string_lossy().into_owned()
 }
 
-/// Copies a C-contiguous buffer into an owned `Vec<u8>` after checking its format with `allowed`,
-/// releasing the buffer while still attached.
+/// Copies a C-contiguous buffer into an owned `Vec<u8>` after checking its format against
+/// `encoding` and its size against `max` (both before allocating), releasing the buffer while still
+/// attached.
 pub fn copy_buffer(
     py: Python<'_>,
     obj: &Bound<'_, PyAny>,
     encoding: Option<Encoding>,
+    max: Option<MaxBytes>,
 ) -> PyResult<Vec<u8>> {
     let buf = PyUntypedBuffer::get(obj)
         .map_err(|_| PyTypeError::new_err("expected bytes or a buffer-protocol object"))?;
@@ -85,6 +116,9 @@ pub fn copy_buffer(
             ));
         }
         let len = buf.len_bytes();
+        if let Some(max) = max {
+            max.check(py, len)?;
+        }
         let mut out: Vec<u8> = Vec::new();
         out.try_reserve_exact(len)
             .map_err(|_| PyMemoryError::new_err("allocation failed"))?;
@@ -101,18 +135,47 @@ pub fn copy_buffer(
     result
 }
 
-/// Extracts audio for a stream with `encoding`: `bytes` (borrowed) or any other C-contiguous buffer
-/// whose format matches (copied). `str` raises `TypeError`.
-pub fn extract_audio<'a>(obj: &'a Bound<'_, PyAny>, encoding: Encoding) -> PyResult<AudioData<'a>> {
+/// Extracts audio for a stream with `encoding`: `bytes` (borrowed) or any other C-contiguous
+/// buffer whose format matches (copied). Either is size-checked against `max` first; `str` raises
+/// `TypeError`.
+pub fn extract_audio<'a>(
+    obj: &'a Bound<'_, PyAny>,
+    encoding: Encoding,
+    max: MaxBytes,
+) -> PyResult<AudioData<'a>> {
     if let Ok(b) = obj.cast::<PyBytes>() {
-        return Ok(AudioData::Bytes(b.as_bytes()));
+        let b = b.as_bytes();
+        max.check(obj.py(), b.len())?;
+        return Ok(AudioData::Bytes(b));
     }
     if obj.is_instance_of::<PyString>() {
         return Err(PyTypeError::new_err(
             "audio must be a bytes-like object, not str",
         ));
     }
-    copy_buffer(obj.py(), obj, Some(encoding)).map(AudioData::Owned)
+    copy_buffer(obj.py(), obj, Some(encoding), Some(max)).map(AudioData::Owned)
+}
+
+/// `InvalidAudio` if `obj` is an `AudioChunk` whose format is not `fmt` (its buffer format code
+/// alone cannot tell, e.g., a 24 kHz mono chunk from a 48 kHz stereo one). Other objects pass.
+pub fn check_chunk_format(obj: &Bound<'_, PyAny>, fmt: Format) -> PyResult<()> {
+    let Ok(chunk) = obj.cast::<AudioChunk>() else {
+        return Ok(());
+    };
+    let got = chunk.get().chunk_format();
+    if got == fmt {
+        return Ok(());
+    }
+    let show = |f: Format| format!("{}/{}/{}", f.encoding.as_str(), f.rate.hz(), f.channels);
+    Err(msg_exc(
+        obj.py(),
+        Exc::InvalidAudio,
+        &format!(
+            "AudioChunk format {} does not match the stream format {}",
+            show(got),
+            show(fmt)
+        ),
+    ))
 }
 
 /// Extracts raw (encoded) bytes: `bytes` (borrowed) or a C-contiguous byte buffer (copied).
@@ -120,7 +183,7 @@ pub fn extract_bytes<'a>(obj: &'a Bound<'_, PyAny>) -> PyResult<AudioData<'a>> {
     if let Ok(b) = obj.cast::<PyBytes>() {
         return Ok(AudioData::Bytes(b.as_bytes()));
     }
-    copy_buffer(obj.py(), obj, None).map(AudioData::Owned)
+    copy_buffer(obj.py(), obj, None, None).map(AudioData::Owned)
 }
 
 /// A Python integer argument checked against `range` **before** narrowing to `T`, so an out-of-range

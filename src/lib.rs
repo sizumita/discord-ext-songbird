@@ -158,7 +158,7 @@ mod native {
     // W4: send and sources.
     #[pymodule_export]
     use crate::py::playback::{
-        ClearResult, EncodedSink, ItemProgress, OpusSink, Playback, PlaybackStats,
+        ClearResult, EncodedSink, OpusSink, Playback, PlaybackStats, SegmentProgress,
     };
     #[pymodule_export]
     use crate::py::sources::{AudioFile, OpusPackets, RawPcm};

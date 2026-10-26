@@ -30,7 +30,6 @@ __all__ = [
     "Control",
     "EncodedSink",
     "EventSubscription",
-    "ItemProgress",
     "NativeTrack",
     "OpusPackets",
     "OpusSink",
@@ -39,6 +38,7 @@ __all__ = [
     "RawPcm",
     "ReceiveSubscription",
     "RouterSubscription",
+    "SegmentProgress",
     "StreamStats",
     "TrackInfo",
     "VERSION",
@@ -226,9 +226,9 @@ class AudioFormat:
     
     Parameters
     ----------
-    sample_rate : int, default 24000
+    sample_rate : int
         One of 8000, 16000, 24000, 48000.
-    channels : int, default 1
+    channels : int
         1 or 2.
     encoding : {"pcm16le", "f32le", "mulaw", "alaw"}, default "pcm16le"
         ``"mulaw"``/``"alaw"`` (G.711) require 8000 Hz mono.
@@ -266,17 +266,11 @@ class AudioFormat:
     @property
     def bytes_per_ms(self) -> builtins.int:
         r"""
-        Exact bytes per millisecond (48 for PCM16 24 kHz mono).
-        """
-    @property
-    def mime_type(self) -> builtins.str:
-        r"""
-        MIME type: ``'audio/pcm;rate=24000'``, ``'audio/pcmu'``, ``'audio/pcma'`` or
-        ``'audio/x-f32le;rate=48000'`` (stereo formats append ``';channels=2'``).
+        Exact bytes per millisecond (192 for PCM16 48 kHz stereo).
         """
     def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
     def __hash__(self) -> builtins.int: ...
-    def __new__(cls, sample_rate: builtins.int = 24000, channels: builtins.int = 1, encoding: typing.Literal['pcm16le', 'f32le', 'mulaw', 'alaw'] = "pcm16le") -> AudioFormat: ...
+    def __new__(cls, sample_rate: builtins.int, channels: builtins.int, encoding: typing.Literal['pcm16le', 'f32le', 'mulaw', 'alaw'] = "pcm16le") -> AudioFormat: ...
     @classmethod
     def parse(cls, spec: builtins.str) -> AudioFormat:
         r"""
@@ -285,9 +279,9 @@ class AudioFormat:
         Parameters
         ----------
         spec : str
-            ``'pcm16_24k'``, ``'pcm16_48k_stereo'``, ``'f32_48k'``, ``'mulaw'``, ``'alaw'``,
-            ``'pcm16le/24000/1'``, a preset name such as ``'PCM16_48K_STEREO'``, or a MIME type as
-            returned by :attr:`mime_type`.
+            ``'pcm16_48k_stereo'``, ``'pcm16_16k'``, ``'f32_48k'``, ``'mulaw'``, ``'alaw'``,
+            ``'pcm16le/48000/2'`` (encoding/rate/channels) or a preset name such as
+            ``'PCM16_48K_STEREO'``.
         
         Returns
         -------
@@ -409,13 +403,13 @@ class ClearResult:
     @property
     def generation(self) -> builtins.int: ...
     @property
-    def items(self) -> tuple[ItemProgress, ...]:
+    def segments(self) -> tuple[SegmentProgress, ...]:
         r"""
         Every open tag plus every tag pulled within the last ``output_latency_ms``.
         """
-    def item(self, tag: builtins.str) -> typing.Optional[ItemProgress]:
+    def segment(self, tag: builtins.str) -> typing.Optional[SegmentProgress]:
         r"""
-        The item of ``tag``, if it is in ``items``.
+        The progress of ``tag``, if it is in ``segments``.
         """
 
 @typing.final
@@ -770,29 +764,6 @@ class EventSubscription:
         """
 
 @typing.final
-class ItemProgress:
-    r"""
-    Playback progress of one tagged segment (§7.7).
-    """
-    @property
-    def tag(self) -> builtins.str: ...
-    @property
-    def written_ms(self) -> builtins.int: ...
-    @property
-    def played_ms(self) -> builtins.int:
-        r"""
-        Clamped to ``written_ms``.
-        """
-    @property
-    def heard_ms(self) -> builtins.int: ...
-    @property
-    def complete(self) -> builtins.bool:
-        r"""
-        ``end_item(tag)`` was called and everything written has been played.
-        """
-    def __repr__(self) -> builtins.str: ...
-
-@typing.final
 class NativeTrack:
     r"""
     The native half of ``TrackHandle`` (§9.8).
@@ -963,7 +934,8 @@ class Playback:
         data : collections.abc.Buffer
             ``bytes`` or any C-contiguous buffer whose format matches the stream encoding.
         tag : str or None, default None
-            Application-defined segment tag (at most 128 bytes) used by ``item()`` / ``end_item()``.
+            Application-defined segment tag (at most 128 bytes), used by ``segment()`` and
+            ``end_segment()``.
         at_ms : int or None, default None
             Source-timeline timestamp in ms; a gap since the previous timed write is filled with
             silence (up to ``max_gap_ms``).
@@ -975,7 +947,10 @@ class Playback:
         PlaybackFull
             Not enough space (nothing consumed).
         InvalidAudio
-            A typed buffer whose format does not match the encoding, or a bad tag.
+            A typed buffer whose format does not match the encoding, an ``AudioChunk`` of another
+            format, or a bad tag.
+        LimitExceeded
+            The write is larger than the whole buffer (checked before anything is copied).
         StreamClosed
             The playback or connection is closed.
         """
@@ -1008,14 +983,14 @@ class Playback:
         reject_until_gap_ms : int or None, default None
             Drop later timed writes contiguous with the cleared audio (``0..=10000``).
         """
-    def end_item(self, tag: builtins.str) -> None:
+    def end_segment(self, tag: builtins.str) -> None:
         r"""
         The application finished writing this tagged segment: closes the tag and releases the
         prebuffer gate.
         """
-    def item(self, tag: builtins.str) -> typing.Optional[ItemProgress]:
+    def segment(self, tag: builtins.str) -> typing.Optional[SegmentProgress]:
         r"""
-        Progress of one tag.
+        Progress of the tagged segment ``tag``, if it is known.
         """
     def pause(self) -> None: ...
     def resume(self) -> None: ...
@@ -1220,6 +1195,29 @@ class RouterSubscription:
         received stay open, also when the router is closed again or garbage-collected. Streams not
         yet received are always closed.
         """
+
+@typing.final
+class SegmentProgress:
+    r"""
+    Playback progress of one tagged segment (§7.7).
+    """
+    @property
+    def tag(self) -> builtins.str: ...
+    @property
+    def written_ms(self) -> builtins.int: ...
+    @property
+    def played_ms(self) -> builtins.int:
+        r"""
+        Clamped to ``written_ms``.
+        """
+    @property
+    def heard_ms(self) -> builtins.int: ...
+    @property
+    def complete(self) -> builtins.bool:
+        r"""
+        ``end_segment(tag)`` was called and everything written has been played.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class StreamStats:

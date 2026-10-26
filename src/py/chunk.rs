@@ -68,6 +68,11 @@ impl AudioChunk {
         }
     }
 
+    /// The chunk's audio format.
+    pub(crate) fn chunk_format(&self) -> sbcore::Format {
+        self.chunk.meta.format
+    }
+
     /// Buffer format code and item size of the payload.
     fn item(&self) -> (&'static CStr, isize) {
         match self.chunk.meta.format.encoding {

@@ -116,6 +116,23 @@ async def test_echo_returns_when_the_connection_closes(world: World) -> None:
     assert await asyncio.wait_for(task, 5) == 0
 
 
+async def test_echo_returns_when_the_connection_closes_mid_speech(world: World, testing: Any) -> None:
+    """Voiced chunks still queued when the connection closes are delivered, but the playback is
+    already closed: echo() must end cleanly instead of raising StreamClosed."""
+    echo = load_example("echo")
+    vc = await connect_detached(world)
+    testing.inject_map(vc._conn, SPEAKER_SSRC, SPEAKER)
+    task = asyncio.create_task(echo.echo(vc, SPEAKER, asyncio.Event(), delay_ms=100))
+    await wait_for(lambda: playback_of(vc) is not None, 5)
+    pkt = voice_packets(testing)[0]
+    for _ in range(10):  # queued, not yet read: no await between the ticks and the close
+        testing.inject_tick(vc._conn, [(SPEAKER_SSRC, pkt)], [])
+        vc.harness.step(20)
+    await vc.disconnect()
+    echoed = await asyncio.wait_for(task, 5)
+    assert 0 <= echoed <= 200
+
+
 async def test_websocket_bridge_streams_binary_frames(world: World, testing: Any) -> None:
     ws_bridge = load_example("websocket_bridge")
     fmt = songbird.PCM16_16K
@@ -183,6 +200,61 @@ async def test_websocket_bridge_stops_on_request(world: World) -> None:
             await wait_for(lambda: playback_of(vc) is not None, 5)
             stop.set()
             assert await asyncio.wait_for(task, 5) == "stopped"
+    finally:
+        await clock.stop()
+    assert vc.is_connected()
+    await vc.disconnect()
+
+
+@pytest.mark.parametrize("attempt", range(4))
+async def test_websocket_bridge_reports_voice_closed_while_audio_arrives(world: World, attempt: int) -> None:
+    """The service keeps sending audio when the voice connection closes: the bridge returns
+    ``"voice_closed"`` every time (no StreamClosed from the downlink, no arbitrary pick)."""
+    ws_bridge = load_example("websocket_bridge")
+    fmt = songbird.PCM16_16K
+    vc = await connect_detached(world)
+    frame = fmt.silence(20)
+
+    async def chatty_server(ws: Any) -> None:
+        with contextlib.suppress(Exception):
+            while True:
+                await ws.send(frame)
+                await asyncio.sleep(0.002)
+
+    clock = Clock(vc)
+    try:
+        async with ws_server(chatty_server) as url:
+            task = asyncio.create_task(ws_bridge.bridge(vc, url, input_format=fmt))
+            await wait_for(lambda: (pb := playback_of(vc)) is not None and pb.written_ms > 0, 5)
+            await vc.disconnect()
+            assert await asyncio.wait_for(task, 5) == "voice_closed"
+    finally:
+        await clock.stop()
+
+
+async def test_websocket_bridge_downlink_ends_cleanly_when_playback_closes(world: World) -> None:
+    """Deterministic version of the race above: audio arrives for a playback that is already closed
+    (as after a voice disconnect); the downlink reports it instead of raising StreamClosed."""
+    ws_bridge = load_example("websocket_bridge")
+    fmt = songbird.PCM16_16K
+    vc = await connect_detached(world)
+    frame = fmt.silence(20)
+
+    async def chatty_server(ws: Any) -> None:
+        with contextlib.suppress(Exception):
+            while True:
+                await ws.send(frame)
+                await asyncio.sleep(0.002)
+
+    clock = Clock(vc)
+    try:
+        async with ws_server(chatty_server) as url:
+            task = asyncio.create_task(ws_bridge.bridge(vc, url, input_format=fmt))
+            await wait_for(lambda: (pb := playback_of(vc)) is not None and pb.written_ms > 0, 5)
+            speaker = playback_of(vc)
+            assert speaker is not None
+            speaker.close()
+            assert await asyncio.wait_for(task, 5) == "voice_closed"
     finally:
         await clock.stop()
     assert vc.is_connected()

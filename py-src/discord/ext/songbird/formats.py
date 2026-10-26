@@ -3,7 +3,7 @@
 :class:`AudioFormat` is the native, immutable format class (little-endian, interleaved;
 ``sample_rate`` ∈ {8000, 16000, 24000, 48000}, ``channels`` ∈ {1, 2}, ``"mulaw"``/``"alaw"`` require
 8000 Hz mono). Anywhere a format is expected, a string accepted by :meth:`AudioFormat.parse` works
-too (``"pcm16_24k"``, ``"pcm16_48k_stereo"``, ``"f32_48k"``, ``"mulaw"``, ``"pcm16le/24000/1"``).
+too (``"pcm16_48k_stereo"``, ``"pcm16_16k"``, ``"f32_48k"``, ``"mulaw"``, ``"pcm16le/48000/2"``).
 
 :data:`PCM16_48K_STEREO` is Discord's native format and the default of every ``listen*`` stream and
 of ``open_playback``: audio in that format passes through without resampling or channel conversion.
