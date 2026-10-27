@@ -62,6 +62,38 @@ async def test_everything_is_collected_after_disconnect(world: World, testing: A
     assert not alive, alive
 
 
+def test_owed_leave_of_a_closed_loop_pins_nothing() -> None:
+    # The module-global owed-leave registry held the leave task strongly. A loop closed while the
+    # leave was pending (run_until_complete interrupted, then close()) never ran its done-callback,
+    # so the task, its guild and the whole old discord.Client stayed reachable forever.
+    from conftest import USER_ID
+    from discord.ext.songbird import client as client_mod
+
+    loop = asyncio.new_event_loop()
+    client = FakeClient()
+    guild = FakeGuild(client)
+    guild.leave_delay = 3_600.0  # the leave never completes before the loop is closed
+    channel = guild.add_channel(CHANNEL_ID)
+
+    async def abort(client: Any, channel: Any) -> None:
+        vc = HarnessClient(client, channel)
+        client._connection._add_voice_client(GUILD_ID, vc)
+        vc._loop = asyncio.get_running_loop()
+        vc._join_sent = True
+        vc._abort_connect()  # schedules the best-effort leave
+        await asyncio.sleep(0)  # it starts and blocks in the gateway
+
+    loop.run_until_complete(abort(client, channel))
+    assert (USER_ID, GUILD_ID) in client_mod._pending_leaves
+    loop.close()  # without cancelling or running the pending leave
+    ref = weakref.ref(client)
+    del client, guild, channel
+    collect()
+    assert ref() is None, "the closed loop's leave pinned the discord.Client"
+    client_mod._prune_owed_leaves()
+    assert (USER_ID, GUILD_ID) not in client_mod._pending_leaves
+
+
 async def test_abandoned_client_closes_its_connection(world: World) -> None:
     vc = await connect_detached(world)
     conn = vc._conn

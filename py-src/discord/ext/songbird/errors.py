@@ -45,7 +45,8 @@ class ConnectFailed(SongbirdError):
     Parameters
     ----------
     reason : str
-        Close reason, e.g. ``"connect_failed"``, ``"kicked"``, ``"requested"``, ``"timeout"``.
+        Close reason, e.g. ``"connect_failed"``, ``"kicked"``, ``"requested"``, ``"timeout"``, or
+        ``"move_failed"`` (``move_to()``: the gateway never confirmed the move).
     code : int or None
         Discord voice close code, if one caused the failure.
     """

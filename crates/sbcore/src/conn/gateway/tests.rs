@@ -3,12 +3,16 @@
 
 use super::*;
 
-/// Phase classes used by the matrix (Joining is split by whether the move fallback is armed).
+/// Phase classes used by the matrix. Joining is split by what it waits for: nothing (the initial
+/// join), an unconfirmed `Move`, the 3 s server fallback of a confirmed move, or a reallocated
+/// voice server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum P {
     Idle,
     Joining,
+    MovePending,
     JoiningMoved,
+    Reallocating,
     Connecting,
     Connected,
     AwaitingMove,
@@ -65,8 +69,12 @@ impl H {
     fn class(&self) -> P {
         match self.g.phase {
             Phase::Idle => P::Idle,
-            Phase::Joining if self.g.fallback.is_some() => P::JoiningMoved,
-            Phase::Joining => P::Joining,
+            Phase::Joining => match (self.g.join_wait, self.g.fallback) {
+                (Some(JoinWait::Move { .. }), _) => P::MovePending,
+                (Some(JoinWait::Server { .. }), _) => P::Reallocating,
+                (None, Some(_)) => P::JoiningMoved,
+                (None, None) => P::Joining,
+            },
             Phase::Connecting { .. } => P::Connecting,
             Phase::Connected => P::Connected,
             Phase::AwaitingMove { .. } => P::AwaitingMove,
@@ -155,8 +163,16 @@ fn build(p: P, prm: GatewayParams) -> H {
     assert_eq!(h.class(), P::Connected);
     match p {
         P::Connected => {}
-        P::JoiningMoved => {
+        P::MovePending => {
             h.step(GwInput::Move { channel: nz(20) });
+        }
+        P::JoiningMoved => {
+            // The gateway confirms the move: the fallback is armed from here.
+            h.step(GwInput::Move { channel: nz(20) });
+            h.step(vs("s1", Some(20)));
+        }
+        P::Reallocating => {
+            h.step(vsrv("t1", None));
         }
         P::AwaitingMove => {
             h.step(disc(
@@ -176,10 +192,12 @@ fn build(p: P, prm: GatewayParams) -> H {
     h
 }
 
-const ALL_PHASES: [P; 9] = [
+const ALL_PHASES: [P; 11] = [
     P::Idle,
     P::Joining,
+    P::MovePending,
     P::JoiningMoved,
+    P::Reallocating,
     P::Connecting,
     P::Connected,
     P::AwaitingMove,
@@ -212,6 +230,8 @@ enum I {
     DiscConnectIo,
     DiscRequested,
     Disc4014,
+    Disc4022,
+    Disc4021,
     Disc4006,
     Disc4017,
     DiscReconnectIo,
@@ -222,7 +242,7 @@ enum I {
     Close,
 }
 
-const ALL_INPUTS: [I; 29] = [
+const ALL_INPUTS: [I; 31] = [
     I::Join,
     I::Move,
     I::BeginRejoin,
@@ -244,6 +264,8 @@ const ALL_INPUTS: [I; 29] = [
     I::DiscConnectIo,
     I::DiscRequested,
     I::Disc4014,
+    I::Disc4022,
+    I::Disc4021,
     I::Disc4006,
     I::Disc4017,
     I::DiscReconnectIo,
@@ -297,6 +319,8 @@ fn input(i: I, h: &mut H) -> GwInput {
         I::DiscConnectIo => disc(DiscKind::Connect, Some(DiscReason::Io)),
         I::DiscRequested => disc(DiscKind::Runtime, Some(DiscReason::Requested)),
         I::Disc4014 => disc(DiscKind::Runtime, Some(DiscReason::WsClosed(Some(4014)))),
+        I::Disc4022 => disc(DiscKind::Runtime, Some(DiscReason::WsClosed(Some(4022)))),
+        I::Disc4021 => disc(DiscKind::Runtime, Some(DiscReason::WsClosed(Some(4021)))),
         I::Disc4006 => disc(DiscKind::Runtime, Some(DiscReason::WsClosed(Some(4006)))),
         I::Disc4017 => disc(DiscKind::Runtime, Some(DiscReason::WsClosed(Some(4017)))),
         I::DiscReconnectIo => disc(DiscKind::Reconnect, Some(DiscReason::Io)),
@@ -327,18 +351,23 @@ fn expected(p: P, i: I) -> Option<(P, &'static [A])> {
             Ph::Idle => (Ph::Joining, &[Mute, Notify]),
             _ => return None,
         },
+        // No fallback before the gateway confirms the move (§4.5 "Move confirmation").
         I::Move => match p {
-            Ph::Connected => (Ph::JoiningMoved, &[LinkDown, Notify]),
-            Ph::Joining => (Ph::Joining, &[]),
-            Ph::JoiningMoved => (Ph::JoiningMoved, &[]),
-            Ph::Connecting => (Ph::JoiningMoved, &[Notify]),
+            Ph::Connected => (Ph::MovePending, &[LinkDown, Notify]),
+            Ph::Joining | Ph::MovePending | Ph::JoiningMoved | Ph::Reallocating => {
+                (Ph::MovePending, &[])
+            }
+            Ph::Connecting => (Ph::MovePending, &[Notify]),
             Ph::AwaitingMove | Ph::AwaitingRejoin | Ph::Rejoining => (p, &[]),
             _ => return None,
         },
         I::BeginRejoin => match p {
-            Ph::Joining | Ph::JoiningMoved | Ph::Connecting | Ph::Connected => {
-                (Ph::Rejoining, &[Notify])
-            }
+            Ph::Joining
+            | Ph::MovePending
+            | Ph::JoiningMoved
+            | Ph::Reallocating
+            | Ph::Connecting
+            | Ph::Connected => (Ph::Rejoining, &[Notify]),
             Ph::AwaitingMove | Ph::AwaitingRejoin | Ph::Rejoining => (Ph::Rejoining, &[]),
             _ => return None,
         },
@@ -352,46 +381,66 @@ fn expected(p: P, i: I) -> Option<(P, &'static [A])> {
             Ph::Idle => return None,
             _ => (Ph::Closed, &[Teardown]),
         },
+        // StateSame/StateNewSession name channel 10: the old channel of a pending move to 20,
+        // which does not confirm it.
         I::StateSame => match p {
-            Ph::Joining => (Ph::Joining, &[]),
+            Ph::Joining | Ph::MovePending | Ph::Reallocating => (p, &[]),
             Ph::JoiningMoved => (Ph::JoiningMoved, &[Ctrl]),
-            Ph::Connecting | Ph::Connected | Ph::AwaitingMove | Ph::Rejoining => (p, &[]),
+            Ph::Connecting
+            | Ph::Connected
+            | Ph::AwaitingMove
+            | Ph::AwaitingRejoin
+            | Ph::Rejoining => (p, &[]),
             _ => return None,
         },
         I::StateNewSession => match p {
-            Ph::Joining => (Ph::Joining, &[]),
+            Ph::Joining | Ph::MovePending | Ph::Reallocating => (p, &[]),
             Ph::JoiningMoved => (Ph::JoiningMoved, &[Ctrl]),
             Ph::Connecting => (Ph::Connecting, &[Connect]),
             Ph::Connected | Ph::AwaitingMove => (Ph::Connecting, &[Connect, Notify]),
-            Ph::Rejoining => (Ph::Rejoining, &[]),
+            // AwaitingRejoin: no fresh server yet, so no Connect.
+            Ph::AwaitingRejoin | Ph::Rejoining => (p, &[]),
             _ => return None,
         },
         I::StateOtherChannel => match p {
-            Ph::Joining => (Ph::Joining, &[Ctrl]),
-            Ph::JoiningMoved => (Ph::JoiningMoved, &[Ctrl]),
+            Ph::Joining | Ph::Reallocating => (p, &[Ctrl]),
+            // A channel other than the old one confirms the move: the fallback is armed.
+            Ph::MovePending | Ph::JoiningMoved => (Ph::JoiningMoved, &[Ctrl]),
             Ph::Connecting | Ph::Connected => (Ph::JoiningMoved, &[Ctrl, LinkDown, Notify]),
             Ph::AwaitingMove => (Ph::JoiningMoved, &[Ctrl, Notify]),
-            Ph::Rejoining => (Ph::Rejoining, &[Ctrl]),
+            Ph::AwaitingRejoin | Ph::Rejoining => (p, &[Ctrl]),
             _ => return None,
         },
         I::ServerNone => match p {
-            Ph::Connecting | Ph::Connected => (Ph::Joining, &[LinkDown, Notify]),
+            // After an established connection a reallocation deadline is armed.
+            Ph::Connected => (Ph::Reallocating, &[LinkDown, Emit, Notify]),
+            // Connecting (initial join): the Python connect timeout governs.
+            Ph::Connecting => (Ph::Joining, &[LinkDown, Notify]),
             // A reallocation announcement disarms the move fallback.
-            Ph::JoiningMoved => (Ph::Joining, &[]),
+            Ph::JoiningMoved => (Ph::Reallocating, &[]),
             _ if open => (p, &[]),
             _ => return None,
         },
         I::ServerSame => match p {
             Ph::Joining => (Ph::Joining, &[]),
-            Ph::JoiningMoved | Ph::Rejoining => (Ph::Connecting, &[Connect, Notify]),
+            // A server update ends a pending move or a reallocation; AwaitingRejoin stashed the
+            // old server, so this one is fresh.
+            Ph::MovePending
+            | Ph::JoiningMoved
+            | Ph::Reallocating
+            | Ph::AwaitingRejoin
+            | Ph::Rejoining => (Ph::Connecting, &[Connect, Notify]),
             Ph::AwaitingMove => (Ph::AwaitingMove, &[]),
             _ => return None, // Connecting/Connected: unchanged server is not a listed row
         },
         I::ServerChanged => match p {
             Ph::Joining => (Ph::Joining, &[]),
-            Ph::JoiningMoved | Ph::Rejoining | Ph::Connected => {
-                (Ph::Connecting, &[Connect, Notify])
-            }
+            Ph::MovePending
+            | Ph::JoiningMoved
+            | Ph::Reallocating
+            | Ph::AwaitingRejoin
+            | Ph::Rejoining
+            | Ph::Connected => (Ph::Connecting, &[Connect, Notify]),
             Ph::Connecting => (Ph::Connecting, &[Connect]),
             Ph::AwaitingMove => (Ph::AwaitingMove, &[]),
             _ => return None,
@@ -426,8 +475,14 @@ fn expected(p: P, i: I) -> Option<(P, &'static [A])> {
             true => (p, &[]),
             false => return None,
         },
-        I::Disc4014 => match p {
+        I::Disc4014 | I::Disc4022 => match p {
             Ph::Connected => (Ph::AwaitingMove, &[LinkDown, Emit, Notify]),
+            Ph::AwaitingMove => (p, &[]),
+            _ if open => (p, &[LinkDown, Emit]),
+            _ => return None,
+        },
+        I::Disc4021 => match p {
+            Ph::Connected => (Ph::Closed, &[Teardown]),
             Ph::AwaitingMove => (p, &[]),
             _ if open => (p, &[LinkDown, Emit]),
             _ => return None,
@@ -454,6 +509,9 @@ fn expected(p: P, i: I) -> Option<(P, &'static [A])> {
         },
         I::Deadline => match p {
             Ph::JoiningMoved => (Ph::Connecting, &[Connect, Notify]),
+            // Never confirmed: back to the intact connection on the old channel.
+            Ph::MovePending => (Ph::Connected, &[LinkUp, Notify]),
+            Ph::Reallocating => (Ph::AwaitingRejoin, &[Notify]),
             Ph::AwaitingMove => (Ph::AwaitingRejoin, &[]),
             Ph::AwaitingRejoin => (Ph::Rejoining, &[Ctrl]),
             Ph::Rejoining => (Ph::AwaitingRejoin, &[]),
@@ -599,10 +657,18 @@ fn driver_connect_before_result_supplies_ssrc() {
 fn endpoint_none_waits_for_reallocation() {
     let mut h = build(P::Connected, params(true, 3));
     let acts = h.step(vsrv("t1", None));
-    assert_eq!(classes(&acts), [A::LinkDown, A::Notify]);
+    assert_eq!(classes(&acts), [A::LinkDown, A::Emit, A::Notify]);
+    assert!(matches!(
+        acts[1],
+        GwAction::Emit(EventData::Disconnected {
+            reason: "server_reallocating",
+            code: None,
+            will_retry: true
+        })
+    ));
     assert_eq!(h.g.status().state, "joining");
-    // Nothing is armed: Discord sends a new update.
-    assert!(h.g.next_deadline().is_none());
+    // Discord sends a new update; the reallocation deadline only bounds the wait.
+    assert_eq!(h.g.next_deadline(), Some(h.now + Duration::from_secs(15)));
     let acts = h.step(vsrv("t9", Some("wss://new.discord.media")));
     let (info, generation) = connect_info(&acts);
     assert_eq!(generation, 2);
@@ -659,6 +725,105 @@ fn move_with_server_update_connects_without_fallback() {
         assert!(h.step(stale).is_empty());
         assert_eq!(h.g.status().state, "connecting");
     }
+}
+
+#[test]
+fn unconfirmed_move_returns_to_the_old_channel() {
+    // Finding: the 3 s fallback was armed by the Move itself, so a move the gateway ignored (no
+    // CONNECT permission, a full channel) "connected" to the new channel id with the old session
+    // and token, and move_to() succeeded.
+    let mut h = build(P::Connected, params(true, 3));
+    h.step(GwInput::Move { channel: nz(20) });
+    assert_eq!(h.g.next_deadline(), Some(h.now + Duration::from_secs(5)));
+    h.advance(Duration::from_secs(3));
+    let before = h.g.unlisted_inputs();
+    assert!(
+        h.step(GwInput::Deadline).is_empty(),
+        "no fallback without confirmation"
+    );
+    assert_eq!(h.g.unlisted_inputs(), before + 1);
+    // A VoiceState naming the old channel is not a confirmation.
+    assert!(h.step(vs("s1", Some(10))).is_empty());
+    h.advance(Duration::from_secs(2));
+    let acts = h.step(GwInput::Deadline);
+    assert!(matches!(
+        acts[..],
+        [
+            GwAction::RxLink {
+                up: true,
+                ssrc: Some(7)
+            },
+            GwAction::NotifyStatus
+        ]
+    ));
+    let s = h.g.status();
+    assert_eq!(
+        (s.state, s.channel_id, s.target_channel_id, s.generation),
+        ("connected", Some(10), Some(10), 1),
+        "no Connect was ever issued for the unconfirmed channel"
+    );
+    // The connection is fully usable again: a later server change reconnects on channel 10.
+    let acts = h.step(vsrv("t2", Some(E2)));
+    let (info, _) = connect_info(&acts);
+    assert_eq!(info.channel_id, ChannelId::from(nz(10)));
+}
+
+#[test]
+fn unconfirmed_move_without_an_intact_connection_rejoins_the_old_channel() {
+    // The old voice WS died during the pending move: nothing to return to, so rejoin where
+    // Discord still has us (not the unconfirmed channel).
+    let mut h = build(P::Connected, params(true, 3));
+    h.step(GwInput::Move { channel: nz(20) });
+    h.step(disc(DiscKind::Runtime, Some(DiscReason::Io)));
+    h.advance(Duration::from_secs(5));
+    let acts = h.step(GwInput::Deadline);
+    assert_eq!(classes(&acts), [A::Notify]);
+    assert_eq!(h.g.status().target_channel_id, Some(10));
+    let acts = h.step(GwInput::Deadline);
+    assert!(matches!(
+        acts[..],
+        [GwAction::Control(Control::Rejoin {
+            attempt: 1,
+            channel_id: 10
+        })]
+    ));
+    // Without reconnect it closes.
+    let mut h = build(P::Connecting, params(false, 3));
+    h.step(GwInput::Move { channel: nz(20) });
+    h.advance(Duration::from_secs(5));
+    let acts = h.step(GwInput::Deadline);
+    assert!(matches!(acts[..], [GwAction::Teardown(CloseReason::Lost)]));
+}
+
+#[test]
+fn move_is_confirmed_by_the_gateway() {
+    // The echo of our op 4 confirms the move; the fallback runs 3 s from the confirmation.
+    let mut h = build(P::Connected, params(true, 3));
+    h.step(GwInput::Move { channel: nz(20) });
+    h.advance(Duration::from_secs(4));
+    assert!(h.step(vs("s1", Some(20))).is_empty());
+    assert_eq!(h.g.next_deadline(), Some(h.now + Duration::from_secs(3)));
+    h.advance(Duration::from_secs(3));
+    let acts = h.step(GwInput::Deadline);
+    let (info, _) = connect_info(&acts);
+    assert_eq!(info.channel_id, ChannelId::from(nz(20)));
+    // A server update alone also confirms it (Discord sends one only in reply to our op 4).
+    let mut h = build(P::Connected, params(true, 3));
+    h.step(GwInput::Move { channel: nz(20) });
+    let acts = h.step(vsrv("t2", Some(E2)));
+    let (info, _) = connect_info(&acts);
+    assert_eq!(
+        (info.channel_id, info.token.as_str()),
+        (ChannelId::from(nz(20)), "t2")
+    );
+    // A newer move keeps the revert target of the first one.
+    let mut h = build(P::Connected, params(true, 3));
+    h.step(GwInput::Move { channel: nz(20) });
+    h.step(GwInput::Move { channel: nz(30) });
+    h.advance(Duration::from_secs(5));
+    h.step(GwInput::Deadline);
+    let s = h.g.status();
+    assert_eq!((s.state, s.channel_id), ("connected", Some(10)));
 }
 
 #[test]
@@ -850,6 +1015,160 @@ fn a_4016_or_4017_closes_without_rejoin() {
 }
 
 #[test]
+fn a_4022_waits_like_4014_and_reconnects_on_the_new_server() {
+    // Finding: 4022 (call terminated: voice server changed, channel deleted) was a generic loss,
+    // so a server migration closed the connection (reconnect=False) or forced an op 4
+    // leave + join; the fresh server update was discarded in AwaitingRejoin.
+    for reconnect in [true, false] {
+        let mut h = build(P::Connected, params(reconnect, 3));
+        let acts = h.step(disc(
+            DiscKind::Runtime,
+            Some(DiscReason::WsClosed(Some(4022))),
+        ));
+        assert_eq!(classes(&acts), [A::LinkDown, A::Emit, A::Notify]);
+        assert!(matches!(
+            acts[1],
+            GwAction::Emit(EventData::Disconnected {
+                code: Some(4022),
+                will_retry: true,
+                ..
+            })
+        ));
+        let acts = h.step(vsrv("t2", Some(E2)));
+        let (info, _) = connect_info(&acts);
+        assert_eq!(info.channel_id, ChannelId::from(nz(10)));
+        assert_eq!(
+            (info.token.as_str(), info.session_id.as_str()),
+            ("t2", "s1")
+        );
+        h.step(GwInput::ConnectResult {
+            generation: h.g.generation,
+            result: Ok(()),
+        });
+        assert_eq!(h.g.status().state, "connected", "reconnect={reconnect}");
+        assert_eq!(h.g.unlisted_inputs(), 0);
+    }
+    // Channel deleted: the gateway's VoiceState(None) closes it.
+    let mut h = build(P::Connected, params(true, 3));
+    h.step(disc(
+        DiscKind::Runtime,
+        Some(DiscReason::WsClosed(Some(4022))),
+    ));
+    let acts = h.step(vs("s1", None));
+    assert!(matches!(
+        acts[..],
+        [GwAction::Teardown(CloseReason::Kicked)]
+    ));
+    // Grace expiry without reconnect reports the real code.
+    let mut h = build(P::Connected, params(false, 3));
+    h.step(disc(
+        DiscKind::Runtime,
+        Some(DiscReason::WsClosed(Some(4022))),
+    ));
+    h.advance(Duration::from_secs(5));
+    assert!(matches!(
+        h.step(GwInput::Deadline)[..],
+        [GwAction::Teardown(CloseReason::Lost)]
+    ));
+    assert_eq!(h.g.status().close_code, Some(4022));
+    // 4014 still waits for the VoiceState of the move (the server is only stored).
+    let mut h = build(P::AwaitingMove, params(true, 3));
+    assert!(h.step(vsrv("t2", Some(E2))).is_empty());
+    assert!(matches!(
+        h.g.phase(),
+        Phase::AwaitingMove { code: 4014, .. }
+    ));
+}
+
+#[test]
+fn a_4021_closes_without_rejoin() {
+    // Rate limited: "should not reconnect"; a rejoin would send more op 4 pairs.
+    let mut h = build(P::Connected, params(true, 3));
+    let acts = h.step(disc(
+        DiscKind::Runtime,
+        Some(DiscReason::WsClosed(Some(4021))),
+    ));
+    assert!(matches!(acts[..], [GwAction::Teardown(CloseReason::Lost)]));
+    let s = h.g.status();
+    assert_eq!(
+        (s.close_reason, s.close_code),
+        (Some(CloseReason::Lost), Some(4021))
+    );
+}
+
+#[test]
+fn moderator_move_while_awaiting_rejoin_is_followed() {
+    // Finding: VoiceState(Some(other)) in AwaitingRejoin was dropped, so the Rejoin control
+    // dragged the bot back to the channel a moderator had moved it out of.
+    let mut h = build(P::AwaitingRejoin, params(true, 3));
+    let acts = h.step(vs("s1", Some(30)));
+    assert!(matches!(
+        acts[..],
+        [GwAction::Control(Control::ChannelMoved { channel_id: 30 })]
+    ));
+    assert_eq!(h.g.status().target_channel_id, Some(30));
+    h.advance(Duration::from_secs(2));
+    let acts = h.step(GwInput::Deadline);
+    assert!(matches!(
+        acts[..],
+        [GwAction::Control(Control::Rejoin {
+            attempt: 1,
+            channel_id: 30
+        })]
+    ));
+    // With the move's fresh server it connects at once, without a leave + join.
+    let mut h = build(P::AwaitingRejoin, params(true, 3));
+    h.step(vs("s3", Some(30)));
+    let acts = h.step(vsrv("t3", Some(E2)));
+    let (info, _) = connect_info(&acts);
+    assert_eq!(info.channel_id, ChannelId::from(nz(30)));
+    assert_eq!(
+        (info.token.as_str(), info.session_id.as_str()),
+        ("t3", "s3")
+    );
+}
+
+#[test]
+fn late_leave_echo_of_a_rejoin_is_not_a_kick() {
+    // The rejoin's op 4 None was delayed past the 15 s Rejoining timeout (discord.py's gateway
+    // rate limiter): its echo lands in AwaitingRejoin and must not close as left_channel.
+    let mut h = build(P::Connected, params(true, 3));
+    h.step(disc(DiscKind::Runtime, Some(DiscReason::Io)));
+    let Phase::AwaitingRejoin { due, .. } = h.g.phase() else {
+        panic!()
+    };
+    h.now = due;
+    h.step(GwInput::Deadline); // Rejoining: Python sends op 4 None, then the join
+    h.advance(Duration::from_secs(15));
+    h.step(GwInput::Deadline); // timed out → AwaitingRejoin{2}
+    assert!(matches!(
+        h.g.phase(),
+        Phase::AwaitingRejoin { attempt: 2, .. }
+    ));
+    assert!(
+        h.step(vs("s1", None)).is_empty(),
+        "the late echo is consumed"
+    );
+    assert_eq!(h.g.status().state, "reconnecting");
+    // Only once: a second VoiceState(None) is a real disconnect.
+    let acts = h.step(vs("s1", None));
+    assert!(matches!(
+        acts[..],
+        [GwAction::Teardown(CloseReason::LeftChannel)]
+    ));
+    // An echo already seen in Rejoining leaves nothing pending.
+    let mut h = build(P::Rejoining, params(true, 3));
+    h.step(vs("s1", None));
+    h.advance(Duration::from_secs(15));
+    h.step(GwInput::Deadline);
+    let acts = h.step(vs("s1", None));
+    assert!(matches!(
+        acts[..],
+        [GwAction::Teardown(CloseReason::LeftChannel)]
+    ));
+}
+
+#[test]
 fn reconnect_kind_disconnect_while_connected() {
     let mut h = build(P::Connected, params(true, 3));
     h.step(disc(DiscKind::Reconnect, Some(DiscReason::TimedOut)));
@@ -961,10 +1280,51 @@ fn rejoining_into_another_channel_waits_for_the_fresh_server() {
 fn reallocation_disarms_the_move_fallback() {
     let mut h = build(P::JoiningMoved, params(true, 3));
     assert!(h.step(vsrv("t1", None)).is_empty());
-    assert!(h.g.next_deadline().is_none());
+    // Only the reallocation deadline is left: the previous server is never reused.
+    assert_eq!(h.g.next_deadline(), Some(h.now + Duration::from_secs(15)));
+    assert!(h.g.prev_server.is_none());
     h.advance(Duration::from_secs(10));
     assert!(h.step(GwInput::Deadline).is_empty());
     assert_eq!(h.g.status().state, "joining");
+}
+
+#[test]
+fn reallocation_that_never_completes_rejoins_or_closes() {
+    // Finding: after VoiceServer(None) the state stayed "joining" forever with no deadline.
+    let mut h = build(P::Connected, params(true, 3));
+    h.step(vsrv("t1", None));
+    h.advance(Duration::from_millis(14_999));
+    assert!(h.step(GwInput::Deadline).is_empty());
+    assert_eq!(h.g.status().state, "joining");
+    h.advance(Duration::from_millis(1));
+    let acts = h.step(GwInput::Deadline);
+    assert_eq!(classes(&acts), [A::Notify]);
+    assert!(matches!(h.g.phase(), Phase::AwaitingRejoin { attempt: 1, due } if due == h.now));
+    let acts = h.step(GwInput::Deadline);
+    assert!(matches!(
+        acts[..],
+        [GwAction::Control(Control::Rejoin {
+            attempt: 1,
+            channel_id: 10
+        })]
+    ));
+
+    let mut h = build(P::Connected, params(false, 3));
+    h.step(vsrv("t1", None));
+    h.advance(Duration::from_secs(15));
+    let acts = h.step(GwInput::Deadline);
+    assert!(matches!(acts[..], [GwAction::Teardown(CloseReason::Lost)]));
+
+    // Also bounded when it arrives while a confirmed move waits for its server (the fallback
+    // is disarmed), and not armed for the initial join (the Python connect timeout governs).
+    let mut h = build(P::JoiningMoved, params(true, 3));
+    h.step(vsrv("t1", None));
+    h.advance(Duration::from_secs(15));
+    h.step(GwInput::Deadline);
+    assert!(matches!(h.g.phase(), Phase::AwaitingRejoin { .. }));
+    let mut h = build(P::Connecting, params(true, 3));
+    h.step(vsrv("t1", None));
+    assert!(h.g.next_deadline().is_none());
 }
 
 #[test]
@@ -1141,6 +1501,10 @@ fn action_seq_is_monotonic() {
 fn deadlines_are_reported() {
     let h = build(P::JoiningMoved, params(true, 3));
     assert_eq!(h.g.next_deadline(), Some(h.now + Duration::from_secs(3)));
+    let h = build(P::MovePending, params(true, 3));
+    assert_eq!(h.g.next_deadline(), Some(h.now + Duration::from_secs(5)));
+    let h = build(P::Reallocating, params(true, 3));
+    assert_eq!(h.g.next_deadline(), Some(h.now + Duration::from_secs(15)));
     let h = build(P::AwaitingMove, params(true, 3));
     assert_eq!(h.g.next_deadline(), Some(h.now + Duration::from_secs(5)));
     let h = build(P::Rejoining, params(true, 3));

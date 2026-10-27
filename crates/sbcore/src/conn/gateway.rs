@@ -13,7 +13,12 @@
 //! * `AwaitingMove` stores a `VoiceServer` that arrives before the move's `VoiceState`;
 //! * `AwaitingMove` + `VoiceState(None)` closes with `Requested` after `request_leave()`;
 //! * `rejoin_attempts = 0` disables gateway rejoins everywhere (a rejoin is scheduled only while
-//!   `attempt + 1 ≤ rejoin_attempts`).
+//!   `attempt + 1 ≤ rejoin_attempts`);
+//! * a `Move` arms the 3 s server fallback only once the gateway confirms it, and an unconfirmed move
+//!   returns to the previous channel (§4.5 "Move confirmation");
+//! * 4022 waits like 4014 and reconnects on a fresh server; 4021 closes; `AwaitingRejoin` merges
+//!   gateway updates; a `VoiceServer(None)` after a connection arms a reallocation deadline; the late
+//!   leave echo of a rejoin is not a kick.
 
 use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
@@ -30,11 +35,23 @@ use crate::events::EventData;
 pub enum Phase {
     Idle,
     Joining,
-    Connecting { generation: u64 },
+    Connecting {
+        generation: u64,
+    },
     Connected,
-    AwaitingMove { deadline: Instant },
-    AwaitingRejoin { attempt: u8, due: Instant },
-    Rejoining { attempt: u8, deadline: Instant },
+    /// After voice close code `code` (4014 or 4022): the gateway update decides what happened.
+    AwaitingMove {
+        deadline: Instant,
+        code: u16,
+    },
+    AwaitingRejoin {
+        attempt: u8,
+        due: Instant,
+    },
+    Rejoining {
+        attempt: u8,
+        deadline: Instant,
+    },
     Closed(CloseReason),
 }
 
@@ -214,7 +231,7 @@ pub struct GatewayParams {
     pub reconnect: bool,
     pub rejoin_attempts: u8,
     pub auto_recover: bool,
-    /// 5 s.
+    /// 5 s: the grace after 4014/4022, and how long the gateway has to confirm a `Move`.
     pub move_grace: Duration,
     /// 3 s.
     pub server_fallback: Duration,
@@ -265,6 +282,30 @@ pub struct StatusSnapshot {
     pub close_code: Option<u16>,
 }
 
+/// What a `Joining` phase entered from an established connection is waiting for, and until when
+/// (§4.5). The initial join has none: the Python `connect(timeout=)` governs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JoinWait {
+    /// A `Move` (our op 4) that the gateway has not confirmed yet. `from`: the channel Discord
+    /// still has us in. `revert`: the media connection to `channel` is intact (Connected → Move,
+    /// no `Connect` and no driver disconnect since), so an unconfirmed move returns to it.
+    Move {
+        deadline: Instant,
+        from: Option<NonZeroU64>,
+        revert: bool,
+    },
+    /// `VoiceServer(None)`: Discord is reallocating the voice server.
+    Server { deadline: Instant },
+}
+
+impl JoinWait {
+    fn deadline(self) -> Instant {
+        match self {
+            JoinWait::Move { deadline, .. } | JoinWait::Server { deadline } => deadline,
+        }
+    }
+}
+
 /// The voice server half of the connection info.
 #[derive(Clone, PartialEq, Eq)]
 struct ServerInfo {
@@ -303,8 +344,13 @@ pub struct GatewayState {
     attempt: u8,
     leave_requested: bool,
     ssrc: Option<u32>,
-    /// Joining after a move: when the 3 s server fallback fires.
+    /// Joining after a confirmed move: when the 3 s server fallback fires.
     fallback: Option<Instant>,
+    /// Joining entered from an established connection: what it waits for (§4.5).
+    join_wait: Option<JoinWait>,
+    /// A rejoin's op 4 `None` was sent and its `VoiceState(None)` echo has not arrived yet: a late
+    /// echo (after the Rejoining timeout) is not a kick.
+    leave_echo_pending: bool,
     last_reinstall: Option<Instant>,
     /// When the media link was last reported down (`Reconnected.gap_ms`).
     link_down_at: Option<Instant>,
@@ -328,6 +374,7 @@ impl std::fmt::Debug for GatewayState {
             .field("generation", &self.generation)
             .field("attempt", &self.attempt)
             .field("leave_requested", &self.leave_requested)
+            .field("join_wait", &self.join_wait)
             .field("ssrc", &self.ssrc)
             .finish_non_exhaustive()
     }
@@ -359,6 +406,8 @@ impl GatewayState {
             leave_requested: false,
             ssrc: None,
             fallback: None,
+            join_wait: None,
+            leave_echo_pending: false,
             last_reinstall: None,
             link_down_at: None,
             close_code: None,
@@ -497,17 +546,33 @@ impl GatewayState {
         out: &mut SmallVec<[GwAction; 4]>,
     ) -> bool {
         match self.phase {
-            Phase::Connected => {
+            Phase::Connected | Phase::Joining | Phase::Connecting { .. } => {
+                // Where Discord has us until it confirms this move, and whether that media
+                // connection is still intact. A newer move supersedes a pending one (keeping where
+                // the first one started); a result of an abandoned attempt is stale (the next
+                // Connect bumps the generation).
+                let (from, revert) = match (self.phase, self.join_wait) {
+                    (Phase::Connected, _) => (self.channel.and_then(NonZeroU64::new), true),
+                    (Phase::Joining, Some(JoinWait::Move { from, revert, .. })) => (from, revert),
+                    (Phase::Connecting { .. }, _) => (self.connect_target, false),
+                    _ => (self.target, false),
+                };
+                if self.phase == Phase::Connected {
+                    self.link_down(now, out);
+                }
                 self.stash_server();
-                self.link_down(now, out);
-                self.enter_joining(channel, now);
-                true
-            }
-            Phase::Joining | Phase::Connecting { .. } => {
-                // The newer move supersedes the pending one; a result of the abandoned attempt is
-                // stale (the next Connect bumps the generation).
-                self.stash_server();
-                self.enter_joining(channel, now);
+                self.phase = Phase::Joining;
+                self.target = Some(channel);
+                self.server = None;
+                // The 3 s server fallback is armed only once the gateway confirms the move: an op 4
+                // that Discord ignores (no CONNECT permission, a full channel) must not "connect"
+                // to the new channel id with the old session and token.
+                self.fallback = None;
+                self.join_wait = Some(JoinWait::Move {
+                    deadline: now.checked_add(self.p.move_grace).unwrap_or(now),
+                    from,
+                    revert,
+                });
                 true
             }
             Phase::AwaitingMove { .. } | Phase::AwaitingRejoin { .. } | Phase::Rejoining { .. } => {
@@ -529,7 +594,16 @@ impl GatewayState {
     fn on_voice_state_none(&mut self, out: &mut SmallVec<[GwAction; 4]>) -> bool {
         match self.phase {
             // Expected from the leave half of the rejoin.
-            Phase::Rejoining { .. } => true,
+            Phase::Rejoining { .. } => {
+                self.leave_echo_pending = false;
+                true
+            }
+            // The echo of a rejoin's leave that arrived after its Rejoining timeout (the op 4 was
+            // delayed, e.g. by discord.py's gateway rate limiter): not a kick.
+            Phase::AwaitingRejoin { .. } if self.leave_echo_pending => {
+                self.leave_echo_pending = false;
+                true
+            }
             Phase::AwaitingMove { .. } => {
                 let r = if self.leave_requested {
                     CloseReason::Requested
@@ -563,15 +637,55 @@ impl GatewayState {
         out: &mut SmallVec<[GwAction; 4]>,
     ) -> bool {
         match self.phase {
-            Phase::Joining | Phase::Rejoining { .. } => {
+            Phase::Joining => {
                 self.session = Some(session);
+                let pending_move = match self.join_wait {
+                    Some(JoinWait::Move { from, .. }) => {
+                        if from == Some(c) && self.target != Some(c) {
+                            // Still in the old channel (e.g. the echo of an earlier flag op 4): not
+                            // the confirmation of our move; the move deadline decides.
+                            return true;
+                        }
+                        self.join_wait = None; // confirmed
+                        true
+                    }
+                    _ => false,
+                };
                 if self.target != Some(c) {
                     self.target = Some(c);
-                    // Joining: a server update from before the move is not reused (§4.5). In
-                    // Rejoining every server was received after the leave, so it stays valid.
-                    if self.phase == Phase::Joining {
-                        self.stash_server();
-                    }
+                    // A server update from before the move is not reused (§4.5).
+                    self.stash_server();
+                    out.push(GwAction::Control(Control::ChannelMoved {
+                        channel_id: c.get(),
+                    }));
+                }
+                if !self.maybe_connect(out) && pending_move {
+                    // The gateway confirmed the move: fall back to the previous server after 3 s.
+                    self.arm_fallback(now);
+                }
+                true
+            }
+            Phase::Rejoining { .. } => {
+                self.session = Some(session);
+                self.leave_echo_pending = false; // the leave was processed before this join
+                if self.target != Some(c) {
+                    // Every server was received after the leave, so it stays valid.
+                    self.target = Some(c);
+                    out.push(GwAction::Control(Control::ChannelMoved {
+                        channel_id: c.get(),
+                    }));
+                }
+                self.maybe_connect(out);
+                true
+            }
+            Phase::AwaitingRejoin { .. } => {
+                // A moderator move (or a late echo of a rejoin's join) while waiting to rejoin:
+                // the rejoin must target the channel Discord has us in, not drag us back. A fresh
+                // server (received since the drop) connects at once.
+                self.session = Some(session);
+                self.leave_echo_pending = false;
+                if self.target != Some(c) {
+                    self.target = Some(c);
                     out.push(GwAction::Control(Control::ChannelMoved {
                         channel_id: c.get(),
                     }));
@@ -597,6 +711,7 @@ impl GatewayState {
                 true
             }
             Phase::AwaitingMove { .. } => {
+                self.leave_echo_pending = false;
                 let session_changed = self.session.as_deref() != Some(&*session);
                 self.session = Some(session);
                 if self.channel != Some(c.get()) {
@@ -619,7 +734,7 @@ impl GatewayState {
                 }
                 true
             }
-            Phase::AwaitingRejoin { .. } | Phase::Idle | Phase::Closed(_) => false,
+            Phase::Idle | Phase::Closed(_) => false,
         }
     }
 
@@ -628,20 +743,49 @@ impl GatewayState {
             return false;
         }
         // Discord sends a new update once it reallocates the server; the move fallback (reusing
-        // the previous server) no longer applies.
+        // the previous server) no longer applies, and neither does reverting a move to it.
         self.server = None;
+        self.prev_server = None;
         self.fallback = None;
-        if matches!(self.phase, Phase::Connected | Phase::Connecting { .. }) {
-            if self.phase == Phase::Connected
-                && let Some(ch) = self.channel.and_then(NonZeroU64::new)
-            {
-                self.target = Some(ch);
-            } else if let Some(ct) = self.connect_target {
-                self.target = Some(ct);
+        // After an established connection nothing else bounds the wait (the Python connect timeout
+        // only covers the initial join): if the new server never arrives, rejoin (or close).
+        let established = self.channel.is_some();
+        let realloc = JoinWait::Server {
+            deadline: now.checked_add(self.p.rejoin_timeout).unwrap_or(now),
+        };
+        match self.phase {
+            Phase::Connected | Phase::Connecting { .. } => {
+                if self.phase == Phase::Connected
+                    && let Some(ch) = self.channel.and_then(NonZeroU64::new)
+                {
+                    self.target = Some(ch);
+                } else if let Some(ct) = self.connect_target {
+                    self.target = Some(ct);
+                }
+                self.phase = Phase::Joining;
+                self.link_down(now, out);
+                if established {
+                    self.join_wait = Some(realloc);
+                    out.push(GwAction::Emit(EventData::Disconnected {
+                        reason: "server_reallocating",
+                        code: None,
+                        will_retry: true,
+                    }));
+                }
             }
-            self.phase = Phase::Joining;
-            self.fallback = None;
-            self.link_down(now, out);
+            Phase::Joining => match self.join_wait {
+                Some(JoinWait::Move { deadline, from, .. }) => {
+                    self.join_wait = Some(JoinWait::Move {
+                        deadline,
+                        from,
+                        revert: false,
+                    });
+                }
+                Some(JoinWait::Server { .. }) => {} // keep the earlier deadline
+                None if established => self.join_wait = Some(realloc),
+                None => {}
+            },
+            _ => {}
         }
         true
     }
@@ -649,9 +793,12 @@ impl GatewayState {
     fn on_voice_server(&mut self, srv: ServerInfo, out: &mut SmallVec<[GwAction; 4]>) -> bool {
         match self.phase {
             Phase::Joining | Phase::Rejoining { .. } => {
-                // In Rejoining every server is fresh: entering it cleared `server` (§4.5).
+                // In Rejoining every server is fresh: entering it cleared `server` (§4.5). In
+                // Joining a server update ends what it waited for: Discord sends one only in
+                // reply to a voice state change, so it also confirms a pending move.
                 self.server = Some(srv);
                 self.fallback = None;
+                self.join_wait = None;
                 self.maybe_connect(out);
                 true
             }
@@ -666,12 +813,30 @@ impl GatewayState {
                 self.begin_connect(out);
                 true
             }
-            Phase::AwaitingMove { .. } => {
-                // Stored for the move that the next VoiceState announces (no actions).
+            Phase::AwaitingMove { code, .. } => {
+                // Stored for the move that the next VoiceState announces (no actions)...
                 self.server = Some(srv);
+                // ...except after 4022 ("call terminated", e.g. the voice server changed): a
+                // server-only change sends no VoiceState, so reconnect at once with the known
+                // session in the current channel (discord.py does the same).
+                if code == 4022
+                    && self.session.is_some()
+                    && let Some(ch) = self.channel.and_then(NonZeroU64::new)
+                {
+                    self.target = Some(ch);
+                    self.begin_connect(out);
+                }
                 true
             }
-            Phase::AwaitingRejoin { .. } | Phase::Idle | Phase::Closed(_) => false,
+            Phase::AwaitingRejoin { .. } => {
+                // Entering AwaitingRejoin stashed the old server, so this one is fresh (e.g. the
+                // server change that broke the connection): connect at once instead of an op 4
+                // leave + join after the backoff.
+                self.server = Some(srv);
+                self.maybe_connect(out);
+                true
+            }
+            Phase::Idle | Phase::Closed(_) => false,
         }
     }
 
@@ -696,6 +861,7 @@ impl GatewayState {
                 self.target = self.connect_target;
                 self.attempt = 0;
                 self.fallback = None;
+                self.leave_echo_pending = false;
                 let channel_id = self.channel.unwrap_or(0);
                 out.push(GwAction::Emit(EventData::Connected {
                     channel_id,
@@ -775,21 +941,26 @@ impl GatewayState {
                 DiscKind::Connect => false,
                 DiscKind::Runtime => {
                     match reason.code() {
-                        Some(4014) => {
-                            // Moved, kicked or channel deleted: the gateway update decides.
+                        Some(code @ (4014 | 4022)) => {
+                            // 4014: moved, kicked or channel deleted. 4022: call terminated
+                            // (channel deleted, voice server changed). The gateway update decides.
                             let deadline = now.checked_add(self.p.move_grace).unwrap_or(now);
-                            self.phase = Phase::AwaitingMove { deadline };
+                            self.phase = Phase::AwaitingMove { deadline, code };
                             self.stash_server();
                             self.link_down(now, out);
                             out.push(GwAction::Emit(EventData::Disconnected {
                                 reason: reason.as_str(),
-                                code: Some(4014),
+                                code: Some(code),
                                 will_retry: true,
                             }));
                         }
                         Some(code @ (4016 | 4017)) => {
                             // A rejoin cannot fix a protocol mismatch.
                             self.close_to(CloseReason::SessionInvalid(Some(code)), Some(code), out);
+                        }
+                        Some(4021) => {
+                            // Rate limited: Discord says not to reconnect, so no rejoin either.
+                            self.close_to(CloseReason::Lost, Some(4021), out);
                         }
                         _ => self.rejoin_or_lost(reason, now, out),
                     }
@@ -808,7 +979,15 @@ impl GatewayState {
                     return false;
                 }
                 // Typically the old voice WS closing (4014) during a move or rejoin: no phase
-                // change; the pending gateway update or attempt decides what happens next.
+                // change; the pending gateway update or attempt decides what happens next. The
+                // media connection a pending move could return to is gone.
+                if let Some(JoinWait::Move { deadline, from, .. }) = self.join_wait {
+                    self.join_wait = Some(JoinWait::Move {
+                        deadline,
+                        from,
+                        revert: false,
+                    });
+                }
                 self.link_down(now, out);
                 out.push(GwAction::Emit(EventData::Disconnected {
                     reason: reason.as_str(),
@@ -840,8 +1019,10 @@ impl GatewayState {
 
     fn on_deadline(&mut self, now: Instant, out: &mut SmallVec<[GwAction; 4]>) -> bool {
         match self.phase {
-            Phase::Joining => match self.fallback {
-                Some(at) if now >= at => {
+            Phase::Joining => {
+                if let Some(at) = self.fallback
+                    && now >= at
+                {
                     // Reuse the previous endpoint/token with the new channel id (DAVE needs it).
                     self.fallback = None;
                     if self.session.is_some()
@@ -850,14 +1031,21 @@ impl GatewayState {
                         self.server = Some(ps);
                         self.begin_connect(out);
                     }
-                    true
+                    return true;
                 }
-                _ => false,
-            },
-            Phase::AwaitingMove { deadline } if now >= deadline => {
+                match self.join_wait {
+                    Some(w) if now >= w.deadline() => {
+                        self.join_wait = None;
+                        self.on_join_wait_expired(w, now, out);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            Phase::AwaitingMove { deadline, code } if now >= deadline => {
                 // No state update within the grace period: assume the gateway session dropped.
                 if !self.schedule_rejoin(1, now) {
-                    self.close_to(CloseReason::Lost, Some(4014), out);
+                    self.close_to(CloseReason::Lost, Some(code), out);
                 }
                 true
             }
@@ -886,6 +1074,41 @@ impl GatewayState {
         }
     }
 
+    /// The Joining deadline of an established connection expired (§4.5).
+    fn on_join_wait_expired(
+        &mut self,
+        w: JoinWait,
+        now: Instant,
+        out: &mut SmallVec<[GwAction; 4]>,
+    ) {
+        if let JoinWait::Move { from, revert, .. } = w {
+            if revert
+                && let Some(ch) = self.channel.and_then(NonZeroU64::new)
+                && let Some(srv) = self.prev_server.take()
+            {
+                // The gateway never confirmed the move (no CONNECT permission, a full channel, a
+                // lost or failed op 4): Discord still has us in `ch`, whose media connection is
+                // intact. Return to it; `move_to` sees the target change and fails.
+                self.phase = Phase::Connected;
+                self.target = Some(ch);
+                self.server = Some(srv);
+                self.link_down_at = None;
+                out.push(GwAction::RxLink {
+                    up: true,
+                    ssrc: self.ssrc,
+                });
+                return;
+            }
+            // Nothing intact to return to: rejoin where Discord still has us.
+            if let Some(f) = from {
+                self.target = Some(f);
+            }
+        }
+        if !self.schedule_rejoin(1, now) {
+            self.close_to(CloseReason::Lost, None, out);
+        }
+    }
+
     // ── helpers ──────────────────────────────────────────────────────────────────────────────────
 
     /// The channel of the current media connection (Connected) or of the in-flight attempt.
@@ -911,10 +1134,12 @@ impl GatewayState {
             .then(|| now.checked_add(self.p.server_fallback).unwrap_or(now));
     }
 
+    /// Joining after a gateway-confirmed move (the 3 s server fallback is armed).
     fn enter_joining(&mut self, target: NonZeroU64, now: Instant) {
         self.phase = Phase::Joining;
         self.target = Some(target);
         self.server = None;
+        self.join_wait = None;
         self.arm_fallback(now);
     }
 
@@ -937,6 +1162,8 @@ impl GatewayState {
         self.server = None;
         self.prev_server = None;
         self.fallback = None;
+        self.join_wait = None;
+        self.leave_echo_pending = true; // Python sends op 4 `None` first
     }
 
     /// `AwaitingRejoin{next, due}` iff `reconnect` and `next ≤ rejoin_attempts`.
@@ -947,6 +1174,9 @@ impl GatewayState {
         self.phase = Phase::AwaitingRejoin { attempt: next, due };
         self.attempt = next;
         self.fallback = None;
+        self.join_wait = None;
+        // A server received from now on is fresh and connects at once (AwaitingRejoin rows).
+        self.stash_server();
         true
     }
 
@@ -1001,6 +1231,7 @@ impl GatewayState {
         };
         self.connect_target = Some(target);
         self.fallback = None;
+        self.join_wait = None;
         // The new connection gets a new SSRC (DriverConnect reports it, in either order).
         self.ssrc = None;
         out.push(GwAction::Connect {
@@ -1036,6 +1267,7 @@ impl GatewayState {
         self.phase = Phase::Closed(r);
         self.close_code = code.or(r.code());
         self.fallback = None;
+        self.join_wait = None;
         out.push(GwAction::Teardown(r));
     }
 
@@ -1068,8 +1300,11 @@ impl GatewayState {
     /// The earliest armed deadline, if any.
     pub fn next_deadline(&self) -> Option<Instant> {
         match self.phase {
-            Phase::Joining => self.fallback,
-            Phase::AwaitingMove { deadline } => Some(deadline),
+            Phase::Joining => match (self.fallback, self.join_wait.map(JoinWait::deadline)) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+            Phase::AwaitingMove { deadline, .. } => Some(deadline),
             Phase::AwaitingRejoin { due, .. } => Some(due),
             Phase::Rejoining { deadline, .. } => Some(deadline),
             _ => None,

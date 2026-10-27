@@ -371,12 +371,14 @@ Joining entered from a move is reported as `"joining"`.
 | From | Input | To / actions |
 |---|---|---|
 | Idle | `Join{c, m, d}` | Joining{target=c}. flags=(m, d). `SetSendMute(m)`. No Rust deadline: the Python `connect(timeout=)` governs. |
-| Joining | `VoiceState(s, Some(c))` | session=s. If c ≠ target: target=c, server=None, `Control(ChannelMoved{c})`. If session and server are complete: Connecting{gen+1}, `Connect(info, gen)`. |
-| Joining | `VoiceServer(t, Some(e))` | server=(t, normalize(e)). If complete: Connecting{gen+1}, `Connect`. |
-| any open phase | `VoiceServer(_, None)` | server=None. A Connected/Connecting phase becomes Joining, with `RxLink{up:false}`. Discord sends a new update once it reallocates the server. |
-| Joining (after a move) | `Deadline` (3 s after the channel change, no server update) | **Fallback:** reuse the previous endpoint/token with the new channel_id, giving Connecting{gen+1}. DAVE needs the new `channel_id`, so a new `ConnectionInfo` is always built. Never armed in Rejoining, where the op 4 leave has revoked the old token. |
-| Connected | `Move{c}` | Joining{target=c, server=None}. `RxLink{up:false}`. Arms the 3 s server fallback. No `ChannelMoved` control: Python initiated the move and updates `.channel` itself. |
-| Joining, Connecting | `Move{c}` | Joining{target=c, server=None}. The newer move supersedes the pending one; a `ConnectResult` from the abandoned attempt is stale, because the next `Connect` bumps the generation. Arms the 3 s fallback. |
+| Joining | `VoiceState(s, Some(c))` | session=s. If c ≠ target: target=c, server=None, `Control(ChannelMoved{c})`. If session and server are complete: Connecting{gen+1}, `Connect(info, gen)`. **Pending move:** a c other than the move's `from` channel confirms it (pending cleared; without a server, the 3 s fallback is armed now); c == `from` (still in the old channel, e.g. the echo of an earlier flag op 4) only stores the session. |
+| Joining | `VoiceServer(t, Some(e))` | server=(t, normalize(e)), pending move or reallocation cleared (Discord sends one only in reply to a voice state change, so it also confirms a move). If complete: Connecting{gen+1}, `Connect`. |
+| any open phase | `VoiceServer(_, None)` | server=None, previous server=None (no fallback to it, no revert). A Connected/Connecting phase becomes Joining, with `RxLink{up:false}`; after an established connection (`channel` known) it also emits `Disconnected{reason:"server_reallocating", will_retry:true}` and arms the **reallocation deadline** (now+15 s; also armed in a Joining that has none, and a pending move can no longer revert). Discord sends a new update once it reallocates the server. The initial join has no Rust deadline. |
+| Joining (reallocating) | `Deadline` (15 s, no server update) | If reconnect: AwaitingRejoin{1, due=now}. Otherwise Closed(Lost). |
+| Joining (after a confirmed move) | `Deadline` (3 s after the gateway confirmed the move, no server update) | **Fallback:** reuse the previous endpoint/token with the new channel_id, giving Connecting{gen+1}. DAVE needs the new `channel_id`, so a new `ConnectionInfo` is always built. Never armed in Rejoining, where the op 4 leave has revoked the old token, and never before the confirmation: Discord silently ignores an op 4 for a channel the bot may not join (no CONNECT permission, a full channel), and the old session and token would then "connect" to a channel the bot is not in. |
+| Connected | `Move{c}` | Joining{target=c, server=None}, **move pending**{from=channel, revert=true, deadline=now+5 s}. `RxLink{up:false}`. No fallback yet (see the confirmation rows). No `ChannelMoved` control: Python initiated the move and updates `.channel` itself. |
+| Joining, Connecting | `Move{c}` | Joining{target=c, server=None}, move pending (deadline now+5 s). The newer move supersedes the pending one and keeps its `from`/`revert`; otherwise `from` is the current target and nothing can be reverted to. A `ConnectResult` from the abandoned attempt is stale, because the next `Connect` bumps the generation. |
+| Joining (move pending) | `Deadline` (5 s, unconfirmed) | **Revert** if the old media connection is intact (revert set, no `Connect` and no `DriverDisconnect` since, previous server known): Connected on `channel` with the previous server, `RxLink{up:true, ssrc}`; `move_to` sees the target change and raises `ConnectFailed("move_failed")`. Otherwise target=`from` and, if reconnect, AwaitingRejoin{1, due=now}, else Closed(Lost). |
 | AwaitingMove, AwaitingRejoin, Rejoining | `Move{c}` | target=c, phase unchanged. The next merge (or `Rejoin` control) uses the new channel. |
 | Connecting | `ConnectResult(g == gen, Ok)` | Connected. `Emit(Connected)`, `RxLink{up:true, ssrc}`, `NotifyStatus`. The ssrc comes from `DriverConnect` in either order. |
 | Connecting | `ConnectResult(g ≠ gen)` or `Err(AttemptDiscarded)` | Ignored (superseded). |
@@ -390,15 +392,20 @@ Joining entered from a move is reported as `"joining"`.
 | Connected | `DriverReconnect{ssrc}` | Stays Connected. `Emit(Reconnected{gap_ms})`, `RxLink{up:true, ssrc}`. |
 | any open phase except Connected | `DriverConnect{ssrc}` / `DriverReconnect{ssrc}` | ssrc stored. No phase or link change. Connecting reaches Connected only through its own `ConnectResult`. In other phases the event comes from an attempt that is being replaced. |
 | any open phase | `DriverDisconnect{Runtime, Requested}` | Ignored (our own `leave()`). |
-| Connected | `DriverDisconnect{Runtime, WsClosed(4014)}` | **AwaitingMove{deadline = now+5 s}.** `RxLink{up:false}`, `Emit(Disconnected{code:4014, will_retry:true})`. **Never disconnects on its own:** 4014 means moved, kicked or channel deleted, and the gateway VOICE_STATE_UPDATE decides which. |
+| Connected | `DriverDisconnect{Runtime, WsClosed(4014 \| 4022)}` | **AwaitingMove{deadline = now+5 s, code}.** `RxLink{up:false}`, `Emit(Disconnected{code, will_retry:true})`. **Never disconnects on its own:** 4014 means moved, kicked or channel deleted; 4022 ("call terminated") means channel deleted or voice server changed. The gateway update decides which (discord.py handles both codes the same way). |
 | AwaitingMove | `VoiceState(s, Some(c'))` | Joining{target=c'} (a move). If c' == channel and s is new, Connecting with a fresh session. |
+| AwaitingMove | `VoiceServer(t, Some(e))` | Stored for the move that the next `VoiceState` announces. **After 4022** with a known session: Connecting{gen+1} at once on `channel` (a server-only change sends no `VoiceState`). |
 | AwaitingMove | `VoiceState(_, None)` | Closed(Kicked). `Control(Closed)`. |
-| AwaitingMove | `Deadline` | If reconnect: AwaitingRejoin{1, due=now}. Otherwise Closed(Lost(4014)). We assume the gateway session dropped, since there was no state update within the grace period. |
+| AwaitingMove | `Deadline` | If reconnect: AwaitingRejoin{1, due=now}. Otherwise Closed(Lost(code)). We assume the gateway session dropped, since there was no state update within the grace period. |
 | AwaitingMove | `DriverDisconnect{_, _}` | Ignored (already waiting for the gateway). |
-| Connected | `DriverDisconnect{Runtime, WsClosed(other final code), Io, TimedOut, ProtocolViolation, Internal}` | If reconnect: AwaitingRejoin{attempt+1}. Otherwise Closed(Lost(reason)). |
+| Connected | `DriverDisconnect{Runtime, WsClosed(4021)}` | Closed(Lost(4021)): rate limited, "should not reconnect", so no rejoin either. |
+| Connected | `DriverDisconnect{Runtime, WsClosed(other final code), Io, TimedOut, ProtocolViolation, Internal}` | If reconnect: AwaitingRejoin{attempt+1}. Otherwise Closed(Lost(reason)). Entering AwaitingRejoin always moves the current server to the fallback slot, so a server received there is fresh. |
 | Connected | `DriverDisconnect{Reconnect, _}` | If reconnect: AwaitingRejoin{attempt+1}. Otherwise Closed(Lost). |
 | Joining, Connecting, AwaitingRejoin, Rejoining | `DriverDisconnect{Runtime \| Reconnect, _}` (other than `Requested`) | **No phase change.** `RxLink{up:false}`, `Emit(Disconnected{code, will_retry:true})`. This is typically the old voice WS closing with 4014 during a move or rejoin. songbird reports it whenever no newer attempt has started yet (`tasks/mod.rs:117-145` quashes it only for stale attempts). The pending gateway update or attempt decides what happens next. |
-| AwaitingRejoin | `Deadline(due)` | Rejoining{attempt, deadline=now+15 s}, **server=None**. `Control(Rejoin{attempt, channel})`: the pump sends op 4 `None`, then op 4 `(channel, flags)`. |
+| AwaitingRejoin | `Deadline(due)` | Rejoining{attempt, deadline=now+15 s}, **server=None**, leave echo expected. `Control(Rejoin{attempt, channel})`: the pump sends op 4 `None`, then op 4 `(channel, flags)`. |
+| AwaitingRejoin | `VoiceState(s, Some(c))` | session=s. If c ≠ target (a moderator moved the bot while it waited): target=c, `Control(ChannelMoved{c})`, so the `Rejoin` follows it instead of dragging the bot back. With a fresh server: Connecting{gen+1}. |
+| AwaitingRejoin | `VoiceServer(t, Some(e))` | server=(t, e) (fresh: entering AwaitingRejoin stashed the old one). With a known session and target: Connecting{gen+1} at once, without an op 4 leave + join. |
+| AwaitingRejoin | `VoiceState(_, None)` while a rejoin's leave echo is still expected | **Ignored once**: the echo of a rejoin's op 4 `None` that arrived after the Rejoining timeout (discord.py's gateway rate limiter can hold an op 4). Otherwise the general `VoiceState(_, None)` row applies. |
 | Rejoining | `VoiceState(_, None)` | **Ignored** (expected from the leave half of the rejoin). |
 | Rejoining | `VoiceState` / `VoiceServer` with a channel | Merges like Joining, then Connecting{gen+1} (attempt carried). It requires a **fresh** `VoiceServer`, received after entering Rejoining. The leave revoked the old token, and a `Connect` with it would block songbird's runner inside `Connection::new` for up to `driver_timeout`. |
 | Rejoining | `Deadline` | If attempt < `rejoin_attempts`: AwaitingRejoin{attempt+1, backoff}. Otherwise Closed(RejoinFailed). |
@@ -406,7 +413,7 @@ Joining entered from a move is reported as `"joining"`.
 | Connected | `RxStalled{since}` | `ReinstallDispatch` (rate-limited to once per 5 s). If stalled ≥ 5 s, and `auto_recover` and reconnect are set: AwaitingRejoin{1, due=now} (the documented DAVE #310 / UDP-rx #315 recovery). |
 | any open phase | `BeginRejoin` (from `vc.reconnect()`) | Rejoining{attempt=0, deadline=now+timeout}, **server=None**. Python then sends the op 4 pair itself. |
 | any open phase | `SetFlags{m, d}` | flags=(m, d); later `Rejoin` controls carry them. `SetSendMute(m)`. No phase change. |
-| any open phase except Rejoining | `VoiceState(_, None)` | Closed(Requested if `leave_requested` else LeftChannel). `Emit(Disconnected{will_retry:false})`, `Control(Closed)`. |
+| any open phase except Rejoining | `VoiceState(_, None)` | Closed(Requested if `leave_requested` else LeftChannel). `Emit(Disconnected{will_retry:false})`, `Control(Closed)`. A pending move's `from`-channel rule and the AwaitingRejoin leave-echo row take precedence. |
 | any | `Leave` | `leave_requested = true` (the following VoiceState(None) completes the transition). |
 | any | `Close(r)` | Closed(r), `Teardown(r)`. |
 | any | any (phase, input) pair not listed above | **No-op:** no actions and no phase change, plus a rate-limited DEBUG log. Examples: `ConnectResult` outside Connecting, `Deadline` with nothing armed, `Join` outside Idle, `RxStalled` outside Connected. |
@@ -728,35 +735,42 @@ class SongbirdClient(discord.VoiceProtocol):           # py-src/discord/ext/song
 ### 6.2 Connect flow
 
 ```python
-_pending_leaves: dict[int, asyncio.Task[None]] = {}   # module level: guild_id → best-effort leave of an aborted connect
+# module level: (bot user id, guild id) → WEAK ref to the leave still owed for that voice state
+_pending_leaves: dict[tuple[int, int], weakref.ref[asyncio.Task[None]]] = {}
 
 async def connect(self, *, timeout: float, reconnect: bool, self_deaf: bool = False, self_mute: bool = False) -> None:
     loop = asyncio.get_running_loop()
     # An explicit set_self_mute()/set_self_deaf() made before connect() wins over discord.py's arguments (§6.7).
     self._self_mute = self_mute if self._explicit_mute is None else self._explicit_mute
     self._self_deaf = self_deaf if self._explicit_deaf is None else self._explicit_deaf
+    key = (self.client.user.id, self.guild.id)                         # the voice state an op 4 acts on
+    deadline = asyncio.timeout(timeout)                                # ONE deadline for the whole operation
     try:
-        if (prev := _pending_leaves.pop(self.guild.id, None)) is not None:
-            # The leave op 4 of an earlier aborted connect must not land AFTER our join op 4.
-            with contextlib.suppress(Exception):                           # incl. TimeoutError; not CancelledError
-                await asyncio.wait_for(prev, 5.0)                          # on timeout it is cancelled: never sent late
-        rsock, wsock = socket.socketpair()
-        self._rsock = rsock; rsock.setblocking(False)
-        bell = native.WakeBell(wsock.detach())                         # Rust owns the write end from here
-        self._conn = native.Connection(bell, self.guild.id, self.client.user.id,
-                                       self._config.to_native(), reconnect)   # Driver + Dispatch + ConnWorker
-        self._pump = _Pump(loop, rsock, self._conn, self)              # holds weakref(self)
-        self._conn.request_join(self.channel.id, self._self_mute, self._self_deaf)   # Idle → Joining; driver.mute()
-        self._conn.set_users_bot([(m.id, m.bot) for m in self.channel.members])
-        # The ONLY op 4 of a join: channel + flags together. No deafen()/mute() update before joining.
-        self._sent_flags = (self._self_mute, self._self_deaf)
-        await self.guild.change_voice_state(channel=self.channel, self_mute=self._self_mute,
-                                            self_deaf=self._self_deaf)
         try:
-            async with asyncio.timeout(timeout):
+            async with deadline:
+                if (prev := _take_owed_leave(key)) is not None:
+                    # An owed leave of this voice state must not land AFTER our join op 4. Waits ≤ 5 s
+                    # (then cancels it: never sent late); woken at once by cleanup() (self._join_abort).
+                    await _await_pending_leave(key, prev, self._join_abort)
+                if self._finalized:                                    # disconnect() ran meanwhile: never join
+                    raise ConnectFailed("requested")
+                rsock, wsock = socket.socketpair()
+                self._rsock = rsock; rsock.setblocking(False)
+                bell = native.WakeBell(wsock.detach())                 # Rust owns the write end from here
+                self._conn = native.Connection(bell, self.guild.id, self.client.user.id,
+                                               self._config.to_native(), reconnect)   # Driver + Dispatch + ConnWorker
+                self._pump = _Pump(loop, rsock, self._conn, self)      # holds weakref(self)
+                self._conn.request_join(self.channel.id, self._self_mute, self._self_deaf)   # Idle → Joining
+                self._conn.set_users_bot([(m.id, m.bot) for m in self.channel.members])
+                # The ONLY op 4 of a join: channel + flags together. No deafen()/mute() update before joining.
+                self._sent_flags = (self._self_mute, self._self_deaf)
+                await self.guild.change_voice_state(channel=self.channel, self_mute=self._self_mute,
+                                                    self_deaf=self._self_deaf)   # rate-limited: inside the deadline
                 st = await self._pump.wait_status(lambda s: s.state in ("connected", "closed"))
         except TimeoutError:
-            raise ConnectTimeout(timeout) from None                    # subclass of TimeoutError
+            if deadline.expired():
+                raise ConnectTimeout(timeout) from None                # subclass of TimeoutError
+            raise
         if st.state == "closed":
             raise ConnectFailed(st.close_reason or "closed", st.close_code)
     except BaseException:                                              # incl. CancelledError, ConnectFailed
@@ -767,10 +781,12 @@ async def connect(self, *, timeout: float, reconnect: bool, self_deaf: bool = Fa
 `_abort_connect()` is synchronous and safe to call after a cancellation:
 
 1. `self._conn.close("connect_aborted")` runs T0–T9 if the connection exists. Otherwise it closes whichever socket halves are still owned by Python.
-2. A best-effort `guild.change_voice_state(channel=None)` is scheduled as a background task with a 5 s timeout. This matters because the gateway may already have put the bot in the channel.
-   - The task is stored in `_pending_leaves[guild.id]`, replacing any older entry, and removes itself when done. Failures are logged.
-   - The next `connect()` for that guild awaits it first, for at most 5 s, before sending its join op 4. If user code retries immediately after a `ConnectTimeout`, the stale leave can therefore never arrive after the new join and disconnect the new session.
-   - The leave is skipped when `disconnect()` already sent one (`self._leave_sent`), for example when a user disconnects during `connect()`.
+2. A best-effort `guild.change_voice_state(channel=None)` is scheduled as a background task (`_send_leave()`), bounded by 120 s: discord.py's gateway rate limiter (110 sends per 60 s) can hold an op 4 for up to a minute, and a leave given up on is a bot left listed in the channel. This matters because the gateway may already have put the bot in the channel.
+   - The task is registered in `_pending_leaves[(user id, guild id)]`, replacing any older entry, and removes itself when done. Failures are logged. **The key is the voice state an op 4 acts on** (one per bot user per guild): separate bots in one process never wait on, or cancel, each other's leaves.
+   - **The registry holds a weak reference.** The running task is kept alive by a timer handle on its own loop (`loop.call_later(…, task)`), which `loop.close()` drops; so a loop closed without running a pending leave (`run_until_complete` interrupted, then `close()`) lets the task, its guild and the old `discord.Client` be collected instead of being pinned by the module for the process lifetime. Entries of finished, collected or closed-loop leaves are pruned whenever the registry is touched.
+   - The next `connect()` for that voice state awaits it first, for at most 5 s (within its own `timeout`), before sending its join op 4. If user code retries immediately after a `ConnectTimeout`, the stale leave can therefore never arrive after the new join and disconnect the new session. A wait that is cancelled, times out, or is aborted by `disconnect()` leaves the leave running and registered (it is still owed).
+   - **`disconnect()` during that wait** (the client exists and is registered, `_conn` does not yet) runs `cleanup()`, which resolves `self._join_abort`: `connect()` wakes at once and raises `ConnectFailed("requested")` without sending its join.
+   - The leave is skipped when `disconnect()` already sent one (`self._leave_sent`), for example when a user disconnects during `connect()`, and when **another client is registered for the guild** (a leave would disconnect it).
 3. `self.cleanup()` runs, which removes the client from `_voice_clients`.
 4. `_finalized` is set.
 
@@ -820,13 +836,13 @@ async def disconnect(self, *, force: bool = False) -> None:
     if conn is None or self._finalized:
         self.cleanup(); return                                  # idempotent (discord.py may call it again)
     conn.request_leave()                                        # VoiceState(None) ⇒ Closed(Requested), not "kicked"
-    self._leave_sent = True                                     # _abort_connect() must not send a second leave
+    leave = self._send_leave(quiet=force)                       # sets _leave_sent; background task, owed leave (§6.2);
+                                                                # None if another client holds the guild's slot
     try:
-        async with asyncio.timeout(5.0):
-            await self.guild.change_voice_state(channel=None)
-    except Exception:
-        if not force:
-            _log.warning("voice leave (op 4) failed; tearing down locally", exc_info=True)
+        if leave is not None and not force:
+            done, _ = await asyncio.wait({leave}, timeout=5.0)  # NOT cancelled after 5 s: it finishes in the background
+            if not done:
+                _log.warning("voice leave (op 4) not sent within 5 s (gateway rate limit?); …")
     finally:
         conn.close("requested")                                 # sync T0–T9 FIRST (cancellation cannot skip it)
         self.cleanup()                                          # always
@@ -834,24 +850,30 @@ async def disconnect(self, *, force: bool = False) -> None:
 ```
 
 - **`disconnect()` never raises** for gateway errors. Teardown is complete either way.
+- **The leave is never given up.** A leave held by discord.py's gateway rate limiter is awaited for at most 5 s and then left to finish in the background (bounded by 120 s), registered as the voice state's owed leave so that the next `connect()` orders its join after it. Before, it was cancelled after 5 s and never sent, and the bot stayed listed in the channel.
+- **`force=True` does not wait at all.** discord.py's `Client.close()` (`state.close()`) disconnects every client in turn with `force=True`; with a per-client 5 s wait, a rate-limited shard made shutdown take minutes. The leaves still go out (the pump-close wait already yields to them) unless the gateway closes first, which ends the session anyway.
 - **`cleanup()`** is idempotent (`_finalized`). It closes every child in `self._children` (a WeakSet), calls `conn.close("cleanup")` and then `super().cleanup()`.
 
 ### 6.6 Move, reconnect, external moves
 
 - **`move_to(channel, *, timeout=30.0)`**
   - `None` means `disconnect()`.
-  - Otherwise:
-    1. `conn.request_move(channel.id)` puts the state machine in Joining with the new target.
+  - Otherwise, all under one `timeout` (which therefore also bounds the op 4 send):
+    1. `conn.request_move(channel.id)` puts the state machine in Joining with the new target and a **pending move** (§4.5).
     2. Send op 4 with the new channel and the current flags.
-    3. `await` the status `connected` **with** `channel_id == channel.id`. A timeout raises `ConnectTimeout`; the connection keeps trying in its current state.
+    3. `await` the status `connected` **with** `channel_id == channel.id`, or a target other than `channel.id`. A timeout raises `ConnectTimeout`; the connection keeps trying in its current state.
+  - **Confirmation.** Discord silently ignores an op 4 for a channel the bot may not join (no CONNECT permission, a full channel). Only a gateway update for the move (a `VoiceState` naming another channel than the old one, or a `VoiceServer`) confirms it and arms the 3 s server fallback. An unconfirmed move returns to the old channel after 5 s when its media connection is intact (otherwise it rejoins the old channel), and `move_to` raises `ConnectFailed("move_failed")` with `.channel` unchanged. The same happens when the op 4 itself raised. Before, the fallback "connected" to the new channel id with the old session and token, and `move_to` returned normally while the bot was still in the old channel.
   - Streams, playbacks, events and the receive timeline survive the move. Synthetic silence covers the gap and is marked in `chunk.gap_ms`.
 - **`reconnect(*, timeout=30.0)`** (graft C) forces a fresh voice session.
   1. `conn.begin_rejoin()` enters Rejoining, so the `channel=None` echo is ignored.
   2. Send op 4 `None`, then op 4 `(channel, flags)`.
   3. Wait for `connected` with a new `generation`.
 
+  The `timeout` covers both op 4s too.
+
   This is the documented recovery for DAVE stalls (songbird #310) and a dead UDP-rx task (#315). `auto_recover` triggers it automatically through §4.5.
-- **External moves** (a moderator drags the bot) arrive as `VOICE_STATE_UPDATE` with a new channel. The same transition applies, and `self.channel` is updated.
+- **External moves** (a moderator drags the bot) arrive as `VOICE_STATE_UPDATE` with a new channel. The same transition applies, and `self.channel` is updated. This includes AwaitingRejoin: the pending `Rejoin` then targets the new channel.
+- **Only the registered client sends op 4.** Every op 4 acts on the bot's single voice state in the guild, and discord.py routes gateway updates only to `state._get_voice_client(guild.id)`. A non-sharded re-IDENTIFY's `READY` (`parse_ready` → `clear()`) replaces `_voice_clients` without calling `cleanup()`, so a client the app still references becomes unreachable for updates, and the app may connect a new one in `on_ready`. Before every op 4 that puts the bot in a channel (rejoin, flag flush, `set_self_*`, `move_to`, `reconnect`), `_may_join()` therefore checks that this client still holds the slot; if not, it runs `cleanup()` (close reason `"cleanup"`) and sends nothing. Leaves (`disconnect()`, the best-effort leave of §6.2) are skipped when **another** client holds the slot. Before, the stale client's rejoin (op 4 `None`, then join) kicked the new client.
 
 ### 6.7 `self_mute` / `self_deaf` without pre-join gateway traffic
 
@@ -873,6 +895,8 @@ async def disconnect(self, *, force: bool = False) -> None:
 |---|---|---|
 | 4015 (server crash), 4009 (session timeout), WS IO errors | Resumed internally with no event. On success: `DriverReconnect`. On failure: `DriverDisconnect{Reconnect, _}`. | Streams continue. `Reconnected{gap_ms}`, or a rejoin, or close (§4.5). |
 | 4014 (disconnected: moved, kicked or channel deleted) | Final: `DriverDisconnect{Runtime, WsClosed(4014)}`. Quashed if the attempt is stale. | **AwaitingMove (5 s grace).** The gateway update decides between move and kick. No auto-disconnect on the code itself. |
+| 4022 (call terminated: channel deleted, voice server changed) | Final, like 4014 | **AwaitingMove (5 s grace)** like 4014 (discord.py treats both alike). A fresh `VOICE_SERVER_UPDATE` reconnects at once with the known session, also with `reconnect=False`; `VoiceState(None)` closes it. |
+| 4021 (rate limited: should not reconnect) | Final | Closed(Lost(4021)), no rejoin. The best-effort leave of §6.2 follows. |
 | 4006 (session no longer valid), other final codes, `Io`/`TimedOut` at Runtime | Final | `reconnect=True`: rejoin with backoff. Otherwise Closed(Lost). |
 | 4016 (unknown encryption mode), 4017 (DAVE protocol required) | Final | Closed(SessionInvalid(code)) without rejoin: a rejoin cannot fix a protocol mismatch. The ERROR log names the songbird version. |
 
@@ -1619,7 +1643,8 @@ class SongbirdClient(discord.VoiceProtocol):
     async def wait_connected(self, timeout: float | None = None) -> None:
         """Wait for state 'connected'. ConnectionClosed if closed; TimeoutError on timeout."""
     async def move_to(self, channel: discord.abc.Snowflake | None, *, timeout: float = 30.0) -> None:
-        """Move and wait until connected on the new channel. None == disconnect(). Streams survive."""
+        """Move and wait until connected on the new channel. None == disconnect(). Streams survive.
+        ConnectFailed("move_failed") if the gateway never confirms the move (§6.6); the timeout covers the op 4."""
     async def reconnect(self, *, timeout: float = 30.0) -> None:
         """Force a fresh voice session (op 4 leave + join). Recovery for stalled receive/DAVE."""
     async def set_self_mute(self, muted: bool) -> None:
@@ -2394,6 +2419,7 @@ sbcore returns `CoreError` (thiserror). The binding converts it to Python except
 |---|---|---|
 | Connect not complete within `timeout` | — (Python layer) | `ConnectTimeout(ConnectFailed, TimeoutError)`. discord.py's `except asyncio.TimeoutError` then runs `disconnect(force=True)`, which is a no-op because the client is already finalised. |
 | Terminal state `Closed(ConnectFailed / SessionInvalid / RejoinFailed / Lost / Kicked)` during `connect`/`move_to` | `ConnectFailed(reason)` | `ConnectFailed(reason, code)` |
+| `disconnect()` while `connect()` waits for an owed leave; a `move_to` the gateway never confirms (or another move superseded) | — (Python layer) | `ConnectFailed("requested")`; `ConnectFailed("move_failed")` |
 | Any native method before `connect()` (`_conn is None`) | — | `NotConnected` |
 | Connection-level method after close | `ConnectionClosed(reason)` | `ConnectionClosed(reason)` |
 | Read or write on a closed stream, playback or subscription | `StreamClosed(reason)` | `StreamClosed(reason)`. Iterators end with `StopAsyncIteration` instead. |
@@ -3139,7 +3165,7 @@ These run in `crates/sbcore` with `cargo test -p sbcore --all-features`. There i
 | `rx::bus`, `rx::lane` | Include/exclude/bots; unmapped audio only when `include` is `None`; floor hold and release; lanes emit chunk sizes exact for every rate × channels × encoding × `chunk_ms` ∈ {10, 20, 30, 40, 100, 1000}; timeline-aligned boundaries; two subscribers share the same `Arc` (`Arc::ptr_eq`); per-user chunks contain only that user's samples (owned length == payload). |
 | `rx::queue`, `rx::router` | `drop_oldest`/`drop_newest`/`error` semantics; `dropped_ms` lands on the chunk right after the hole; arm/notify race (2 threads × 10⁵); `close` wakes; capacity ≤ `min(bound, 16)` until needed; `skip_to_live`; router cap and `close_on_leave`. |
 | `rx::pipeline` (synthetic `RxInput`, real Opus from `songbird::driver::opus::Encoder`) | Continuous output with no ticks (synthesis from `t0`, before the first tick); 100 ms trigger; `gap_ms`. A burst after a stall: **silent** real ticks are skipped and **voiced ticks are never dropped**. Users are decoded only when needed. `set_filter` re-homes without a gap or duplicate. Watchdog reports `stalled_since` after `stall_timeout`. Removing a subscription frees its lane/converter/bus (`counts()`). **Soak:** 180 000 ticks (1 h) with 3 subscriptions and no consumer; Σ queue bytes ≤ budget at every tick. |
-| `conn::gateway` | Table-driven: every row of §4.5, **plus an enumeration of every phase × input pair** asserting that each pair not in the table yields no actions and no phase change. Both update orders; `endpoint=None`; 3 s server fallback; `Move` from Connected, Joining and Connecting; a 4014 `DriverDisconnect` arriving in Joining (old WS after a move) and in Rejoining changes no phase; `VoiceServer` change while Connecting → gen+1; 4014 followed by a move / a kick / grace expiry (with and without reconnect); 4006 rejoin up to the limit; 4016/4017 close without rejoin; `DriverDisconnect{Reconnect}` while Connected; stale `ConnectResult` ignored; `BeginRejoin` and AwaitingRejoin → Rejoining clear `server`, and a `VoiceState` alone in Rejoining issues no `Connect`; Rejoining ignores `VoiceState(None)`; `SetFlags` in every open phase; `Leave` + `VoiceState(None)` → Requested; RxStalled → `ReinstallDispatch` rate-limited, rejoin at 5 s. |
+| `conn::gateway` | Table-driven: every row of §4.5, **plus an enumeration of every phase × input pair** asserting that each pair not in the table yields no actions and no phase change. Both update orders; `endpoint=None`; 3 s server fallback; `Move` from Connected, Joining and Connecting; a 4014 `DriverDisconnect` arriving in Joining (old WS after a move) and in Rejoining changes no phase; `VoiceServer` change while Connecting → gen+1; 4014 followed by a move / a kick / grace expiry (with and without reconnect); 4006 rejoin up to the limit; 4016/4017 close without rejoin; 4022 waits like 4014 and reconnects on a fresh server; 4021 closes; an unconfirmed `Move` never uses the fallback and returns to the old channel (or rejoins it); `VoiceServer(None)` arms the reallocation deadline; AwaitingRejoin follows a moderator move, connects on a fresh server and ignores a rejoin's late leave echo once; `DriverDisconnect{Reconnect}` while Connected; stale `ConnectResult` ignored; `BeginRejoin` and AwaitingRejoin → Rejoining clear `server`, and a `VoiceState` alone in Rejoining issues no `Connect`; Rejoining ignores `VoiceState(None)`; `SetFlags` in every open phase; `Leave` + `VoiceState(None)` → Requested; RxStalled → `ReinstallDispatch` rate-limited, rejoin at 5 s. |
 | `conn::shared` / `driver` (tokio, real Driver, no network) | `ConnShared::new` → play a live track (parked mixer) → `close()`. Then `live_counts()` for `Dispatch`, `SongbirdInput`/`LiveReader`/`DoneGuard` (mixer-side track teardown), `ConnWorker` and `PcmQueue` reach 0 within `driver_timeout + 1 s`, `scheduler().live_tasks()` returns to baseline, and the NET runtime's alive tasks (songbird's core, events and parked-mixer tasks, ≥ 3 while the Driver exists) return to their baseline: this, not `Dispatch`, proves Poison. `total_tasks()` is **not** asserted (§11.3). `close` is idempotent, safe from 8 threads concurrently and from a non-runtime thread. **T6 is synchronous:** right after `close()` returns, every `SubQueue`/router/`EventQueue` is closed, and `Disconnected{will_retry:false}` is the last event, even while the RX runtime is blocked by a test barrier. **Self-deadlock regression:** a terminal transition triggered inside `Dispatch::act` and inside a Python-thread call completes (5 s watchdog). **Apply ordering:** 3 threads × 10⁴ interleaved `apply()` calls; the `Connect` generations reaching the driver and the `RxLink` values reaching the worker are monotonic and end at the final state. `build_config` never yields `retry_limit: None` and sets `preallocated_tracks(48)`. A heartbeat gap > 3 s triggers one rate-limited `ReinstallDispatch` with `receive=false`. |
 | `tracks` | **Priority resolution:** a `DoneGuard` drop followed within 2 ticks by `End(PlayMode::End)` → `finished`, by `Errored` → `error`, by `End(Stop)` → `stopped`; a drop with no event → `stopped` after the grace period (or `finished` with `EOF_SEEN`, `error` with `DECODE_ERROR`, `disconnected` while closing); T8 resolves leftovers as `disconnected`. The queue passes only the current entry to songbird; index 0 is the first pending entry; `__getitem__`/`dequeue` bounds; pending-entry `PendingChange`s apply when the entry starts; `seek`/`info` on a pending entry → `Track`; `stop()` = clear + skip; the 10 001st entry → `Limit`; a lazy `Encoded` entry spawns no thread until current; the 33rd playing track → `Limit`. |
 | `tx::queue`/`writer`/`anchor`/`tags` (manual clock) | All-or-nothing `PlaybackFull` (carry restored); `space_wanted ≤ cap`. Odd and partial-frame writes. A rejected write consumes nothing (the carry is kept); a write longer than the cap → `Limit` **before** parsing (counting allocator: no allocation). Two threads writing one stream: carry snapshot retry, no torn frame. `clear()` and `close()` complete while another thread is inside a 4 MiB write's parse (they never take L6w). **Gap-fill regression:** 1000 ms played, then 250 ms idle with auto-pause, then a write at `at_ms = 2500` arriving at wall `t0 + 2500` inserts ≤ 20 ms; the same write arriving at `t0 + 1100` inserts 1400 ± 20 ms. Late writes append and re-anchor and never trim. Beyond `max_gap` re-anchors; `gap + frames > cap` re-anchors instead of raising; `i64::MIN`/`i64::MAX` `at_ms` never panic. Gap silence excluded from tag `written`. `PlaybackSpec::validate` rejects `prebuffer_ms` or `max_gap_ms` > `max_buffer_ms/2`. **Prebuffer gate:** opens at `prebuffer_frames`; a segment shorter than `prebuffer_ms` plays after `prebuffer_ticks`; `drain()`/`end_segment()` open it at once. **`clear()`:** capacity freed immediately with no pull in between (parked); **an underrun mid-segment (≥ 1 tick with an empty queue, tag still open) still yields that tag in `segments`, and its late writes are rejected**; tags close at Active → Idle, so a later clear does not report them; `end_segment` → `complete` once played; `played ≤ written`; `reject_late`; `reject_until_gap_ms` rejects contiguous timed writes and accepts the first one after the gap; `hold_ms`; generation bump drops the carry. **Tag overflow:** the 257th tag evicts the oldest closed tag, else the least-recently-written open one, counted in `tags_evicted`. **heard_ms:** after the last pull and an idle-pause, `heard_ms` and `segment().heard_ms` reach `played_ms` once `output_latency_ms` of wall time has passed. `when_disconnected="discard"`. |
@@ -3163,7 +3189,7 @@ These use pytest 9.1.1 with pytest-asyncio 1.4.1 (`asyncio_mode = "auto"`) and r
 |---|---|
 | `tests/conftest.py` | `FakeClient` (`user.id`), `FakeGuild` (`change_voice_state` records every op 4; `get_member`, `get_channel`), `FakeChannel` (`members`, `_get_voice_client_key`). A `connected_vc` fixture drives the voice hooks against a detached connection and injects `DriverConnect`. |
 | `test_formats.py` | Validation, `parse` (only the library's own spellings: MIME types and protocol-specific encoding identifiers are rejected), the neutral presets (exactly the exported set), `AudioFormat()` without a rate or channel count raises `TypeError`, `bytes_per_ms`, `silence` (600 000 ms accepted, 600 001 → `LimitExceeded`), no `mime_type`, eq/hash; every `listen*` method and `open_playback` default to `PCM16_48K_STEREO`. |
-| `test_connect.py` | **Exactly one op 4 carrying `self_mute`/`self_deaf`, and none before it.** On a directly constructed client, `set_self_mute(True)` before `connect(self_mute=False)` sends nothing and the join op 4 carries `self_mute=True` (explicit wins). `set_self_mute` during `connecting` sends nothing until `connected`, then exactly one op 4 with the new flags. Timeout → `ConnectTimeout` (`reason == "timeout"`, `timeout` set), `isinstance(e, asyncio.TimeoutError)`, client unregistered, best-effort leave sent; a second `channel.connect()` does not raise "Already connected". **Timeout → immediate reconnect: the recorded op 4 order is `None` (the stale leave) then the new join**, even when the fake gateway delays the leave by 1 s. `disconnect()` during `connect()` → `ConnectFailed("requested")` and only one leave op 4. **Cancellation** of `connect()` gives the same cleanup. `ConnectFailed` on terminal failure. `disconnect()` is idempotent and calls `cleanup()` even when op 4 raises. `move_to` waits for the new channel. Kick (`VoiceState(None)`) → `cleanup()` + `Disconnected`. A 4014 then a move keeps the connection. `Control.Rejoin` sends op 4 `None` then op 4 `(channel, flags)`. `reconnect()`. `user_id == client.user.id`. |
+| `test_connect.py` | **Exactly one op 4 carrying `self_mute`/`self_deaf`, and none before it.** On a directly constructed client, `set_self_mute(True)` before `connect(self_mute=False)` sends nothing and the join op 4 carries `self_mute=True` (explicit wins). `set_self_mute` during `connecting` sends nothing until `connected`, then exactly one op 4 with the new flags. Timeout → `ConnectTimeout` (`reason == "timeout"`, `timeout` set), `isinstance(e, asyncio.TimeoutError)`, client unregistered, best-effort leave sent; a second `channel.connect()` does not raise "Already connected". **Timeout → immediate reconnect: the recorded op 4 order is `None` (the stale leave) then the new join**, even when the fake gateway delays the leave by 1 s. `disconnect()` during `connect()` → `ConnectFailed("requested")` and only one leave op 4. **Cancellation** of `connect()` gives the same cleanup. `ConnectFailed` on terminal failure. `disconnect()` is idempotent and calls `cleanup()` even when op 4 raises. `move_to` waits for the new channel. Kick (`VoiceState(None)`) → `cleanup()` + `Disconnected`. A 4014 then a move keeps the connection. `Control.Rejoin` sends op 4 `None` then op 4 `(channel, flags)`. `reconnect()`. `user_id == client.user.id`. `disconnect()` while `connect()` waits for an owed leave stops the join; owed leaves are per bot user; a client unregistered by a re-IDENTIFY sends no op 4 (and never kicks the new client); an unconfirmed or failed `move_to` keeps the old channel (`move_failed`); 4022/4021; a moderator move while awaiting a rejoin is followed; a rate-limited leave finishes in the background, and `force=True` does not wait for it; the timeouts of `connect`/`move_to`/`reconnect` cover their op 4s; a server reallocation without a new server rejoins. `test_leaks.py`: an owed leave of a closed loop pins nothing. |
 | `test_receive.py` | N injected ticks give exactly N × 20 / `chunk_ms` chunks, including silence; exact byte lengths for every format; `speaking`/`speakers`/`dropped_ms`/`gap_ms`/`timeline_ms`; synthesis while no ticks arrive (manual clock); `skip_to_live` (with `reset_clock=True` the next chunk has `start_ms == seq == 0`; `origin_timeline_ms` follows); `overflow="error"` makes `async for` raise `StreamOverflow` once after the queued chunks; `set_include` at runtime without a gap; floor policy; `UserStreams` yields and ends on `UserLeft`; `memoryview(c).format == "h"`; `np.shares_memory(np.frombuffer(c, "<i2"), memoryview(c))`; `bytes(c) == c.to_bytes()`; the default format is Discord's native 48 kHz stereo PCM16 (`listen()`, `listen_user()`, `listen_mixed()`, `listen_users()`; 3840-byte 20 ms chunks); a chunk export outlives `stream.close()`; Arrow capsules round-trip through pyarrow 26 and arro3 0.9.1. |
 | `test_cancellation.py` | 10 000 × `asyncio.wait_for(anext(stream), tiny)` interleaved with injections: every chunk is received exactly once (by `seq`). The same for `await playback.write()` under `TaskGroup` cancellation, which never writes partially. |
 | `test_playback.py` | **An opened but unwritten playback produces no pulls** (`track_log` shows it created paused, nothing else) **and the first write resumes it within one tick.** `open_playback()` defaults to `PCM16_48K_STEREO` (stereo mixer output); `write`/`write_nowait` with bytes/bytearray/memoryview; a `str` raises `TypeError` and consumes nothing; odd byte counts; `PlaybackFull` then `await write()` completes as the harness pulls; `clear()` within one pulled tick; `ClearResult.segments[*].heard_ms ≤ written_ms`; a tag that underran mid-stream is still in `segments` and its late writes are rejected; `end_segment` → `complete`; `reject_late`; `reject_until_gap_ms` with contiguous timed (`at_ms`) writes; `hold_ms`; `at_ms` gap fill including the idle-pause regression with the manual clock; `prebuffer_ms` with a segment shorter than the prebuffer; `set_self_mute(True)` holds `played_ms` and `drain()` waits; `drain()`; `wait_idle()`; `aclose(drain=True)`; `PlaybackStarted`/`PlaybackIdle` events; writes after close raise `StreamClosed`; bytearray/memoryview/numpy int16/`array('h')` accepted for pcm16le; **numpy float32, `array('f')` and `'>i2'` buffers into pcm16le raise `InvalidAudio`**; float32 accepted for f32le; **an `AudioChunk` whose format differs from the playback's (24 kHz mono into the default 48 kHz stereo, µ-law into pcm16le) raises `InvalidAudio` and consumes nothing**, also for `RawPcm`. |

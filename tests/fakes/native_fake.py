@@ -2455,6 +2455,11 @@ class _Conn:
         self.leave_requested = False
         self.ssrc: int | None = None
         self.deadline: float | None = None
+        # Joining after an established connection: ("move", deadline, from, revert) for an
+        # unconfirmed move, ("server", deadline, None, False) for a reallocation (§4.5).
+        self.join_wait: tuple[str, float, int | None, bool] | None = None
+        self.aw_code = 4014  # the close code that entered awaiting_move
+        self.leave_echo_pending = False
         self.close_reason: str | None = None
         self.close_code: int | None = None
         # control slots
@@ -2573,6 +2578,7 @@ class _Conn:
         self.generation += 1
         self.counters["connects"] += 1
         self.deadline = None
+        self.join_wait = None
         self._set_phase("connecting")
         self.wake.notify(WAKE_CONN)
 
@@ -2602,19 +2608,40 @@ class _Conn:
             self.send_muted = mute
             self._set_phase("joining")
 
+    def _await_rejoin(self, attempt: int, due: float) -> None:
+        """``schedule_rejoin``: the old server is stashed, so a later one is fresh."""
+        self.attempt = attempt
+        self.deadline = due
+        self.join_wait = None
+        self.server = None
+        self._set_phase("awaiting_rejoin")
+
+    def _may_rejoin(self, attempt: int) -> bool:
+        return self.reconnect and 1 <= attempt <= self.settings.rejoin_attempts
+
     def move(self, channel: int) -> None:
         with self.lock:
             if self.closing:
                 return
-            if self.phase in ("connected", "joining", "connecting"):
+            p = self.phase
+            if p in ("connected", "joining", "connecting"):
+                jw = self.join_wait
+                if p == "connected":
+                    frm, revert = self.channel, True
+                elif p == "joining" and jw is not None and jw[0] == "move":
+                    frm, revert = jw[2], jw[3]
+                else:
+                    frm, revert = self.target, False
                 self.target = channel
                 self.server = None
-                self.deadline = self.clock.now() + 3.0
-                if self.phase == "connected":
+                # No fallback until the gateway confirms the move (§4.5).
+                self.deadline = None
+                self.join_wait = ("move", self.clock.now() + 5.0, frm, revert)
+                if p == "connected":
                     self._link(False)
                 self._set_phase("joining")
                 self.wake.notify(WAKE_CONN)
-            elif self.phase in ("awaiting_move", "awaiting_rejoin", "rejoining"):
+            elif p in ("awaiting_move", "awaiting_rejoin", "rejoining"):
                 self.target = channel
 
     def begin_rejoin(self) -> None:
@@ -2623,6 +2650,8 @@ class _Conn:
                 return
             self.attempt = 0
             self.server = None
+            self.join_wait = None
+            self.leave_echo_pending = True
             self.deadline = self.clock.now() + 15.0
             self._set_phase("rejoining")
 
@@ -2644,40 +2673,56 @@ class _Conn:
                 return
             p = self.phase
             if ch is None:
-                if p == "rejoining":
+                if p == "rejoining" or (p == "awaiting_rejoin" and self.leave_echo_pending):
+                    self.leave_echo_pending = False  # the (late) echo of a rejoin's leave
                     return
                 if p == "awaiting_move":
-                    self.close("kicked")
+                    self.close("requested" if self.leave_requested else "kicked")
                     return
                 self.close("requested" if self.leave_requested else "left_channel")
                 return
-            if p == "rejoining":
+            if p in ("rejoining", "awaiting_rejoin"):
                 self.session = session
-                self.target = ch
+                self.leave_echo_pending = False
+                if ch != self.target:
+                    self.target = ch
+                    self.set_ctrl("moved", ch)
                 if self.server is not None:
                     self._connecting()
                 return
             if p == "awaiting_move":
-                if ch == self.channel and session != self.session and self.prev_server is not None:
+                if ch == self.channel and session != self.session and (self.server or self.prev_server):
                     self.session = session
-                    self.server = self.prev_server
+                    self.server = self.server or self.prev_server
                     self._connecting()
                     return
                 self.session = session
-                self.target = ch
-                self.server = None
                 if ch != self.channel:
+                    self.target = ch
                     self.set_ctrl("moved", ch)
-                self._set_phase("joining")
+                    self._set_phase("joining")
+                    if self.server is not None:
+                        self._connecting()
+                    elif self.prev_server is not None:
+                        self.deadline = self.clock.now() + 3.0
                 return
             if p == "joining":
                 self.session = session
+                pending = False
+                jw = self.join_wait
+                if jw is not None and jw[0] == "move":
+                    if ch == jw[2] and ch != self.target:
+                        return  # still in the old channel: not the confirmation of the move
+                    self.join_wait = None
+                    pending = True
                 if ch != self.target:
                     self.target = ch
                     self.server = None
                     self.set_ctrl("moved", ch)
                 if self.server is not None:
                     self._connecting()
+                elif pending and self.prev_server is not None:
+                    self.deadline = self.clock.now() + 3.0
                 return
             if p in ("connecting", "connected"):
                 ref = self.target if p == "connecting" else self.channel
@@ -2685,6 +2730,7 @@ class _Conn:
                     self.target = ch
                     self.session = session
                     self.server = None
+                    self.join_wait = None
                     self.deadline = self.clock.now() + 3.0
                     self.set_ctrl("moved", ch)
                     self._link(False)
@@ -2697,11 +2743,25 @@ class _Conn:
         with self.lock:
             if self.closing or self.phase not in _OPEN_PHASES:
                 return
+            now = self.clock.now()
             if endpoint is None:
                 self.server = None
+                self.prev_server = None
+                established = self.channel is not None
                 if self.phase in ("connecting", "connected"):
                     self._link(False)
+                    self.deadline = None
                     self._set_phase("joining")
+                    if established:
+                        self.join_wait = ("server", now + 15.0, None, False)
+                        self.emit(_EV.Disconnected("server_reallocating", None, True))
+                elif self.phase == "joining":
+                    self.deadline = None  # the move fallback no longer applies
+                    jw = self.join_wait
+                    if jw is not None and jw[0] == "move":
+                        self.join_wait = (jw[0], jw[1], jw[2], False)
+                    elif jw is None and established:
+                        self.join_wait = ("server", now + 15.0, None, False)
                 return
             ep = endpoint.strip()
             ep = ep[len("wss://") :] if ep.startswith("wss://") else ep
@@ -2710,12 +2770,25 @@ class _Conn:
             if p in ("joining", "rejoining"):
                 self.server = srv
                 self.prev_server = srv
+                if p == "joining":
+                    self.join_wait = None  # a server update confirms a pending move
+                    self.deadline = None
                 if self.session is not None:
                     self._connecting()
             elif p in ("connecting", "connected") and srv != self.server:
                 self.server = srv
                 self.prev_server = srv
                 self._connecting()
+            elif p == "awaiting_move":
+                self.server = srv
+                if self.aw_code == 4022 and self.session is not None and self.channel is not None:
+                    self.target = self.channel  # voice server changed: reconnect at once
+                    self._connecting()
+            elif p == "awaiting_rejoin":
+                self.server = srv  # fresh (entering AwaitingRejoin stashed the old one)
+                self.prev_server = srv
+                if self.session is not None and self.target is not None:
+                    self._connecting()
 
     def driver_connect(self, ssrc: int) -> None:
         with self.lock:
@@ -2733,14 +2806,14 @@ class _Conn:
                 self.channel = self.target
                 self.attempt = 0
                 self.deadline = None
+                self.join_wait = None
+                self.leave_echo_pending = False
                 self._set_phase("connected")
                 self._link(True)
                 self.emit(_EV.Connected(self.channel or 0, self.ssrc or 0, self.tick_index * 20))
                 self.wake.notify(WAKE_CONN)
-            elif self.reconnect and self.attempt < self.settings.rejoin_attempts:
-                self.attempt += 1
-                self.deadline = self.clock.now() + self._backoff(self.attempt)
-                self._set_phase("awaiting_rejoin")
+            elif self._may_rejoin(self.attempt + 1):
+                self._await_rejoin(self.attempt + 1, self.clock.now() + self._backoff(self.attempt + 1))
             else:
                 self.close("connect_failed")
 
@@ -2760,50 +2833,77 @@ class _Conn:
             p = self.phase
             if p == "connected":
                 self._link(False)
-                if kind == "runtime" and reason == "ws_closed" and code == 4014:
+                if kind == "runtime" and reason == "ws_closed" and code in (4014, 4022):
+                    self.aw_code = code
+                    self.server = None
                     self.deadline = self.clock.now() + 5.0
                     self._set_phase("awaiting_move")
                     self.emit(_EV.Disconnected(reason or "lost", code, True))
                 elif reason == "ws_closed" and code in (4016, 4017):
                     self.close("session_invalid", code)
-                elif self.reconnect and self.attempt < self.settings.rejoin_attempts:
-                    self.attempt += 1
-                    self.deadline = self.clock.now() + self._backoff(self.attempt)
-                    self._set_phase("awaiting_rejoin")
+                elif kind == "runtime" and reason == "ws_closed" and code == 4021:
+                    self.close("lost", code)  # rate limited: should not reconnect
+                elif self._may_rejoin(self.attempt + 1):
+                    self._await_rejoin(self.attempt + 1, self.clock.now() + self._backoff(self.attempt + 1))
                     self.emit(_EV.Disconnected(reason or "lost", code, True))
                 else:
-                    self.close("lost")
+                    self.close("lost", code)
             elif p in ("joining", "connecting", "awaiting_rejoin", "rejoining") and kind != "connect":
+                jw = self.join_wait
+                if jw is not None and jw[0] == "move":
+                    self.join_wait = (jw[0], jw[1], jw[2], False)  # nothing intact to return to
                 self._link(False)
                 self.emit(_EV.Disconnected(reason or "lost", code, True))
 
     def deadlines(self, now: float) -> None:
         with self.lock:
-            if self.closing or self.deadline is None or now < self.deadline:
+            if self.closing:
                 return
             p = self.phase
-            self.deadline = None
-            if p == "joining" and self.prev_server is not None and self.session is not None:
-                self.server = self.prev_server
-                self._connecting()
-            elif p == "awaiting_move":
-                if self.reconnect:
-                    self.attempt = 1
-                    self.deadline = now
-                    self._set_phase("awaiting_rejoin")
+            if p == "joining":
+                if self.deadline is not None and now >= self.deadline:  # the 3 s server fallback
+                    self.deadline = None
+                    if self.prev_server is not None and self.session is not None:
+                        self.server = self.prev_server
+                        self._connecting()
+                    return
+                jw = self.join_wait
+                if jw is None or now < jw[1]:
+                    return
+                self.join_wait = None
+                if jw[0] == "move":
+                    if jw[3] and self.channel is not None and self.prev_server is not None:
+                        # Never confirmed: back to the intact connection on the old channel.
+                        self.target = self.channel
+                        self.server = self.prev_server
+                        self._set_phase("connected")
+                        self._link(True)
+                        return
+                    if jw[2] is not None:
+                        self.target = jw[2]
+                if self._may_rejoin(1):
+                    self._await_rejoin(1, now)
                 else:
                     self.close("lost")
+                return
+            if self.deadline is None or now < self.deadline:
+                return
+            self.deadline = None
+            if p == "awaiting_move":
+                if self._may_rejoin(1):
+                    self._await_rejoin(1, now)
+                else:
+                    self.close("lost", self.aw_code)
             elif p == "awaiting_rejoin":
                 self.server = None
                 self.deadline = now + 15.0
+                self.leave_echo_pending = True
                 self.counters["rejoins"] += 1
                 self._set_phase("rejoining")
                 self.set_ctrl("rejoin", (self.attempt, self.target or self.channel or 0))
             elif p == "rejoining":
-                if self.attempt < self.settings.rejoin_attempts:
-                    self.attempt += 1
-                    self.deadline = now + self._backoff(self.attempt)
-                    self._set_phase("awaiting_rejoin")
+                if self._may_rejoin(self.attempt + 1):
+                    self._await_rejoin(self.attempt + 1, now + self._backoff(self.attempt + 1))
                 else:
                     self.close("rejoin_failed")
 

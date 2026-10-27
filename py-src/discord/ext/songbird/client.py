@@ -45,10 +45,18 @@ __all__ = ["SongbirdClient", "connect"]
 
 _log = logging.getLogger("discord.ext.songbird")
 
-#: guild_id → best-effort leave (op 4 ``None``) of an aborted connect; awaited by the next connect.
-_pending_leaves: dict[int, asyncio.Task[None]] = {}
+#: ``(bot user id, guild id)`` → the leave (op 4 ``None``) still owed for that voice state: an aborted
+#: connect's, a terminal close's, or a ``disconnect()`` whose op 4 is still in flight (§6.2). The next
+#: ``connect()`` for the same voice state awaits it. Held **weakly**: the task is kept alive by a timer
+#: handle on its own event loop, so a loop closed without running it releases the task and the
+#: ``discord.Client`` it references instead of this module pinning them for the process lifetime.
+_pending_leaves: dict[tuple[int, int], weakref.ref[asyncio.Task[None]]] = {}
 
+#: How long ``connect()``/``disconnect()`` wait for a leave before going on without it.
 _LEAVE_TIMEOUT_S = 5.0
+#: Bound of a background leave: discord.py's gateway rate limiter (110 sends per 60 s) can hold an
+#: op 4 for up to a minute, and a leave given up on is a bot left listed in the channel.
+_LEAVE_SEND_TIMEOUT_S = 120.0
 #: Terminal close reasons after which the gateway may still list the bot in a channel.
 _LEAVE_AFTER = frozenset({"connect_failed", "rejoin_failed", "lost", "session_invalid", "internal_error"})
 _PUMP_CLOSE_TIMEOUT_S = 2.0
@@ -107,6 +115,9 @@ class SongbirdClient(discord.VoiceProtocol):
         self._children: weakref.WeakSet[Any] = weakref.WeakSet()
         self._queue: TrackQueue | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
+        # Resolved by cleanup(): wakes a connect() that waits for an owed leave, so a disconnect()
+        # in that window stops the join instead of returning while the join is still to come.
+        self._join_abort: asyncio.Future[None] | None = None
 
     @classmethod
     def with_config(
@@ -145,9 +156,12 @@ class SongbirdClient(discord.VoiceProtocol):
         Raises
         ------
         ConnectTimeout
-            Not connected within ``timeout`` seconds (a ``TimeoutError``).
+            Not connected within ``timeout`` seconds (a ``TimeoutError``). The timeout covers the
+            whole operation: waiting for an owed leave, sending the join op 4 (which discord.py's
+            gateway rate limiter can delay) and the handshake.
         ConnectFailed
-            The connection ended terminally while connecting.
+            The connection ended terminally while connecting, or ``disconnect()`` was called
+            meanwhile (``reason == "requested"``).
 
         Notes
         -----
@@ -159,29 +173,40 @@ class SongbirdClient(discord.VoiceProtocol):
         # An explicit set_self_mute()/set_self_deaf() made before connect() wins (§6.7).
         self._self_mute = self_mute if self._explicit_mute is None else self._explicit_mute
         self._self_deaf = self_deaf if self._explicit_deaf is None else self._explicit_deaf
+        key = _leave_key(self.client, self.guild.id)
+        deadline = asyncio.timeout(timeout)
         try:
-            if (prev := _pending_leaves.pop(self.guild.id, None)) is not None:
-                # The leave op 4 of an earlier aborted connect must not land after our join op 4.
-                await _await_pending_leave(self.guild.id, prev)
-            rsock, wsock = socket.socketpair()
-            self._rsock = rsock
-            rsock.setblocking(False)
-            bell = native.WakeBell(wsock.detach())  # Rust owns the write end from here
-            self._conn = self._open_connection(bell, self._config.to_native(), reconnect)
-            self._pump = _Pump(loop, rsock, self._conn, self)
-            self._conn.request_join(self.channel.id, self._self_mute, self._self_deaf)
-            self._conn.set_users_bot([(m.id, m.bot) for m in self.channel.members])
-            # The only op 4 of a join: channel and flags together, nothing before it.
-            self._sent_flags = (self._self_mute, self._self_deaf)
-            self._join_sent = True
-            await self.guild.change_voice_state(
-                channel=self.channel, self_mute=self._self_mute, self_deaf=self._self_deaf
-            )
             try:
-                async with asyncio.timeout(timeout):
+                async with deadline:
+                    if (prev := _take_owed_leave(key)) is not None:
+                        # An owed leave of this voice state must not land after our join op 4.
+                        self._join_abort = loop.create_future()
+                        try:
+                            await _await_pending_leave(key, prev, self._join_abort)
+                        finally:
+                            self._join_abort = None
+                    if self._finalized:
+                        # disconnect() (or cleanup()) ran while we waited: never join after it.
+                        raise ConnectFailed("requested")
+                    rsock, wsock = socket.socketpair()
+                    self._rsock = rsock
+                    rsock.setblocking(False)
+                    bell = native.WakeBell(wsock.detach())  # Rust owns the write end from here
+                    self._conn = self._open_connection(bell, self._config.to_native(), reconnect)
+                    self._pump = _Pump(loop, rsock, self._conn, self)
+                    self._conn.request_join(self.channel.id, self._self_mute, self._self_deaf)
+                    self._conn.set_users_bot([(m.id, m.bot) for m in self.channel.members])
+                    # The only op 4 of a join: channel and flags together, nothing before it.
+                    self._sent_flags = (self._self_mute, self._self_deaf)
+                    self._join_sent = True
+                    await self.guild.change_voice_state(
+                        channel=self.channel, self_mute=self._self_mute, self_deaf=self._self_deaf
+                    )
                     st = await self._pump.wait_status(lambda s: s.state in ("connected", "closed"))
             except TimeoutError:
-                raise ConnectTimeout(timeout) from None
+                if deadline.expired():
+                    raise ConnectTimeout(timeout) from None
+                raise
             if st.state == "closed":
                 raise ConnectFailed(st.close_reason or "closed", st.close_code)
         except BaseException:
@@ -205,43 +230,58 @@ class SongbirdClient(discord.VoiceProtocol):
             with contextlib.suppress(OSError):
                 self._rsock.close()
         if self._join_sent and not self._leave_sent:
-            self._schedule_leave()
+            self._send_leave()
         self.cleanup()
 
-    def _schedule_leave(self) -> None:
+    def _send_leave(self, *, quiet: bool = False) -> asyncio.Task[None] | None:
+        """Send op 4 ``None`` in a background task registered as this voice state's owed leave
+        (§6.2), so the next ``connect()`` orders its join after it. Never joins again afterwards.
+
+        Returns ``None`` (nothing sent) when another client is registered for the guild: the leave
+        would disconnect *that* client.
+        """
+        self._leave_sent = True
+        slot = self._slot()
+        if slot is not None and slot is not self:
+            return None
         guild = self.guild
         try:
             loop = self._loop or asyncio.get_running_loop()
-            task = loop.create_task(_best_effort_leave(guild), name=f"songbird-leave-{guild.id}")
-        except RuntimeError:  # no running loop (or it is closing): nothing can be sent
-            return
-        self._leave_sent = True
-        _pending_leaves[guild.id] = task
-
-        def _done(t: asyncio.Task[None]) -> None:
-            if _pending_leaves.get(guild.id) is t:
-                del _pending_leaves[guild.id]
-
-        task.add_done_callback(_done)
+            task = loop.create_task(_best_effort_leave(guild, quiet=quiet), name=f"songbird-leave-{guild.id}")
+        except RuntimeError:  # no running loop (or it is closed): nothing can be sent
+            return None
+        _track_leave(_leave_key(self.client, guild.id), task)
+        return task
 
     async def disconnect(self, *, force: bool = False) -> None:
         """Leave the channel and tear down every stream, playback and track.
 
         Always calls :meth:`cleanup`; idempotent. Never raises for gateway errors (they are logged
         unless ``force=True``).
+
+        Notes
+        -----
+        The leave op 4 is awaited for at most 5 s (not at all with ``force=True``, which discord.py
+        passes when the client shuts down). A leave that discord.py's gateway rate limiter holds
+        longer is not given up: it keeps running in the background, and the next ``connect()`` in
+        the guild orders its join after it. Nothing is sent when another client is registered for
+        the guild (a stale client must not disconnect it).
         """
         conn = self._conn
         if conn is None or self._finalized:
-            self.cleanup()
+            self.cleanup()  # also stops a connect() that is still waiting for an owed leave
             return
         conn.request_leave()  # the VoiceState(None) echo then closes with "requested", not "kicked"
-        self._leave_sent = True
+        leave = self._send_leave(quiet=force)
         try:
-            async with asyncio.timeout(_LEAVE_TIMEOUT_S):
-                await self.guild.change_voice_state(channel=None)
-        except Exception:
-            if not force:
-                _log.warning("voice leave (op 4) failed; tearing down locally", exc_info=True)
+            if leave is not None and not force:
+                done, _ = await asyncio.wait({leave}, timeout=_LEAVE_TIMEOUT_S)
+                if not done:
+                    _log.warning(
+                        "voice leave (op 4) not sent within %.0f s (gateway rate limit?); tearing down "
+                        "locally, the leave is still sent in the background",
+                        _LEAVE_TIMEOUT_S,
+                    )
         finally:
             conn.close("requested")  # synchronous T0–T9 first: cancellation cannot skip it
             self.cleanup()
@@ -279,6 +319,8 @@ class SongbirdClient(discord.VoiceProtocol):
         if self._finalized:
             return
         self._finalized = True
+        if (abort := self._join_abort) is not None:
+            _resolve_soon(abort)
         for child in list(self._children):
             with contextlib.suppress(Exception):
                 child.close()
@@ -359,7 +401,13 @@ class SongbirdClient(discord.VoiceProtocol):
         Raises
         ------
         ConnectTimeout
-            Not connected on the new channel within ``timeout`` (the connection keeps trying).
+            Not connected on the new channel within ``timeout`` (the connection keeps trying). The
+            timeout also covers sending the op 4.
+        ConnectFailed
+            ``reason == "move_failed"``: the gateway never confirmed the move (Discord ignores an
+            op 4 for a channel the bot may not join, e.g. without CONNECT permission or when it is
+            full), or another move superseded it. The connection stays on (or rejoins) the channel
+            Discord has the bot in, and :attr:`channel` is unchanged.
         ConnectionClosed
             The connection closed meanwhile.
         """
@@ -371,16 +419,29 @@ class SongbirdClient(discord.VoiceProtocol):
         if channel.id == self.channel.id and conn.status().state == "connected":
             return
         self._check_may_join()
-        conn.request_move(channel.id)
-        self._sent_flags = (self._self_mute, self._self_deaf)
-        await self.guild.change_voice_state(channel=channel, self_mute=self._self_mute, self_deaf=self._self_deaf)
+        deadline = asyncio.timeout(timeout)
         try:
-            async with asyncio.timeout(timeout):
-                st = await pump.wait_status(lambda s: s.state == "connected" and s.channel_id == channel.id)
+            async with deadline:
+                conn.request_move(channel.id)
+                self._sent_flags = (self._self_mute, self._self_deaf)
+                await self.guild.change_voice_state(
+                    channel=channel, self_mute=self._self_mute, self_deaf=self._self_deaf
+                )
+                # Done when connected there, or when the target changed: an unconfirmed move
+                # returned to the old channel (§4.5), or another move superseded this one.
+                st = await pump.wait_status(
+                    lambda s: (
+                        (s.state == "connected" and s.channel_id == channel.id) or s.target_channel_id != channel.id
+                    )
+                )
         except TimeoutError:
-            raise ConnectTimeout(timeout) from None
+            if deadline.expired():
+                raise ConnectTimeout(timeout) from None
+            raise
         if st.state == "closed":
             raise ConnectionClosed(st.close_reason or "closed")
+        if st.state != "connected" or st.channel_id != channel.id:
+            raise ConnectFailed("move_failed")
         if (moved := _voice_channel(self.guild.get_channel(channel.id))) is not None:
             self.channel = moved
 
@@ -393,24 +454,29 @@ class SongbirdClient(discord.VoiceProtocol):
         Raises
         ------
         ConnectTimeout
-            Not reconnected within ``timeout``.
+            Not reconnected within ``timeout`` (which also covers sending both op 4s).
         ConnectionClosed
             The connection closed meanwhile.
         """
         conn = self._require_conn()
         pump = self._require_pump()
         self._check_may_join()
-        generation = conn.status().generation
-        conn.begin_rejoin()  # Rejoining: the channel=None echo is not a kick
-        await self.guild.change_voice_state(channel=None)
-        self._check_may_join()  # disconnect()/close while leaving: never join again
-        self._sent_flags = (self._self_mute, self._self_deaf)
-        await self.guild.change_voice_state(channel=self.channel, self_mute=self._self_mute, self_deaf=self._self_deaf)
+        deadline = asyncio.timeout(timeout)
         try:
-            async with asyncio.timeout(timeout):
+            async with deadline:
+                generation = conn.status().generation
+                conn.begin_rejoin()  # Rejoining: the channel=None echo is not a kick
+                await self.guild.change_voice_state(channel=None)
+                self._check_may_join()  # disconnect()/close while leaving: never join again
+                self._sent_flags = (self._self_mute, self._self_deaf)
+                await self.guild.change_voice_state(
+                    channel=self.channel, self_mute=self._self_mute, self_deaf=self._self_deaf
+                )
                 st = await pump.wait_status(lambda s: s.state == "connected" and s.generation > generation)
         except TimeoutError:
-            raise ConnectTimeout(timeout) from None
+            if deadline.expired():
+                raise ConnectTimeout(timeout) from None
+            raise
         if st.state == "closed":
             raise ConnectionClosed(st.close_reason or "closed")
 
@@ -692,14 +758,35 @@ class SongbirdClient(discord.VoiceProtocol):
     def _require(self) -> tuple[native.Connection, _Pump]:
         return self._require_conn(), self._require_pump()
 
+    def _slot(self) -> Any:
+        """The voice client discord.py currently routes this guild's gateway updates to."""
+        key, _ = self.channel._get_voice_client_key()
+        return self.client._connection._get_voice_client(key)
+
     def _may_join(self) -> bool:
         """Whether an op 4 that puts the bot in a channel may still be sent.
 
         Never after a leave was sent (``disconnect()``, an aborted connect) or the connection closed:
         such an op 4 would put the bot back in the channel with nothing registered to serve it.
+
+        Never by a client that discord.py no longer routes gateway updates to: a non-sharded
+        re-IDENTIFY's ``READY`` replaces ``_voice_clients`` without calling ``cleanup()``, and the
+        app may have connected a new client since. Every op 4 acts on the bot's one voice state in
+        the guild, so a stale client's rejoin would kick the registered one. Such a client is
+        cleaned up here instead, without gateway traffic.
         """
         conn = self._conn
-        return conn is not None and not conn.closed and not self._finalized and not self._leave_sent
+        if conn is None or conn.closed or self._finalized or self._leave_sent:
+            return False
+        if self._slot() is not self:
+            _log.warning(
+                "songbird client of guild %s is no longer discord.py's registered voice client "
+                "(the gateway re-identified, or another client connected); closing it locally",
+                self.guild.id,
+            )
+            self.cleanup()
+            return False
+        return True
 
     def _check_may_join(self) -> None:
         if not self._may_join():
@@ -788,7 +875,7 @@ class SongbirdClient(discord.VoiceProtocol):
         if not self._finalized:
             _log.debug("songbird connection in guild %s closed: %s", self.guild.id, reason)
             if reason in _LEAVE_AFTER and self._join_sent and not self._leave_sent:
-                self._schedule_leave()
+                self._send_leave()
         self.cleanup()
 
 
@@ -799,33 +886,116 @@ def _voice_channel(ch: Any) -> VocalGuildChannel | None:
     return None
 
 
-async def _await_pending_leave(guild_id: int, prev: asyncio.Task[None]) -> None:
-    """Wait (at most 5 s) for the best-effort leave of an earlier aborted connect (§6.2).
+def _leave_key(client: discord.Client, guild_id: int) -> tuple[int, int]:
+    """The voice state an op 4 acts on: one per bot user per guild (separate bots never wait on,
+    or cancel, each other's leaves)."""
+    user = client.user
+    return (user.id if user is not None else 0, guild_id)
+
+
+def _keep_alive(_task: asyncio.Task[None]) -> None:
+    """Timer callback that only holds a leave task (see :func:`_track_leave`)."""
+
+
+def _prune_owed_leaves() -> None:
+    """Drop entries whose leave finished, was collected, or belongs to a closed event loop."""
+    for key, ref in list(_pending_leaves.items()):
+        task = ref()
+        if task is None or task.done() or task.get_loop().is_closed():
+            if _pending_leaves.get(key) is ref:
+                _pending_leaves.pop(key, None)
+
+
+def _track_leave(key: tuple[int, int], task: asyncio.Task[None]) -> None:
+    """Register ``task`` as the owed leave of ``key`` (replacing an older one).
+
+    The strong reference that keeps the running task alive is a timer handle on the task's own
+    loop: ``loop.close()`` drops it, so a loop closed without running the leave (e.g.
+    ``run_until_complete`` interrupted, then ``close()``) lets the task, its guild and the old
+    ``discord.Client`` be collected. The module dict holds only a weak reference.
+    """
+    keep = task.get_loop().call_later(_LEAVE_SEND_TIMEOUT_S + _LEAVE_TIMEOUT_S, _keep_alive, task)
+    _prune_owed_leaves()
+    ref = weakref.ref(task)
+    _pending_leaves[key] = ref
+
+    def _done(t: asyncio.Task[None]) -> None:
+        keep.cancel()
+        cur = _pending_leaves.get(key)
+        if cur is not None and cur() is t:
+            _pending_leaves.pop(key, None)
+
+    task.add_done_callback(_done)
+
+
+def _take_owed_leave(key: tuple[int, int]) -> asyncio.Task[None] | None:
+    """Pop the owed leave of ``key`` if it is still running."""
+    _prune_owed_leaves()
+    ref = _pending_leaves.pop(key, None)
+    task = ref() if ref is not None else None
+    return task if task is not None and not task.done() else None
+
+
+def _owe_again(key: tuple[int, int], task: asyncio.Task[None]) -> None:
+    """Put back a leave that is still owed (unless a newer one was registered meanwhile)."""
+    if task.done():
+        return
+    cur = _pending_leaves.get(key)
+    if cur is None or (t := cur()) is None or t.done():
+        _pending_leaves[key] = weakref.ref(task)
+
+
+def _resolve_soon(fut: asyncio.Future[None]) -> None:
+    """Resolve ``fut`` from any thread (cleanup() may run off its loop)."""
+
+    def _set() -> None:
+        if not fut.done():
+            fut.set_result(None)
+
+    loop = fut.get_loop()
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        _set()
+    elif not loop.is_closed():
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(_set)
+
+
+async def _await_pending_leave(key: tuple[int, int], prev: asyncio.Task[None], abort: asyncio.Future[None]) -> None:
+    """Wait (at most 5 s) for an owed leave of this voice state before joining (§6.2).
 
     On timeout the leave is cancelled, so it can never be sent after the new join. If *this* wait is
-    cancelled (the new ``connect()`` was cancelled), the leave keeps running and stays registered for
-    the next ``connect()``: it is still owed, and ``asyncio.wait_for`` would have cancelled it.
-    A leave scheduled on another event loop (an earlier ``asyncio.run``) is ignored: it can neither
-    be awaited nor cancelled from here, and its gateway session is not ours.
+    cancelled (the new ``connect()`` was cancelled or timed out) or ``abort`` resolves (its client
+    was disconnected), the leave keeps running and stays registered for the next ``connect()``: it
+    is still owed, and ``asyncio.wait_for`` would have cancelled it. A leave scheduled on another
+    event loop (an earlier ``asyncio.run``) is ignored: it can neither be awaited nor cancelled from
+    here, and its gateway session is not ours.
     """
     if prev.get_loop() is not asyncio.get_running_loop():
         return
     try:
-        done, _ = await asyncio.wait({prev}, timeout=_LEAVE_TIMEOUT_S)
+        done, _ = await asyncio.wait({prev, abort}, timeout=_LEAVE_TIMEOUT_S, return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
-        if not prev.done():
-            _pending_leaves.setdefault(guild_id, prev)
+        _owe_again(key, prev)
         raise
-    if not done:
-        prev.cancel()
+    if prev in done:
+        return
+    if abort.done():
+        _owe_again(key, prev)
+        return
+    prev.cancel()
 
 
-async def _best_effort_leave(guild: discord.Guild) -> None:
+async def _best_effort_leave(guild: discord.Guild, *, quiet: bool = False) -> None:
     try:
-        async with asyncio.timeout(_LEAVE_TIMEOUT_S):
+        async with asyncio.timeout(_LEAVE_SEND_TIMEOUT_S):
             await guild.change_voice_state(channel=None)
     except Exception:
-        _log.warning("best-effort voice leave after a failed connect did not complete", exc_info=True)
+        if not quiet:
+            _log.warning("voice leave (op 4) did not complete", exc_info=True)
 
 
 async def connect(

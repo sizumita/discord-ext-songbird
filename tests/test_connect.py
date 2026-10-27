@@ -7,6 +7,7 @@ fake guild records each op 4 and plays the gateway.
 from __future__ import annotations
 
 import asyncio
+import weakref
 from typing import Any
 
 import pytest
@@ -16,11 +17,15 @@ from conftest import (
     OTHER_CHANNEL_ID,
     SSRC,
     USER_ID,
+    FakeClient,
+    FakeGuild,
+    FakeUser,
     HarnessClient,
     Op4,
     World,
     client_factory,
     connect_detached,
+    drain,
     pump_settle,
     wait_for,
 )
@@ -36,6 +41,7 @@ from discord.ext.songbird import (
     VoiceEvent,
     native,
 )
+from discord.ext.songbird import client as client_mod
 
 pytestmark = pytest.mark.usefixtures("testing")
 
@@ -479,8 +485,6 @@ async def test_pending_leave_of_another_event_loop_is_ignored(world: World) -> N
     # awaited nor cancelled from this loop: connect() must not wait 5 s for it or touch it.
     import threading
 
-    from discord.ext.songbird import client as client_mod
-
     other = asyncio.new_event_loop()
     ready = threading.Event()
     box: dict[str, Any] = {}
@@ -497,14 +501,272 @@ async def test_pending_leave_of_another_event_loop_is_ignored(world: World) -> N
     thread = threading.Thread(target=run_other)
     thread.start()
     assert ready.wait(2)
-    client_mod._pending_leaves[GUILD_ID] = box["task"]
+    key = (USER_ID, GUILD_ID)
+    client_mod._pending_leaves[key] = weakref.ref(box["task"])
     try:
         async with asyncio.timeout(2):  # well under the 5 s owed-leave wait
             vc = await connect_detached(world)
         assert not box["task"].done()  # untouched
-        assert GUILD_ID not in client_mod._pending_leaves
+        assert key not in client_mod._pending_leaves
         await vc.disconnect()
     finally:
-        client_mod._pending_leaves.pop(GUILD_ID, None)
+        client_mod._pending_leaves.pop(key, None)
         other.call_soon_threadsafe(other.stop)
         thread.join(5)
+
+
+# ── review findings (discord.py integration) ──────────────────────────────────────────────────────
+
+
+async def test_disconnect_while_connect_waits_for_an_owed_leave(world: World) -> None:
+    # A retried connect() waits for the owed leave of an aborted one. A disconnect() in that window
+    # used to return while connect() went on to send its join op 4 afterwards (the bot sat in the
+    # channel the user had just left until the timeout, unregistered).
+    world.guild.send_server_update = False
+    world.guild.leave_delay = 0.5
+    with pytest.raises(ConnectTimeout):
+        await world.channel.connect(cls=client_factory(), timeout=0.05, reconnect=True)
+    task = asyncio.create_task(world.channel.connect(cls=client_factory(), timeout=5, reconnect=True))
+    await wait_for(lambda: registered(world) is not None)
+    vc: HarnessClient = registered(world)
+    await asyncio.sleep(0.02)
+    assert vc._conn is None  # still waiting for the owed leave
+    await vc.disconnect()
+    with pytest.raises(ConnectFailed) as ei:
+        async with asyncio.timeout(0.2):  # at once, not after the owed leave
+            await task
+    assert ei.value.reason == "requested"
+    assert registered(world) is None
+    # The leave is still owed: an immediate connect orders its join after it.
+    world.guild.send_server_update = True
+    vc2 = await connect_detached(world)
+    assert [op.channel_id for op in world.guild.op4] == [CHANNEL_ID, None, CHANNEL_ID]
+    await vc2.disconnect()
+
+
+async def test_owed_leave_of_another_bot_is_not_awaited(world: World) -> None:
+    # Owed leaves are keyed by voice state (bot user, guild): a second bot of the same process
+    # connecting in the guild neither waits for nor cancels the first bot's leave.
+    world.guild.send_server_update = False
+    world.guild.leave_delay = 1.0
+    with pytest.raises(ConnectTimeout):
+        await world.channel.connect(cls=client_factory(), timeout=0.05, reconnect=True)
+    client_b = FakeClient()
+    client_b.user = FakeUser(USER_ID + 1, bot=True, name="other-bot")
+    guild_b = FakeGuild(client_b)
+    world_b = World(client_b, guild_b, guild_b.add_channel(CHANNEL_ID), guild_b.add_channel(OTHER_CHANNEL_ID))
+    async with asyncio.timeout(0.5):
+        vc_b = await connect_detached(world_b)
+    ref = client_mod._pending_leaves.get((USER_ID, GUILD_ID))
+    leave_a = ref() if ref is not None else None
+    assert leave_a is not None and not leave_a.done()
+    await wait_for(lambda: Op4(None, False, False) in world.guild.op4, timeout=3)
+    assert not leave_a.cancelled()
+    await vc_b.disconnect()
+
+
+async def test_stale_client_after_a_reidentify_never_kicks_the_new_one(world: World, testing: Any) -> None:
+    # discord.py's non-sharded READY (a re-IDENTIFY) replaces state._voice_clients without calling
+    # cleanup(). The old client (still referenced by the app) used to rejoin when its voice WS
+    # dropped, and its op 4 None kicked the client the app had connected in on_ready.
+    vc1 = await connect_detached(world)
+    world.client._connection._voice_clients = {}  # ConnectionState.clear()
+    vc2 = await connect_detached(world)
+    assert registered(world) is vc2
+    sent = list(world.guild.op4)
+    testing.inject_driver_event(vc1._conn, "disconnect", reason="ws_closed", code=4014)
+    vc1.harness.step(5_100)  # grace → AwaitingRejoin → Control.Rejoin
+    conn1 = vc1._conn
+    assert conn1 is not None
+    await wait_for(lambda: conn1.closed)
+    await pump_settle()
+    assert world.guild.op4 == sent  # no leave + join from the stale client
+    assert vc1.status.close_reason == "cleanup"
+    # Its disconnect() and flag changes send nothing either (a leave would disconnect vc2).
+    await vc1.disconnect()
+    await vc1.set_self_mute(True)
+    await asyncio.sleep(0.01)
+    assert world.guild.op4 == sent
+    assert vc2.is_connected() and registered(world) is vc2
+    await vc2.disconnect()
+
+
+async def test_unregistered_client_closes_instead_of_sending_op4(world: World, testing: Any) -> None:
+    vc = await connect_detached(world)
+    world.client._connection._voice_clients = {}
+    with pytest.raises(ConnectionClosed):
+        await vc.move_to(world.other, timeout=1)
+    assert vc.status.close_reason == "cleanup"
+    vc2 = await connect_detached(world)
+    world.client._connection._voice_clients = {}
+    world.guild.respond = False
+    testing.inject_driver_event(vc2._conn, "disconnect", reason="io")
+    vc2.harness.step(2_000)  # backoff → Control.Rejoin
+    conn2 = vc2._conn
+    assert conn2 is not None
+    await wait_for(lambda: conn2.closed)
+    await pump_settle()
+    assert [op.channel_id for op in world.guild.op4] == [CHANNEL_ID, CHANNEL_ID]  # the two joins only
+
+
+async def test_move_the_gateway_never_confirms_returns_to_the_old_channel(world: World) -> None:
+    # Discord ignores an op 4 for a channel the bot may not join (no CONNECT permission, full).
+    # The 3 s server fallback used to "connect" to that channel id with the old session and token,
+    # and move_to() returned normally while the bot was still in the old channel.
+    vc = await connect_detached(world)
+    world.guild.respond = False
+    task = asyncio.create_task(vc.move_to(world.other, timeout=30))
+    await wait_for(lambda: world.guild.op4[-1] == Op4(OTHER_CHANNEL_ID, False, False))
+    vc.harness.step(3_100)
+    await pump_settle()
+    assert vc.status.state == "joining" and not task.done()
+    vc.harness.step(2_000)  # unconfirmed for 5 s: back to the old channel
+    with pytest.raises(ConnectFailed) as ei:
+        await task
+    assert ei.value.reason == "move_failed"
+    st = vc.status
+    assert (st.state, st.channel_id, st.target_channel_id) == ("connected", CHANNEL_ID, CHANNEL_ID)
+    assert st.generation == 1  # no Connect for the unconfirmed channel
+    assert vc.channel is world.channel
+    await vc.disconnect()
+
+
+async def test_failed_move_op4_never_reports_the_new_channel(world: World) -> None:
+    vc = await connect_detached(world)
+    world.guild.fail_next = RuntimeError("gateway reconnecting")
+    with pytest.raises(RuntimeError):
+        await vc.move_to(world.other)
+    vc.harness.step(5_100)
+    await pump_settle()
+    st = vc.status
+    assert (st.state, st.channel_id, st.target_channel_id) == ("connected", CHANNEL_ID, CHANNEL_ID)
+    assert vc.channel is world.channel
+    await vc.disconnect()
+
+
+async def test_voice_server_change_4022_reconnects_without_rejoin(world: World, testing: Any) -> None:
+    # 4022 (call terminated, e.g. the voice server changed) used to be a generic loss: closed as
+    # "lost" with reconnect=False, or an audible op 4 leave + join with reconnect=True.
+    for reconnect in (False, True):
+        vc = await connect_detached(world, reconnect=reconnect)
+        before = len(world.guild.op4)
+        testing.inject_driver_event(vc._conn, "disconnect", reason="ws_closed", code=4022)
+        assert vc.status.state == "reconnecting"
+        await vc.on_voice_server_update(
+            {"token": "t2", "endpoint": "wss://other.discord.media", "guild_id": str(GUILD_ID)}
+        )
+        assert vc.status.state == "connecting"
+        testing.inject_driver_event(vc._conn, "connect", ssrc=SSRC)
+        await wait_for(vc.is_connected)
+        assert len(world.guild.op4) == before  # no leave + join
+        assert vc.stats().get("gw_unlisted_inputs", 0) == 0
+        await vc.disconnect()
+
+
+async def test_rate_limited_4021_closes_without_rejoin(world: World, testing: Any) -> None:
+    vc = await connect_detached(world)
+    world.guild.respond = False
+    testing.inject_driver_event(vc._conn, "disconnect", reason="ws_closed", code=4021)
+    await wait_for(lambda: registered(world) is None)
+    st = vc.status
+    assert (st.close_reason, st.close_code) == ("lost", 4021)
+    await wait_for(lambda: len(world.guild.op4) == 2)
+    await asyncio.sleep(0.01)
+    assert [op.channel_id for op in world.guild.op4] == [CHANNEL_ID, None]  # one best-effort leave
+
+
+async def test_moderator_move_while_awaiting_rejoin_is_followed(world: World, testing: Any) -> None:
+    # The update used to be dropped in AwaitingRejoin, and the rejoin dragged the bot back.
+    vc = await connect_detached(world)
+    world.guild.respond = False
+    testing.inject_driver_event(vc._conn, "disconnect", reason="io")
+    assert vc.status.state == "reconnecting"
+    await vc.on_voice_state_update({"channel_id": str(OTHER_CHANNEL_ID), "session_id": "moved"})  # type: ignore
+    assert vc.status.target_channel_id == OTHER_CHANNEL_ID
+    assert vc.channel is world.other
+    vc.harness.step(2_000)  # backoff → Control.Rejoin
+    await wait_for(lambda: len(world.guild.op4) >= 3)
+    assert world.guild.op4[1:] == [Op4(None, False, False), Op4(OTHER_CHANNEL_ID, False, False)]
+    await vc.disconnect()
+
+
+async def test_slow_leave_is_finished_in_the_background(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A leave held by discord.py's gateway rate limiter (up to 60 s) used to be cancelled after
+    # 5 s and never sent: the bot stayed listed in the channel.
+    monkeypatch.setattr(client_mod, "_LEAVE_TIMEOUT_S", 0.05)
+    vc = await connect_detached(world)
+    world.guild.leave_delay = 0.3
+    async with asyncio.timeout(0.25):
+        await vc.disconnect()  # tears down locally after 0.05 s
+    assert registered(world) is None and vc._conn is not None and vc._conn.closed
+    assert Op4(None, False, False) not in world.guild.op4
+    await wait_for(lambda: Op4(None, False, False) in world.guild.op4, timeout=2)
+
+
+async def test_forced_disconnect_does_not_wait_for_the_leave(world: World) -> None:
+    # discord.py's Client.close() disconnects every client in turn with force=True: no client may
+    # hold the shutdown for its leave. The leave is still sent, and ordered before the next join.
+    vc = await connect_detached(world)
+    world.guild.leave_delay = 1.0
+    async with asyncio.timeout(0.5):
+        await vc.disconnect(force=True)
+    assert registered(world) is None
+    vc2 = await connect_detached(world)
+    assert [op.channel_id for op in world.guild.op4] == [CHANNEL_ID, None, CHANNEL_ID]
+    await vc2.disconnect()
+
+
+async def test_connect_timeout_covers_the_join_op4(world: World) -> None:
+    # The timeout used to start only after the join op 4 was sent, so a rate-limited op 4 made
+    # connect(timeout=0.2) take as long as the limiter (up to 60 s).
+    send = world.guild.change_voice_state
+
+    async def rate_limited(**kw: Any) -> None:
+        if kw.get("channel") is not None:
+            await asyncio.sleep(2.0)
+        await send(**kw)
+
+    world.guild.change_voice_state = rate_limited
+    with pytest.raises(ConnectTimeout):
+        async with asyncio.timeout(1.0):
+            await world.channel.connect(cls=client_factory(), timeout=0.2, reconnect=True)
+    assert registered(world) is None
+    await wait_for(lambda: Op4(None, False, False) in world.guild.op4)  # the best-effort leave
+
+
+async def test_move_and_reconnect_timeouts_cover_the_op4(world: World) -> None:
+    vc = await connect_detached(world)
+    send = world.guild.change_voice_state
+
+    async def rate_limited(**kw: Any) -> None:
+        await asyncio.sleep(2.0)
+        await send(**kw)
+
+    world.guild.change_voice_state = rate_limited
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    with pytest.raises(ConnectTimeout):
+        await vc.move_to(world.other, timeout=0.2)
+    with pytest.raises(ConnectTimeout):
+        await vc.reconnect(timeout=0.2)
+    assert loop.time() - t0 < 1.0
+    del world.guild.change_voice_state
+    await vc.disconnect()
+
+
+async def test_server_reallocation_that_never_completes_rejoins(world: World, testing: Any) -> None:
+    # VOICE_SERVER_UPDATE(endpoint=None) without a follow-up used to leave the connection in
+    # "joining" forever, with no event.
+    vc = await connect_detached(world)
+    world.guild.respond = False
+    async with vc.events() as events:
+        await vc.on_voice_server_update({"token": "t", "endpoint": None, "guild_id": str(GUILD_ID)})
+        assert vc.status.state == "joining"
+        seen = drain(events)
+        assert any(
+            isinstance(e, VoiceEvent.Disconnected) and e.reason == "server_reallocating" and e.will_retry for e in seen
+        ), seen
+        vc.harness.step(15_100)  # no new server: rejoin
+        await wait_for(lambda: len(world.guild.op4) >= 3)
+        assert world.guild.op4[1:] == [Op4(None, False, False), Op4(CHANNEL_ID, False, False)]
+    await vc.disconnect()
