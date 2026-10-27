@@ -175,7 +175,7 @@ jobs:
           uv run --no-sync pytest -ra
 
   windows:
-    name: Windows (Proactor loop): wake and receive
+    name: "Windows (Proactor loop): wake and receive"
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
