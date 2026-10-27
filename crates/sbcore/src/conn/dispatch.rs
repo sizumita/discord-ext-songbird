@@ -42,9 +42,11 @@ pub(crate) struct DispatchInner {
     conn: Weak<ConnShared>,
     rx: Option<RxSender>,
     tracks: Weak<TrackRegistry>,
-    /// Control inputs that did not fit the tick channel (cap `RX_CTRL_OVERFLOW_CAP`); drained first
-    /// by the worker.
+    /// Control inputs that did not fit the tick channel (cap `RX_CTRL_OVERFLOW_CAP`), and every
+    /// control input after them until the worker drains it (after the channel): one total order.
     ctrl_overflow: Arc<Mutex<VecDeque<RxInput>>>,
+    /// The channel of the last `Connect` handed to the Driver (0: none yet).
+    media_channel: AtomicU64,
     /// Reference point of `ctr.heartbeat`.
     base: Instant,
     pub(crate) ctr: DispatchCounters,
@@ -56,12 +58,8 @@ impl DispatchInner {
     fn on_event(&self, ctx: &EventContext<'_>) {
         match ctx {
             EventContext::VoiceTick(t) => {
-                if let Some(rx) = &self.rx {
-                    let tick = RawTick::from_voice_tick(t, Instant::now());
-                    if let Err(TrySendError::Full(_)) = rx.try_send(RxInput::Tick(tick)) {
-                        // The pipeline treats the hole like any other gap.
-                        self.ctr.ticks_dropped.fetch_add(1, Ordering::Relaxed);
-                    }
+                if self.rx.is_some() {
+                    self.send_tick(RawTick::from_voice_tick(t, Instant::now()));
                 }
             }
             EventContext::SpeakingStateUpdate(s) => {
@@ -112,22 +110,66 @@ impl DispatchInner {
         self.send_ctrl(RxInput::LinkDown);
     }
 
-    /// Control inputs are never silently lost: when the channel is full they go to the 64-entry
-    /// overflow that the worker drains first.
-    fn send_ctrl(&self, input: RxInput) {
+    /// One tick. Dropped (`ticks_dropped`; the pipeline treats the hole like any other gap) when
+    /// the channel is full, or while control inputs wait in the overflow: in the channel it would
+    /// overtake them.
+    fn send_tick(&self, tick: RawTick) {
         let Some(rx) = &self.rx else {
             return;
         };
-        match rx.try_send(input) {
-            Ok(()) | Err(TrySendError::Closed(_)) => {}
-            Err(TrySendError::Full(input)) => {
-                let mut q = self.ctrl_overflow.lock();
-                if q.len() < RX_CTRL_OVERFLOW_CAP {
-                    q.push_back(input);
-                } else {
-                    self.ctr.ctrl_dropped.fetch_add(1, Ordering::Relaxed);
+        // The overflow lock is held across `try_send` (non-blocking), so the worker cannot empty
+        // the overflow between the check and the send. A rejected tick is freed after the lock.
+        let rejected = {
+            let q = self.ctrl_overflow.lock();
+            if q.is_empty() {
+                match rx.try_send(RxInput::Tick(tick)) {
+                    Err(TrySendError::Full(t)) => Some(t),
+                    Ok(()) | Err(TrySendError::Closed(_)) => None,
                 }
+            } else {
+                Some(RxInput::Tick(tick))
             }
+        };
+        if let Some(t) = rejected {
+            self.ctr.ticks_dropped.fetch_add(1, Ordering::Relaxed);
+            drop(t);
+        }
+    }
+
+    /// Control inputs are never silently lost: when the channel is full they go to the 64-entry
+    /// overflow, and while it holds anything every later one queues behind them. The worker drains
+    /// the overflow after the channel, so control inputs keep their order relative to each other
+    /// and to the ticks (a `LinkUp` never overtakes an earlier `LinkDown`, nor a `Map` an earlier
+    /// `UserLeft`).
+    pub(crate) fn send_ctrl(&self, input: RxInput) {
+        let Some(rx) = &self.rx else {
+            return;
+        };
+        let mut q = self.ctrl_overflow.lock();
+        let input = if q.is_empty() {
+            match rx.try_send(input) {
+                Ok(()) | Err(TrySendError::Closed(_)) => return,
+                Err(TrySendError::Full(input)) => input,
+            }
+        } else {
+            input
+        };
+        if q.len() < RX_CTRL_OVERFLOW_CAP {
+            q.push_back(input);
+        } else {
+            drop(q);
+            self.ctr.ctrl_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A `Connect` to `channel` is about to be handed to the Driver. A channel other than the
+    /// previous one moves the media session: `RxInput::ChannelChanged`, queued before anything the
+    /// new connection can produce, ends the old channel's presences (no `ClientDisconnect` arrives
+    /// for them) and its SSRC space (§8.5).
+    pub(crate) fn media_channel(&self, channel: u64) {
+        let prev = self.media_channel.swap(channel, Ordering::AcqRel);
+        if prev != 0 && prev != channel {
+            self.send_ctrl(RxInput::ChannelChanged);
         }
     }
 
@@ -159,6 +201,7 @@ impl Dispatch {
             rx,
             tracks,
             ctrl_overflow,
+            media_channel: AtomicU64::new(0),
             base: Instant::now(),
             ctr: DispatchCounters::default(),
             _live: LiveCounter::new(&live::DISPATCH),
@@ -172,6 +215,11 @@ impl Dispatch {
 
     pub(crate) fn counters(&self) -> &DispatchCounters {
         &self.0.ctr
+    }
+
+    /// See [`DispatchInner::media_channel`].
+    pub(crate) fn media_channel(&self, channel: u64) {
+        self.0.media_channel(channel);
     }
 
     /// When the last heartbeat arrived (the dispatcher's creation if none has yet).
@@ -242,6 +290,64 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(RxInput::LinkDown)));
         assert_eq!(overflow.lock().len(), RX_CTRL_OVERFLOW_CAP);
         assert_eq!(d.counters().ctrl_dropped.load(Ordering::Relaxed), 5);
+    }
+
+    fn empty_tick() -> RawTick {
+        RawTick {
+            arrived: Instant::now(),
+            voices: smallvec::SmallVec::new(),
+            silent: smallvec::SmallVec::new(),
+        }
+    }
+
+    /// Once a control input waits in the overflow, later ones queue behind it and ticks are
+    /// dropped: nothing newer enters the channel ahead of it (the worker drains the channel, then
+    /// the overflow), so a `LinkUp` never overtakes an earlier `LinkDown`.
+    #[test]
+    fn the_overflow_keeps_one_order_with_the_channel() {
+        let _serial = crate::conn::TEST_LOCK.lock();
+        let (d, mut rx, overflow) = inner_with_channel(2);
+        let inner = d.inner();
+        inner.send_ctrl(RxInput::LinkDown);
+        inner.send_tick(empty_tick());
+        inner.send_ctrl(RxInput::LinkUp { ssrc: Some(1) }); // channel full: overflow
+        assert_eq!(overflow.lock().len(), 1);
+        assert!(matches!(rx.try_recv(), Ok(RxInput::LinkDown)));
+        // Room in the channel again, but the overflow is older than anything sent now.
+        inner.send_tick(empty_tick());
+        inner.send_ctrl(RxInput::UserLeft { user_id: 7 });
+        assert_eq!(d.counters().ticks_dropped.load(Ordering::Relaxed), 1);
+        assert!(matches!(rx.try_recv(), Ok(RxInput::Tick(_))));
+        assert!(rx.try_recv().is_err());
+        let q: Vec<RxInput> = overflow.lock().drain(..).collect();
+        assert!(matches!(
+            q[..],
+            [
+                RxInput::LinkUp { ssrc: Some(1) },
+                RxInput::UserLeft { user_id: 7 }
+            ]
+        ));
+        // Drained: the channel takes everything again.
+        inner.send_tick(empty_tick());
+        inner.send_ctrl(RxInput::LinkDown);
+        assert!(matches!(rx.try_recv(), Ok(RxInput::Tick(_))));
+        assert!(matches!(rx.try_recv(), Ok(RxInput::LinkDown)));
+        assert_eq!(d.counters().ctrl_dropped.load(Ordering::Relaxed), 0);
+    }
+
+    /// Only a `Connect` to another channel ends the old channel's receive state (a reconnect to
+    /// the same channel keeps the SSRC map, §8.5).
+    #[test]
+    fn a_connect_to_another_channel_queues_channel_changed() {
+        let _serial = crate::conn::TEST_LOCK.lock();
+        let (d, mut rx, _overflow) = inner_with_channel(8);
+        d.media_channel(10); // the first connect: nothing to end
+        d.media_channel(10); // a reconnect
+        assert!(rx.try_recv().is_err());
+        d.media_channel(11);
+        assert!(matches!(rx.try_recv(), Ok(RxInput::ChannelChanged)));
+        d.media_channel(11);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

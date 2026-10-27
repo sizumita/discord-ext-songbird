@@ -282,8 +282,9 @@ class AudioStream(AsyncIterator[AudioChunk]):
 class UserStreams(AsyncIterator[AudioStream]):
     """Yields one :class:`AudioStream` per user as they first speak.
 
-    With ``close_on_leave=True`` each stream ends when its user leaves (``UserLeft``); a user who
-    returns gets a new stream. Created by ``SongbirdClient.listen_users``.
+    With ``close_on_leave=True`` each stream ends when its user leaves (``UserLeft``) or when the bot
+    moves to another channel, which ends every presence of the old channel; a user who returns, or is
+    heard on the new channel, gets a new stream. Created by ``SongbirdClient.listen_users``.
     """
 
     def __init__(self, router: native.RouterSubscription, pump: _Pump, register: Any = None) -> None:

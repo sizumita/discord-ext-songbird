@@ -59,10 +59,21 @@ impl RawTick {
 #[derive(Clone, Debug)]
 pub enum RxInput {
     Tick(RawTick),
-    Map { ssrc: u32, user_id: u64 },
-    UserLeft { user_id: u64 },
-    LinkUp { ssrc: Option<u32> },
+    Map {
+        ssrc: u32,
+        user_id: u64,
+    },
+    UserLeft {
+        user_id: u64,
+    },
+    LinkUp {
+        ssrc: Option<u32>,
+    },
     LinkDown,
+    /// The media session moves to another channel: a `Connect` to a channel other than the
+    /// previous one is about to start. No `ClientDisconnect` arrives for the users left behind,
+    /// and the old session's SSRCs mean nothing on the new one (§8.5).
+    ChannelChanged,
 }
 
 /// Sender half of the tick channel.

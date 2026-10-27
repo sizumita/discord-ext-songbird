@@ -131,6 +131,11 @@ impl SpeakingDetector {
         self.users.len()
     }
 
+    /// Ids of the users currently speaking (any order).
+    pub fn user_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.users.keys().copied()
+    }
+
     fn expired(&self, e: &UserSpeech, tick: u64) -> bool {
         tick.saturating_sub(e.last_voiced_tick) >= u64::from(self.hangover_ticks)
     }

@@ -20,7 +20,7 @@ pub mod speaking;
 #[cfg(test)]
 mod pipeline_tests;
 #[cfg(test)]
-mod test_util;
+pub(crate) mod test_util;
 
 pub use bus::{MixFilter, MixPolicy};
 pub use chunk::{ChunkData, ChunkMeta};

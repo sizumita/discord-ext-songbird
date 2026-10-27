@@ -115,6 +115,22 @@ struct SsrcMap {
     last_seen: Instant,
 }
 
+/// Connection state of a pipeline that outlives its consumers, carried into the pipeline rebuilt
+/// after a caught worker panic ([`RxPipeline::take_carry`]).
+pub(crate) struct RxCarry {
+    ssrc_users: HashMap<u32, SsrcMap>,
+    bots: HashSet<u64>,
+    classify_seen: HashSet<u64>,
+    pending_prunes: VecDeque<(Instant, u64)>,
+    departed: HashSet<u64>,
+    speaking: SpeakingDetector,
+    tick_index: u64,
+    link_up: bool,
+    stall_ref: Option<Instant>,
+    next_router_sub: u64,
+    counts: RxCounts,
+}
+
 /// Decoder state of one SSRC plus bookkeeping.
 struct StateSlot {
     state: SsrcState,
@@ -193,6 +209,10 @@ pub struct RxPipeline {
     bots: HashSet<u64>,
     classify_seen: HashSet<u64>,
     pending_prunes: VecDeque<(Instant, u64)>,
+    /// Users whose `UserLeft` prune is pending: their mapping is kept so the jitter buffer can
+    /// drain, but their presence ended. They are never voiced, so the playout tail neither
+    /// restarts a talk spurt nor opens a router stream (cleared by a new `Map` or the prune).
+    departed: HashSet<u64>,
     next_prune: Option<Instant>,
     // Consumers.
     buses: HashMap<u32, BusEntry>,
@@ -282,6 +302,7 @@ impl RxPipeline {
             bots: HashSet::new(),
             classify_seen: HashSet::new(),
             pending_prunes: VecDeque::new(),
+            departed: HashSet::new(),
             next_prune: None,
             buses: HashMap::new(),
             bus_ids: HashMap::new(),
@@ -334,6 +355,7 @@ impl RxPipeline {
             RxInput::LinkDown => {
                 self.link_up = false;
             }
+            RxInput::ChannelChanged => self.on_channel_changed(),
         }
         self.flush_events();
     }
@@ -411,6 +433,48 @@ impl RxPipeline {
         for u in self.cur.drain(..) {
             self.frame_pool.push(u.frame);
         }
+    }
+
+    /// Takes the connection state that outlives the consumers (call after `close_all`): the SSRC
+    /// → user map, bot flags, pending leaves, speaking spurts, the timeline, the link and the
+    /// counters. `ConnWorker::recover` moves it into the rebuilt pipeline (§5.7): Discord sends a
+    /// user's SSRC (op 5) once per session, so a pipeline rebuilt without the map could never
+    /// attribute present users' audio again, and its ignore-bots and include/exclude filters would
+    /// stop matching them.
+    pub(crate) fn take_carry(&mut self) -> RxCarry {
+        RxCarry {
+            ssrc_users: std::mem::take(&mut self.ssrc_users),
+            bots: std::mem::take(&mut self.bots),
+            classify_seen: std::mem::take(&mut self.classify_seen),
+            pending_prunes: std::mem::take(&mut self.pending_prunes),
+            departed: std::mem::take(&mut self.departed),
+            speaking: std::mem::replace(
+                &mut self.speaking,
+                SpeakingDetector::new(self.cfg.hangover_ms.div_ceil(TICK_MS)),
+            ),
+            tick_index: self.tick_index,
+            link_up: self.link_up,
+            stall_ref: self.stall_ref,
+            next_router_sub: self.next_router_sub,
+            counts: self.counts,
+        }
+    }
+
+    /// Seeds a fresh pipeline (no consumers yet) with `c` (see [`RxPipeline::take_carry`]).
+    pub(crate) fn restore_carry(&mut self, c: RxCarry) {
+        self.ssrc_users = c.ssrc_users;
+        self.bots = c.bots;
+        self.classify_seen = c.classify_seen;
+        self.pending_prunes = c.pending_prunes;
+        self.departed = c.departed;
+        self.speaking = c.speaking;
+        self.tick_index = self.tick_index.max(c.tick_index);
+        self.link_up = c.link_up;
+        self.stall_ref = c.stall_ref;
+        // Router stream ids stay unique: a stale `RemoveSub` of a stream closed by the panic must
+        // never unregister a new one.
+        self.next_router_sub = c.next_router_sub;
+        self.counts = c.counts;
     }
 
     pub fn counts(&self) -> RxCounts {
@@ -794,12 +858,17 @@ impl RxPipeline {
         if !self.cfg.enabled {
             return;
         }
+        // Judge the tick by its own arrival, not by the step's `now`: a worker that runs late (the
+        // RX thread is shared) handles its backlog in one step, and measuring every queued tick
+        // against that late `now` would synthesise a fake gap in front of real audio that arrived
+        // on time. `on_timer` runs after the channel is drained and still fills genuine holes.
+        let at = raw.arrived.min(now);
         if self.has_consumers() {
-            self.synthesize(now);
+            self.synthesize(at);
         } else {
-            self.fast_forward(now);
+            self.fast_forward(at);
         }
-        let exp = self.expected(now);
+        let exp = self.expected(at);
         if self.tick_index > exp.saturating_add(DEBT_TICKS) && !tick_has_voice(&raw) {
             // Debt after a burst: fully silent real ticks are dropped, voiced ones never.
             self.counts.ticks_skipped += 1;
@@ -830,6 +899,7 @@ impl RxPipeline {
         );
         // A (re)mapped user is back: cancel a pending `UserLeft` prune.
         self.pending_prunes.retain(|(_, u)| *u != user);
+        self.departed.remove(&user);
         if !changed {
             return;
         }
@@ -855,6 +925,56 @@ impl RxPipeline {
     }
 
     fn on_user_left(&mut self, user: u64, now: Instant) {
+        self.leave(user);
+        if self.pending_prunes.len() >= MAX_PENDING_PRUNES
+            && let Some((_, u)) = self.pending_prunes.pop_front()
+        {
+            self.prune_user(u);
+        }
+        // The mapping stays until the prune so the jitter buffer can drain, but the presence is
+        // over: the tail is never voiced (no new spurt, no new router stream).
+        self.departed.insert(user);
+        self.pending_prunes
+            .push_back((now.checked_add(USER_LEFT_PRUNE).unwrap_or(now), user));
+    }
+
+    /// The media session moved to another channel. Discord sends no `ClientDisconnect` for the
+    /// users left behind, so every user present on the old channel leaves now (sorted by id), and
+    /// the SSRC space starts empty: the new session assigns its own SSRCs. Explicit subscriptions,
+    /// live streams of `close_on_leave=False` routers, bot flags and the timeline survive.
+    fn on_channel_changed(&mut self) {
+        let mut present: Vec<u64> = self
+            .ssrc_users
+            .values()
+            .map(|m| m.user)
+            .chain(self.speaking.user_ids())
+            .chain(
+                self.routers
+                    .values()
+                    .filter(|r| r.spec.close_on_leave)
+                    .flat_map(|r| r.routed.keys().copied()),
+            )
+            .filter(|u| !self.departed.contains(u))
+            .collect();
+        present.sort_unstable();
+        present.dedup();
+        for u in present {
+            self.leave(u);
+        }
+        for r in self.routers.values_mut() {
+            r.routed
+                .retain(|_, w| w.upgrade().is_some_and(|q| !q.is_closed()));
+        }
+        self.ssrc_users.clear();
+        self.states.clear();
+        self.pending_prunes.clear();
+        self.departed.clear();
+        self.classify_seen.clear();
+    }
+
+    /// One presence ends: `SpeakingStopped` (if speaking) then `UserLeft`; router streams close
+    /// (`close_on_leave`) or are forgotten once dead; the user is classified again on return.
+    fn leave(&mut self, user: u64) {
         self.speaking.user_left(user, self.tick_index, &mut self.ev);
         for r in self.routers.values_mut() {
             if r.spec.close_on_leave {
@@ -875,18 +995,12 @@ impl RxPipeline {
             }
         }
         self.classify_seen.remove(&user);
-        if self.pending_prunes.len() >= MAX_PENDING_PRUNES
-            && let Some((_, u)) = self.pending_prunes.pop_front()
-        {
-            self.prune_user(u);
-        }
-        self.pending_prunes
-            .push_back((now.checked_add(USER_LEFT_PRUNE).unwrap_or(now), user));
     }
 
     // ── pruning and watchdog ─────────────────────────────────────────────────────────────────────
 
     fn prune_user(&mut self, user: u64) {
+        self.departed.remove(&user);
         let ssrcs: SmallVec<[u32; 4]> = self
             .ssrc_users
             .iter()
@@ -1009,11 +1123,15 @@ impl RxPipeline {
         self.collect_frames();
         let thr = self.cfg.voice_threshold_dbfs;
         for e in &mut self.cur {
+            // A departed user's playout tail is still delivered as audio, never as speech.
             e.voiced = e.packet_voiced
+                && !e.user.is_some_and(|u| self.departed.contains(&u))
                 && thr.is_none_or(|t| e.has_audio && measure(&e.frame[..]).rms_dbfs >= t);
         }
         for e in &self.cur {
-            if let Some(u) = e.user {
+            if let Some(u) = e.user
+                && !self.departed.contains(&u)
+            {
                 let concealed = e.lost && !e.packet_voiced;
                 self.speaking
                     .on_tick(u, e.voiced, concealed, tick, captured_at, &mut self.ev);

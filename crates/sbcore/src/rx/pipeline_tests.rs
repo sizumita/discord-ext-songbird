@@ -1209,3 +1209,354 @@ fn close_all_keeps_pending_bot_flags() {
     assert!(v.iter().any(|d| d.chunk.meta.speaking));
     assert!(v.iter().all(|d| !d.chunk.meta.speakers.contains(&B)));
 }
+
+fn speaking_events(ev: &[EventData]) -> Vec<String> {
+    ev.iter()
+        .filter_map(|e| match e {
+            EventData::SpeakingStarted { user_id, .. } => Some(format!("start {user_id}")),
+            EventData::SpeakingStopped { user_id, .. } => Some(format!("stop {user_id}")),
+            EventData::UserLeft { user_id } => Some(format!("left {user_id}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// songbird keeps delivering a departed user's playout buffer for a while after
+/// `ClientDisconnect` (the mapping is kept 1 s for it): that tail is audio, never speech. It
+/// neither restarts a talk spurt after `UserLeft` nor opens a second router stream for the ended
+/// presence (which no further `UserLeft` would ever close). A returning user is voiced again.
+#[test]
+fn playout_tail_after_user_left_opens_no_stream_and_restarts_no_spurt() {
+    let mut r = Rig::new();
+    r.map(SA, A);
+    r.map(SB, B);
+    let closing = RouterQueue::new(token(&r.hub));
+    r.p.apply(RxCmd::AddRouter {
+        id: 1,
+        spec: router_spec(20, true),
+        queue: closing.clone(),
+    });
+    let keeping = RouterQueue::new(token(&r.hub));
+    r.p.apply(RxCmd::AddRouter {
+        id: 2,
+        spec: router_spec(20, false),
+        queue: keeping.clone(),
+    });
+    let ua = r.user(A, PCM16_24K, 20);
+    r.timer();
+    let pa = voice(440.0, 0.3, 60);
+    for p in pa.iter().take(10) {
+        let v = vec![r.packet(SA, p), r.packet(SB, p)];
+        r.tick(v);
+    }
+    let first = pop_stream(&closing).expect("A's stream");
+    let _first_b = pop_stream(&closing).expect("B's stream");
+    let kept_a = pop_stream(&keeping).expect("A's stream");
+    let _kept_b = pop_stream(&keeping).expect("B's stream");
+    let kept_a = if kept_a.queue.user_id() == Some(A) {
+        kept_a
+    } else {
+        _kept_b
+    };
+    // The consumer of the `close_on_leave=False` router closes A's stream.
+    kept_a.close();
+    let v = vec![r.packet(SB, &pa[10])];
+    r.tick(v);
+    drain(&ua);
+    r.events();
+    r.p.on_input(RxInput::UserLeft { user_id: A }, r.now);
+    assert_eq!(first.queue.close_reason(), Some(CloseReason::UserLeft));
+    // The playout tail: three more voiced packets of the departed user.
+    for p in pa.iter().skip(11).take(3) {
+        let v = vec![r.packet(SA, p)];
+        r.tick(v);
+    }
+    r.idle(500);
+    assert!(
+        pop_stream(&closing).is_none(),
+        "no stream for an ended presence"
+    );
+    assert!(pop_stream(&keeping).is_none(), "nor a re-created one");
+    assert_eq!(r.p.counts().router_streams, 4);
+    let ev = speaking_events(&r.events());
+    let of_a: Vec<&String> = ev.iter().filter(|e| e.ends_with("1001")).collect();
+    assert_eq!(of_a, ["stop 1001", "left 1001"]);
+    let tail = drain(&ua);
+    assert!(
+        tail.iter()
+            .any(|d| d.chunk.data.as_bytes().iter().any(|b| *b != 0)),
+        "the tail is still delivered as audio"
+    );
+    assert!(tail.iter().all(|d| !d.chunk.meta.speaking));
+    // The user comes back: voiced again, with a new presence and stream.
+    r.idle(1_000);
+    r.map(SA, A);
+    for p in pa.iter().skip(20).take(5) {
+        let v = vec![r.packet(SA, p)];
+        r.tick(v);
+    }
+    let again = pop_stream(&closing).expect("a returning user gets a new stream");
+    assert_eq!(again.queue.user_id(), Some(A));
+    assert_eq!(
+        pop_stream(&keeping).map(|s| s.queue.user_id()),
+        Some(Some(A))
+    );
+    assert_eq!(speaking_events(&r.events()), ["start 1001"]);
+    assert!(drain(&ua).iter().any(|d| d.chunk.meta.speaking));
+}
+
+/// A returning user's `Map` (before the prune) ends the departed state at once.
+#[test]
+fn a_map_before_the_prune_makes_a_departed_user_voiced_again() {
+    let mut r = Rig::new();
+    r.map(SA, A);
+    let rq = RouterQueue::new(token(&r.hub));
+    r.p.apply(RxCmd::AddRouter {
+        id: 1,
+        spec: router_spec(20, true),
+        queue: rq.clone(),
+    });
+    r.timer();
+    let pa = voice(440.0, 0.3, 20);
+    for p in pa.iter().take(3) {
+        let v = vec![r.packet(SA, p)];
+        r.tick(v);
+    }
+    let first = pop_stream(&rq).unwrap();
+    r.p.on_input(RxInput::UserLeft { user_id: A }, r.now);
+    assert!(first.queue.is_closed());
+    r.tick(vec![]);
+    r.map(SA, A); // back within the second (same SSRC: no `UserMapped`)
+    for p in pa.iter().skip(3).take(3) {
+        let v = vec![r.packet(SA, p)];
+        r.tick(v);
+    }
+    assert_eq!(pop_stream(&rq).unwrap().queue.user_id(), Some(A));
+    r.idle(2_000);
+    // The cancelled prune kept the mapping.
+    let v = vec![r.packet(SA, &pa[10])];
+    r.tick(v);
+    assert!(
+        speaking_events(&r.events())
+            .iter()
+            .filter(|e| *e == "start 1001")
+            .count()
+            >= 2
+    );
+}
+
+/// When the media session moves to another channel, Discord sends no `ClientDisconnect` for the
+/// users left behind: every present user leaves (events, `close_on_leave` streams), the SSRC map,
+/// decoders and classification start empty, and an old SSRC is unmapped. Explicit subscriptions,
+/// live `close_on_leave=False` streams and bot flags survive; the users heard on the new channel
+/// get new streams.
+#[test]
+fn channel_change_ends_every_presence_and_the_ssrc_space() {
+    let mut r = Rig::new();
+    r.map(SA, A);
+    r.map(SB, B);
+    r.p.apply(RxCmd::SetBots(vec![(B, true)]));
+    let closing = RouterQueue::new(token(&r.hub));
+    r.p.apply(RxCmd::AddRouter {
+        id: 1,
+        spec: RouterSpec {
+            ignore_bots: false,
+            ..router_spec(20, true)
+        },
+        queue: closing.clone(),
+    });
+    let keeping = RouterQueue::new(token(&r.hub));
+    r.p.apply(RxCmd::AddRouter {
+        id: 2,
+        spec: RouterSpec {
+            ignore_bots: false,
+            ..router_spec(20, false)
+        },
+        queue: keeping.clone(),
+    });
+    let ua = r.user(A, PCM16_24K, 20);
+    let mix = r.mixed(MixFilter::everyone(), PCM16_24K, 20); // ignore_bots
+    r.timer();
+    let pa = voice(440.0, 0.3, 60);
+    for p in pa.iter().take(5) {
+        let v = vec![r.packet(SA, p), r.packet(SB, p)];
+        r.tick(v);
+    }
+    let mut closing_streams: HashMap<u64, Subscription> = HashMap::new();
+    while let Some(s) = pop_stream(&closing) {
+        closing_streams.insert(s.queue.user_id().unwrap(), s);
+    }
+    let mut kept: HashMap<u64, Subscription> = HashMap::new();
+    while let Some(s) = pop_stream(&keeping) {
+        kept.insert(s.queue.user_id().unwrap(), s);
+    }
+    assert_eq!((closing_streams.len(), kept.len()), (2, 2));
+    // A stream the consumer already closed is forgotten by the change.
+    kept.remove(&B).unwrap().close();
+    r.timer();
+    let before = r.p.counts();
+    assert_eq!((before.subscriptions, before.decoders_active), (5, 2));
+    r.unclassified.lock().clear();
+    r.events();
+
+    r.p.on_input(RxInput::ChannelChanged, r.now);
+    assert_eq!(
+        speaking_events(&r.events()),
+        ["stop 1001", "left 1001", "stop 1002", "left 1002"]
+    );
+    for s in closing_streams.values() {
+        assert_eq!(s.queue.close_reason(), Some(CloseReason::UserLeft));
+    }
+    assert!(!kept[&A].queue.is_closed(), "close_on_leave=False keeps it");
+    assert!(!ua.queue.is_closed(), "explicit subscriptions survive");
+    r.tick(vec![]);
+    let c = r.p.counts();
+    assert_eq!((c.subscriptions, c.decoders_active), (3, 0));
+    assert_eq!(c.router_streams, 4);
+    drain(&ua);
+    drain(&kept[&A]);
+
+    // The old SSRC means nothing on the new session (no mapping yet): unmapped audio.
+    for p in pa.iter().skip(5).take(3) {
+        let v = vec![r.packet(SA, p)];
+        r.tick(v);
+    }
+    assert!(drain(&ua).iter().all(|d| !d.chunk.meta.speaking));
+    assert!(pop_stream(&closing).is_none());
+    assert!(speaking_events(&r.events()).is_empty());
+
+    // On the new channel A transmits on another SSRC; B (a bot) too.
+    const SA2: u32 = 0xA2;
+    const SB2: u32 = 0xB2;
+    r.map(SA2, A);
+    r.map(SB2, B);
+    assert_eq!(*r.unclassified.lock(), [A, B], "classified again");
+    for p in pa.iter().skip(8).take(5) {
+        let v = vec![r.packet(SA2, p), r.packet(SB2, p)];
+        r.tick(v);
+    }
+    let mut again: Vec<u64> = std::iter::from_fn(|| pop_stream(&closing))
+        .map(|s| s.queue.user_id().unwrap())
+        .collect();
+    again.sort_unstable();
+    assert_eq!(again, [A, B], "new presences, new streams");
+    let reopened: Vec<u64> = std::iter::from_fn(|| pop_stream(&keeping))
+        .map(|s| s.queue.user_id().unwrap())
+        .collect();
+    assert_eq!(
+        reopened,
+        [B],
+        "A keeps its live close_on_leave=False stream"
+    );
+    assert!(drain(&ua).iter().any(|d| d.chunk.meta.speaking));
+    assert!(drain(&kept[&A]).iter().any(|d| d.chunk.meta.speaking));
+    let m = drain(&mix);
+    assert!(m.iter().any(|d| d.chunk.meta.speakers.contains(&A)));
+    assert!(
+        m.iter().all(|d| !d.chunk.meta.speakers.contains(&B)),
+        "bot flags survive the change"
+    );
+}
+
+/// A worker that runs late handles its tick backlog in one step: every queued tick is judged by
+/// its own arrival, so ticks that arrived on time fill their own slots instead of being pushed
+/// behind synthesised silence (no fake `gap_ms` in the middle of speech).
+#[test]
+fn a_late_worker_backlog_is_not_preceded_by_synthetic_silence() {
+    let mut r = Rig::new();
+    r.map(SA, A);
+    let ua = r.user(A, PCM16_24K, 20);
+    r.timer();
+    let pa = voice(440.0, 0.3, 120);
+    let mut it = pa.iter();
+    for p in it.by_ref().take(50) {
+        let v = vec![r.packet(SA, p)];
+        r.tick(v);
+    }
+    // Ten ticks arrive on time, 20 ms apart, while the worker is busy elsewhere for 205 ms.
+    let mut backlog = Vec::new();
+    for p in it.by_ref().take(10) {
+        r.advance(20);
+        backlog.push(RawTick {
+            arrived: r.now,
+            voices: std::iter::once(r.packet(SA, p)).collect(),
+            silent: SmallVec::new(),
+        });
+    }
+    r.advance(25);
+    for raw in backlog {
+        r.p.on_input(RxInput::Tick(raw), r.now);
+    }
+    r.timer();
+    for p in it.by_ref().take(50) {
+        let v = vec![r.packet(SA, p)];
+        r.tick(v);
+    }
+    let v = drain(&ua);
+    assert!(
+        v.iter().all(|d| d.chunk.meta.gap_ms == 0),
+        "fake gap at {:?}",
+        v.iter()
+            .filter(|d| d.chunk.meta.gap_ms > 0)
+            .map(|d| d.chunk.meta.timeline_ms)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(r.p.counts().ticks_synthetic, 0);
+    let t = timelines(&v);
+    assert!(t.windows(2).all(|w| w[1] == w[0] + 20), "continuous");
+    // The timeline still trails real time by the usual slack, not by the worker's delay.
+    let expected = (r.now - r.t0).as_millis() as u64;
+    assert!(r.p.timeline_ms() <= expected && r.p.timeline_ms() + 60 >= expected);
+}
+
+/// `ConnWorker::recover` moves the connection state into the rebuilt pipeline: mappings, bot
+/// flags, departed users, speaking spurts, the timeline and the router stream ids.
+#[test]
+fn carry_moves_connection_state_into_a_fresh_pipeline() {
+    let mut r = Rig::new();
+    r.map(SA, A);
+    r.map(SB, B);
+    r.p.apply(RxCmd::SetBots(vec![(B, true)]));
+    let _ua = r.user(A, PCM16_24K, 20);
+    r.timer();
+    let pa = voice(440.0, 0.3, 30);
+    for p in pa.iter().take(5) {
+        let v = vec![r.packet(SA, p)];
+        r.tick(v);
+    }
+    let timeline = r.p.timeline_ms();
+    r.events();
+    r.p.close_all(CloseReason::InternalError);
+    let carry = r.p.take_carry();
+    let mut fresh = RxPipeline::new(
+        cfg(r.t0),
+        EventHub::new(),
+        CtrlQueue::new(r.hub.clone()),
+        r.unclassified.clone(),
+    );
+    fresh.restore_carry(carry);
+    r.p = fresh;
+    assert_eq!(r.p.timeline_ms(), timeline, "the timeline continues");
+    let ua = r.user(A, PCM16_24K, 20);
+    let mix = r.mixed(MixFilter::everyone(), PCM16_24K, 20); // ignore_bots
+    r.timer();
+    for p in pa.iter().skip(5).take(10) {
+        let v = vec![r.packet(SA, p), r.packet(SB, p)];
+        r.tick(v);
+    }
+    assert!(
+        drain(&ua).iter().any(|d| d.chunk.meta.speaking),
+        "A still mapped"
+    );
+    let m = drain(&mix);
+    assert!(m.iter().any(|d| d.chunk.meta.speakers.contains(&A)));
+    assert!(
+        m.iter().all(|d| !d.chunk.meta.speakers.contains(&B)),
+        "B still a bot"
+    );
+    // A's spurt carried over: no second `SpeakingStarted`; it ends after the hangover.
+    r.idle(400);
+    let ev = speaking_events(&r.events());
+    let of_a: Vec<&String> = ev.iter().filter(|e| e.ends_with("1001")).collect();
+    assert_eq!(of_a, ["stop 1001"]);
+}

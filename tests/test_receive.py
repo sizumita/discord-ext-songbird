@@ -6,11 +6,24 @@ so the timeline never synthesises or skips unless a test wants it to.
 
 from __future__ import annotations
 
+import asyncio
 import gc
 from typing import Any
 
 import pytest
-from conftest import FakeUser, HarnessClient, drain, inject_ticks, pump_settle, voice_packets
+from conftest import (
+    OTHER_CHANNEL_ID,
+    SSRC,
+    FakeUser,
+    HarnessClient,
+    World,
+    connect_detached,
+    drain,
+    inject_ticks,
+    pump_settle,
+    voice_packets,
+    wait_for,
+)
 from discord.ext import songbird
 from discord.ext.songbird import AudioFormat, StreamClosed, StreamOverflow
 
@@ -283,6 +296,58 @@ async def test_user_streams(connected_vc: HarnessClient, testing: Any) -> None:
         assert users.dropped == 0
     with pytest.raises(StopAsyncIteration):
         await anext(users)
+
+
+@pytest.mark.real_only  # the fake's simplified receive pipeline has no channel-change handling
+async def test_user_streams_of_the_old_channel_end_on_move(world: World, testing: Any) -> None:
+    """Discord sends no ``ClientDisconnect`` for the users a moving bot leaves behind: the move
+    ends their presences, so ``listen_users`` streams close with ``user_left`` and give back their
+    subscription slots and receive budget, and the old SSRCs are unmapped on the new channel."""
+    vc = await connect_detached(world)
+    try:
+        mapped(vc, testing, (SSRC_A, A), (SSRC_B, B))
+        pkt = voice_packets(testing)[0]
+        events = vc.events()
+        users = vc.listen_users(songbird.PCM16_48K, chunk_ms=20)
+        user_a = vc.listen_user(A, songbird.PCM16_48K)
+        tick(vc, testing, [(SSRC_A, pkt), (SSRC_B, pkt)])
+        streams = {s.user_id: s for s in [await anext(users), await anext(users)]}
+        assert set(streams) == {A, B}
+        assert vc.stats()["subscriptions"] == 3
+
+        async def finish_move() -> None:
+            await wait_for(lambda: vc.status.state == "connecting" and vc.status.target_channel_id == OTHER_CHANNEL_ID)
+            testing.inject_driver_event(vc._conn, "connect", ssrc=SSRC + 1)
+
+        task = asyncio.create_task(finish_move())
+        await vc.move_to(world.other)
+        await task
+        vc.harness.step(40)
+        for s in streams.values():
+            assert s.closed and s.close_reason == "user_left"
+            assert [c async for c in s], "queued chunks stay readable"
+        assert not user_a.closed, "explicit streams survive the move"
+        await pump_settle()
+        left = [e.user_id for e in drain(events) if isinstance(e, songbird.VoiceEvent.UserLeft)]
+        assert sorted(left) == sorted([A, B])
+        del streams
+        gc.collect()
+        vc.harness.step(20)
+        assert vc.stats()["subscriptions"] == 1  # user_a only
+        # A's old SSRC is not A on the new channel until it is mapped again.
+        drain(user_a)
+        tick(vc, testing, [(SSRC_A, pkt)])
+        assert all(not c.speaking for c in drain(user_a))
+        mapped(vc, testing, (SSRC_A + 100, A))
+        tick(vc, testing, [(SSRC_A + 100, pkt)])
+        stream = await anext(users)
+        assert stream.user_id == A, "a new presence on the new channel"
+        assert any(c.speaking for c in drain(user_a))
+        users.close()
+        user_a.close()
+        events.close()
+    finally:
+        await vc.disconnect(force=True)
 
 
 async def test_buffer_protocol(connected_vc: HarnessClient, testing: Any) -> None:

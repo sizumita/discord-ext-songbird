@@ -695,7 +695,7 @@ take_ready(out):       // Python only, after sock_recv returned
   |---|---|---|
   | `Dispatch::act` | `catch_unwind` | The event is dropped and counted (`dispatch_panics`); always returns `None`. |
   | `LiveReader::next_packet`, `PcmDecoder::decode`, Opus readers | `catch_unwind` | The source is poisoned: `decode` returns silence once, then `next_packet` returns EOF and the track ends with `PlaybackEnded("internal_error")`. |
-  | ConnWorker tick | `catch_unwind` | Every subscription closes with `ConnectionClosed("internal_error")`; the receive pipeline is rebuilt empty. |
+  | ConnWorker tick | `catch_unwind` | Every subscription closes with `ConnectionClosed("internal_error")`; the receive pipeline is rebuilt without consumers. Connection state carries over: the SSRC → user map (Discord announces a user's SSRC once per session), bot flags, pending leaves, speaking spurts, the timeline, the link state and the counters. |
   | Decode threads | `catch_unwind` | The stream closes with `"decode_error"`. |
 
 - **Logging.** Every caught panic logs at ERROR once per site per minute and increments `stats()["panics"]`.
@@ -1234,7 +1234,7 @@ The dispatcher is registered once per event type at Driver creation (§4.8) and 
 
 | Event | Action |
 |---|---|
-| `VoiceTick(t)` | Build `RawTick{arrived: Instant::now(), voices, silent}`. Each `t.speaking` entry becomes `RawVoice::Packet{ssrc, packet: rd.packet.clone() /* Bytes refcount */, payload_offset, payload_end: rd.payload_end_pad}`, or `RawVoice::Lost{ssrc}` when `packet: None`. Then `rx.try_send(RxInput::Tick)`. If the channel is full, increment `ticks_dropped`; the pipeline treats the hole like any other gap. |
+| `VoiceTick(t)` | Build `RawTick{arrived: Instant::now(), voices, silent}`. Each `t.speaking` entry becomes `RawVoice::Packet{ssrc, packet: rd.packet.clone() /* Bytes refcount */, payload_offset, payload_end: rd.payload_end_pad}`, or `RawVoice::Lost{ssrc}` when `packet: None`. Then `rx.try_send(RxInput::Tick)`. If the channel is full, or a control input waits in `ctrl_overflow` (the tick would overtake it), increment `ticks_dropped`; the pipeline treats the hole like any other gap. |
 | `SpeakingStateUpdate(s)` | If `s.user_id` is `Some`: `RxInput::Map{ssrc, user_id}`. |
 | `ClientDisconnect(c)` | `RxInput::UserLeft{user_id}`. |
 | `DriverConnect(d)` / `DriverReconnect(d)` | `conn.apply(GwInput::DriverConnect / DriverReconnect{ssrc})` (§4.6), plus `RxInput::LinkUp{ssrc}`. |
@@ -1242,7 +1242,9 @@ The dispatcher is registered once per event type at Driver creation (§4.8) and 
 | `Track(list)` from `End`/`Error` | `tracks.on_track_event(list)` (§7.10). |
 | heartbeat (`Periodic(1 s)`) | Registered as a separate `Heartbeat(Arc<DispatchInner>)` handler, because a global timed event's context is `EventContext::Track(every track)` (`events/store.rs`, `GlobalEvents::tick`), which `on_event` could not tell apart from `End`. It only does `ctr.heartbeat.store(now_ms)`, and the ConnWorker compares that with the clock (§8.8). |
 
-Control inputs (`Map`, `UserLeft`, `Link*`) also use `try_send`. When the channel is full they go to `ctrl_overflow`, a 64-entry leaf lock that the worker drains first, so mappings are never silently lost.
+Control inputs (`Map`, `UserLeft`, `Link*`, `ChannelChanged`) also use `try_send`. When the channel is full they go to `ctrl_overflow`, a 64-entry leaf lock, so mappings are never silently lost. **One total order:** while `ctrl_overflow` holds anything, every later control input queues behind it and ticks are dropped (the check and the `try_send` happen under that lock), so nothing newer enters the channel; the worker drains the channel first and `ctrl_overflow` once the channel is empty. A `LinkUp` therefore never overtakes an earlier `LinkDown`, nor a returning user's `Map` the `UserLeft` before it.
+
+`RxInput::ChannelChanged` is not a songbird event: the executor sends it through the same control path when it hands the Driver a `Connect` to a channel other than the previous `Connect`'s (a `move_to`, a moderator move, a move after 4014, a rejoin that follows a move), before the Driver starts, so it precedes every mapping and tick of the new session (§8.5).
 
 ### 8.3 Opus extraction (`sbcore::rx::opus::extract_opus`; pure; fuzzed)
 
@@ -1299,9 +1301,10 @@ Every access uses `get`/`checked_*`, as sbcore's `deny(clippy::indexing_slicing)
   - Idle → Speaking on the first voiced tick: `SpeakingStarted{user_id, timeline_ms, captured_at}`.
   - Speaking → Idle after `speaking_hangover_ms` (default 200, range 20–5000) without a voiced tick: `SpeakingStopped{user_id, timeline_ms, duration_ms}`.
 - **`UserMapped{user_id, ssrc}`** fires on a new or changed SSRC mapping. It also queues the user for bot classification (`Control::ClassifyUsers`).
-- **`UserLeft{user_id}`** fires on `ClientDisconnect`, also with `receive=False`: the tick channel stays open as a control-only path (no `VoiceTick` handler, the pipeline ignores ticks), so `UserMapped`/`UserLeft` are reported while `SpeakingStarted`/`SpeakingStopped`, which need audio, are not. A `SpeakingStopped` is emitted first if the user was speaking. SSRC state is pruned 1 s later so the jitter buffer can drain.
+- **`UserLeft{user_id}`** fires on `ClientDisconnect`, also with `receive=False`: the tick channel stays open as a control-only path (no `VoiceTick` handler, the pipeline ignores ticks), so `UserMapped`/`UserLeft` are reported while `SpeakingStarted`/`SpeakingStopped`, which need audio, are not. A `SpeakingStopped` is emitted first if the user was speaking. SSRC state is pruned 1 s later so the jitter buffer can drain. songbird keeps delivering the user's playout buffer after `ClientDisconnect`; until the prune (or a new `Map` for the user, who came back) that tail is delivered as audio but is **never voiced**: it starts no talk spurt, opens no router stream and is not in `speakers`, so nothing about a departed user follows its `UserLeft`.
+- **Channel change.** A bot that moves to another channel gets no `ClientDisconnect` for the users it leaves behind. `RxInput::ChannelChanged` (§8.2) ends every presence of the old channel instead: each user that is mapped, speaking or holding a `close_on_leave` router stream gets `SpeakingStopped` (if speaking) and `UserLeft`, in user-id order, with the router effects of a leave (§8.9). Then the SSRC map, decoder states, pending leaves and the classification set start empty, because the new session assigns its own SSRCs: an old SSRC is unmapped until its op 5 arrives. Explicit subscriptions, live streams of `close_on_leave=False` routers, bot flags and the timeline survive.
 - **Joins are not observable through songbird** (`ClientConnect` was discontinued, `ws.rs:270-272`). The documentation points to discord.py's `on_voice_state_update`. `UserMapped` means "first transmitted".
-- **Retention.** The SSRC → user map survives reconnects. Idle SSRC state is pruned after `decode_state_timeout_s` (default 60 s).
+- **Retention.** The SSRC → user map survives reconnects to the same channel (and a caught worker panic, §5.7); a move to another channel starts it empty (above). Idle SSRC state is pruned after `decode_state_timeout_s` (default 60 s).
 
 ### 8.6 Sources: per-user and mixed (`MixBus`)
 
@@ -1348,6 +1351,7 @@ Every access uses `get`/`checked_*`, as sbcore's `deny(clippy::indexing_slicing)
   - Synthetic ticks are marked, and chunks report them in `gap_ms`.
   - Streams therefore emit one chunk per `chunk_ms` of real time from subscription until close, which keeps any consumer (a file writer, a network uplink) real-time paced.
   - With no subscribers, synthesis is lazy: `tick_index` fast-forwards on the next tick or subscribe, so idle connections cost no wake-ups.
+  - **A real tick is judged by its own arrival.** Before processing a real tick, synthesis, fast-forward and the debt check below use `now = min(tick.arrived, worker now)`, not the time the worker gets to it. The RX runtime is shared, so a worker that runs late handles its backlog in one step; measuring each queued tick against that late `now` would put synthetic silence (with `gap_ms`) in front of audio that arrived on time. The timer pass after the channel is drained still uses the worker's `now` and fills genuine holes.
 - **Debt.** When real ticks come back in a burst (songbird never skips ticks, `udp_rx/mod.rs:86-111`) and `tick_index − expected(now) > 5`:
   - a real tick that is **fully silent** (no voiced packet for any user) is dropped and counted in `ticks_skipped`;
   - **voiced ticks are always processed and never dropped.** The timeline then converges at the next silence.
@@ -1390,7 +1394,8 @@ Every access uses `get`/`checked_*`, as sbcore's `deny(clippy::indexing_slicing)
 - **Router (`listen_users`):**
   - `RouterSpec{format, chunk_ms, max_queue_ms, overflow, include, ignore_bots, close_on_leave}`.
   - On a user's first voiced tick that passes the filters, the worker creates a per-user subscription (budget-checked) and pushes it into the router queue. The queue holds 64 entries; drop-oldest closes the dropped stream and counts it. A stream that cannot be created (`MAX_SUBS_PER_CONN`, which router streams share with explicit subscriptions, the `max_receive_mb` budget, wake ids) is counted in `dropped` too and logged as a warning; the user is marked routed, so it is not retried every voiced tick, and gets a stream again only after its `UserLeft` (or a channel change). User docs: receive.md "Limits".
-  - `close_on_leave=True` closes that user's stream with `"user_left"`. A user who returns gets a new stream.
+  - `close_on_leave=True` closes that user's stream with `"user_left"`. A user who returns gets a new stream. One stream per presence: a presence ends on `UserLeft` or when the bot moves to another channel (§8.5), and a departed user's playout tail never opens another stream.
+  - `close_on_leave=False` keeps a live stream across the leave (reused when the user returns); a stream that is already closed is forgotten on leave, so the router's bookkeeping stays bounded by live streams plus present users.
   - `UserStreams.close()` closes the router and, by default, every stream it created.
 
 ### 8.10 Delivery to Python and `AudioChunk`
@@ -1741,7 +1746,8 @@ class AudioStream(AsyncIterator[AudioChunk]):
     async def __aexit__(self, *exc: object) -> None: """aclose()."""
 
 class UserStreams(AsyncIterator[AudioStream]):
-    """Yields one AudioStream per user as they first speak; each ends on UserLeft when close_on_leave=True."""
+    """Yields one AudioStream per user as they first speak; each ends on UserLeft (or when the bot moves to
+    another channel) when close_on_leave=True."""
     @property
     def dropped(self) -> int: """Users with no stream: refused by the 64-stream cap or the receive budget (logged; not
                                     retried until they leave), or discarded when 64 new streams waited unread."""
@@ -2872,7 +2878,8 @@ impl TrackQueue {
 pub enum RawVoice { Packet { ssrc: u32, packet: bytes::Bytes, payload_offset: usize, payload_end: usize }, Lost { ssrc: u32 } }
 pub struct RawTick { pub arrived: Instant, pub voices: SmallVec<[RawVoice; 8]>, pub silent: SmallVec<[u32; 16]> }
 impl RawTick { pub fn from_voice_tick(t: &songbird::events::context_data::VoiceTick, now: Instant) -> Self; }
-pub enum RxInput { Tick(RawTick), Map { ssrc: u32, user_id: u64 }, UserLeft { user_id: u64 }, LinkUp { ssrc: Option<u32> }, LinkDown }
+pub enum RxInput { Tick(RawTick), Map { ssrc: u32, user_id: u64 }, UserLeft { user_id: u64 }, LinkUp { ssrc: Option<u32> }, LinkDown,
+                   ChannelChanged /* §8.2, §8.5 */ }
 pub type RxSender = tokio::sync::mpsc::Sender<RxInput>;
 
 // rx/opus.rs, rx/decoder.rs, rx/speaking.rs ───────────────────────────────────────────────────────────

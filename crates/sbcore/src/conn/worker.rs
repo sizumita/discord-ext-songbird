@@ -353,14 +353,21 @@ impl ConnWorker {
         }
     }
 
-    /// After a caught panic: close every subscription and rebuild the pipeline empty.
+    /// After a caught panic: close every subscription and rebuild the pipeline without consumers.
+    /// The connection state (SSRC → user map, bot flags, pending leaves, speaking spurts, timeline,
+    /// link, counters) moves into the new pipeline: Discord announces a user's SSRC once per
+    /// session, so dropping the map would lose every present user's audio for good (§8.5).
     fn recover(&mut self, conn: &Arc<ConnShared>) {
         self.shared.close_queues(CloseReason::InternalError);
         let fresh = conn.new_pipeline();
         let mut old = std::mem::replace(&mut self.pipeline, fresh);
-        let _ = catch_unwind(AssertUnwindSafe(|| {
-            old.close_all(CloseReason::InternalError)
+        let carry = catch_unwind(AssertUnwindSafe(|| {
+            old.close_all(CloseReason::InternalError);
+            old.take_carry()
         }));
+        if let Ok(c) = carry {
+            self.pipeline.restore_carry(c);
+        }
         let _ = catch_unwind(AssertUnwindSafe(move || drop(old)));
     }
 
@@ -384,26 +391,39 @@ impl ConnWorker {
             }
         }
 
-        // 2. Inputs: the control overflow first (so mappings are never lost), then the channel.
-        loop {
-            let item = self.overflow.lock().pop_front();
-            match item {
-                Some(input) => self.pipeline.on_input(input, now),
-                None => break,
-            }
-        }
+        // 2. Inputs, in the order Dispatch produced them: the stash and the channel, then the
+        //    control overflow. While the overflow holds anything, Dispatch adds nothing to the
+        //    channel (control inputs queue behind the overflow, ticks are dropped), so the whole
+        //    channel is older than the overflow, and the overflow is drained only once the channel
+        //    is empty.
         if let Some(input) = self.stash.take() {
             self.pipeline.on_input(input, now);
         }
         let mut taken = 0usize;
+        let mut channel_empty = self.rx_closed;
         while taken < INPUT_BUDGET && !self.rx_closed {
             match self.rx_in.try_recv() {
                 Ok(input) => {
                     self.pipeline.on_input(input, now);
                     taken += 1;
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => self.rx_closed = true,
+                Err(TryRecvError::Empty) => {
+                    channel_empty = true;
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.rx_closed = true;
+                    channel_empty = true;
+                }
+            }
+        }
+        if channel_empty {
+            loop {
+                let item = self.overflow.lock().pop_front();
+                match item {
+                    Some(input) => self.pipeline.on_input(input, now),
+                    None => break,
+                }
             }
         }
 
@@ -778,6 +798,272 @@ mod hooked_tests {
             again.queue.close_reason(),
             Some(CloseReason::ConnectionClosed)
         );
+    }
+
+    use crate::rx::raw::{RawTick, RawVoice};
+    use crate::rx::{MixFilter, Overflow, RxSource, SubSpec};
+
+    /// One tick at `at`: an RTP packet of `opus` per `(ssrc, seq)`.
+    fn tick_of(at: Instant, voices: &[(u32, u16)], opus: &[u8]) -> RxInput {
+        RxInput::Tick(RawTick {
+            arrived: at,
+            voices: voices
+                .iter()
+                .map(|&(ssrc, seq)| {
+                    let (pkt, payload_offset, payload_end) =
+                        crate::rx::test_util::RtpBuild::new(seq, ssrc).build(opus, 16);
+                    RawVoice::Packet {
+                        ssrc,
+                        packet: bytes::Bytes::from(pkt),
+                        payload_offset,
+                        payload_end,
+                    }
+                })
+                .collect(),
+            silent: smallvec::SmallVec::new(),
+        })
+    }
+
+    fn silent_tick(at: Instant) -> RxInput {
+        tick_of(at, &[], &[])
+    }
+
+    fn drain_events(events: &crate::events::EventQueue) -> Vec<EventData> {
+        std::iter::from_fn(|| match events.try_pop() {
+            Pop::Item(e) => Some(e),
+            _ => None,
+        })
+        .collect()
+    }
+
+    /// The tick channel is full when the driver reconnects: `LinkDown` takes the last slot and
+    /// `LinkUp` waits in the overflow. The worker applies them in that order (the overflow after
+    /// the channel), so the link is up and a later receive stall is still detected.
+    #[test]
+    fn a_link_up_in_the_overflow_is_applied_after_the_older_link_down() {
+        let _serial = crate::conn::TEST_LOCK.lock();
+        let (conn, mut w, m, _peer) = detached();
+        let events = conn.subscribe_events(64, KindMask::ALL).unwrap();
+        let tx = conn.rx_sender().unwrap();
+        for _ in 0..TICK_CHANNEL_CAP - 1 {
+            tx.try_send(silent_tick(m.now())).unwrap();
+        }
+        let d = conn.dispatch().inner();
+        d.send_ctrl(RxInput::LinkDown); // the last slot
+        d.send_ctrl(RxInput::LinkUp { ssrc: Some(5) }); // the overflow
+        w.step(m.now());
+        assert!(w.overflow.lock().is_empty());
+        // No tick for longer than `stall_timeout` while the link is up: a stall.
+        for _ in 0..150 {
+            m.advance(TICK);
+            w.step(m.now());
+        }
+        assert!(
+            drain_events(&events)
+                .iter()
+                .any(|e| matches!(e, EventData::ReceiveStalled { .. })),
+            "the stall watchdog is armed"
+        );
+        conn.close(CloseReason::Cleanup);
+    }
+
+    /// A user leaves and comes back (new SSRC) while the channel is full: the `Map` waits in the
+    /// overflow behind the queued `UserLeft`, so the leave's prune never deletes the new mapping.
+    #[test]
+    fn a_map_in_the_overflow_is_applied_after_the_older_user_left() {
+        const A: u64 = 7;
+        let _serial = crate::conn::TEST_LOCK.lock();
+        let (conn, mut w, m, _peer) = detached();
+        let events = conn.subscribe_events(256, KindMask::ALL).unwrap();
+        let tx = conn.rx_sender().unwrap();
+        let d = conn.dispatch().inner();
+        d.send_ctrl(RxInput::Map {
+            ssrc: 11,
+            user_id: A,
+        });
+        w.step(m.now());
+        for _ in 0..TICK_CHANNEL_CAP - 2 {
+            tx.try_send(silent_tick(m.now())).unwrap();
+        }
+        d.send_ctrl(RxInput::UserLeft { user_id: A });
+        tx.try_send(silent_tick(m.now())).unwrap(); // full
+        d.send_ctrl(RxInput::Map {
+            ssrc: 21,
+            user_id: A,
+        });
+        w.step(m.now());
+        for _ in 0..75 {
+            m.advance(TICK); // past the 1 s prune
+            w.step(m.now());
+        }
+        drain_events(&events);
+        let opus =
+            crate::rx::test_util::opus_frames(&crate::rx::test_util::sine48(440.0, 0.3, 960 * 5));
+        for (i, p) in opus.iter().enumerate() {
+            m.advance(TICK);
+            tx.try_send(tick_of(m.now(), &[(21, 100 + i as u16)], p))
+                .unwrap();
+            w.step(m.now());
+        }
+        assert!(
+            drain_events(&events)
+                .iter()
+                .any(|e| matches!(e, EventData::SpeakingStarted { user_id: A, .. })),
+            "the returning user's new SSRC is still mapped"
+        );
+        conn.close(CloseReason::Cleanup);
+    }
+
+    /// §5.7 + §8.5: the pipeline rebuilt after a caught panic keeps the SSRC → user map, the bot
+    /// flags and the timeline (Discord announces a user's SSRC once per session).
+    #[test]
+    fn a_worker_panic_keeps_the_ssrc_map_bot_flags_and_timeline() {
+        const A: u64 = 7;
+        const BOT: u64 = 9;
+        let _serial = crate::conn::TEST_LOCK.lock();
+        let (conn, mut w, m, _peer) = detached();
+        let tx = conn.rx_sender().unwrap();
+        let d = conn.dispatch().inner();
+        d.send_ctrl(RxInput::Map {
+            ssrc: 1,
+            user_id: A,
+        });
+        d.send_ctrl(RxInput::Map {
+            ssrc: 2,
+            user_id: BOT,
+        });
+        conn.set_users_bot(&[(BOT, true)]);
+        let early = conn
+            .subscribe(SubSpec {
+                source: RxSource::User(A),
+                format: crate::format::PCM16_24K,
+                chunk_ms: 20,
+                max_queue_ms: 2_000,
+                overflow: Overflow::DropOldest,
+            })
+            .unwrap();
+        for _ in 0..50 {
+            m.advance(TICK);
+            w.step(m.now());
+        }
+        let timeline = conn.timeline_ms();
+        assert!(timeline >= 900);
+        w.shared.panic_next_step.store(true, Ordering::Release);
+        m.advance(TICK);
+        w.step(m.now());
+        assert_eq!(early.queue.close_reason(), Some(CloseReason::InternalError));
+        assert!(
+            conn.timeline_ms() >= timeline,
+            "the timeline never goes back"
+        );
+        let spec = |source| SubSpec {
+            source,
+            format: crate::format::PCM16_24K,
+            chunk_ms: 20,
+            max_queue_ms: 2_000,
+            overflow: Overflow::DropOldest,
+        };
+        let ua = conn.subscribe(spec(RxSource::User(A))).unwrap();
+        let mix = conn
+            .subscribe(spec(RxSource::Mixed(MixFilter::everyone())))
+            .unwrap();
+        let opus =
+            crate::rx::test_util::opus_frames(&crate::rx::test_util::sine48(440.0, 0.3, 960 * 10));
+        for (i, p) in opus.iter().enumerate() {
+            m.advance(TICK);
+            let seq = 100 + i as u16;
+            tx.try_send(tick_of(m.now(), &[(1, seq), (2, seq)], p))
+                .unwrap();
+            w.step(m.now());
+        }
+        let pop_all = |s: &crate::rx::Subscription| {
+            std::iter::from_fn(|| match s.queue.try_pop() {
+                Pop::Item(d) => Some(d),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+        };
+        assert!(
+            pop_all(&ua).iter().any(|d| d.chunk.meta.speaking),
+            "A's SSRC is still mapped"
+        );
+        let mixed = pop_all(&mix);
+        assert!(mixed.iter().any(|d| d.chunk.meta.speakers.contains(&A)));
+        assert!(
+            mixed.iter().all(|d| !d.chunk.meta.speakers.contains(&BOT)),
+            "the bot is still excluded"
+        );
+        conn.close(CloseReason::Cleanup);
+    }
+
+    /// A moderator moves the bot: the `Connect` to the new channel ends every presence of the old
+    /// one in the receive pipeline (no `ClientDisconnect` arrives for those users), so its
+    /// `listen_users` streams close and give back their slots and budget; a reconnect to the same
+    /// channel keeps everything.
+    #[test]
+    fn moving_to_another_channel_closes_the_old_channels_router_streams() {
+        use crate::rx::RouterSpec;
+        const A: u64 = 7;
+        let _serial = crate::conn::TEST_LOCK.lock();
+        let (conn, mut w, m, _peer) = detached();
+        conn.request_join(NonZeroU64::new(10).unwrap(), false, false);
+        conn.on_voice_state("s", Some(10));
+        conn.on_voice_server("t", Some("e.discord.media"));
+        assert_eq!(conn.status().state, "connected");
+        let router = conn
+            .subscribe_router(RouterSpec {
+                format: crate::format::PCM16_48K,
+                chunk_ms: 20,
+                max_queue_ms: 200,
+                overflow: Overflow::DropOldest,
+                include: None,
+                ignore_bots: false,
+                close_on_leave: true,
+            })
+            .unwrap();
+        let tx = conn.rx_sender().unwrap();
+        conn.dispatch().inner().send_ctrl(RxInput::Map {
+            ssrc: 1,
+            user_id: A,
+        });
+        let opus =
+            crate::rx::test_util::opus_frames(&crate::rx::test_util::sine48(440.0, 0.3, 960 * 3));
+        for (i, p) in opus.iter().enumerate() {
+            m.advance(TICK);
+            tx.try_send(tick_of(m.now(), &[(1, 100 + i as u16)], p))
+                .unwrap();
+            w.step(m.now());
+        }
+        let stream = match router.queue.try_pop_or_arm() {
+            Pop::Item(s) => s,
+            other => panic!("{other:?}"),
+        };
+        let stat = |k: &str| conn.stats().into_iter().find(|(n, _)| *n == k).unwrap().1;
+        assert_eq!(stat("subscriptions"), 1);
+        assert!(stat("receive_budget_bytes") > 0);
+        // Same channel, new session: a reconnect keeps the presence.
+        conn.on_voice_state("s2", Some(10));
+        m.advance(TICK);
+        w.step(m.now());
+        assert!(!stream.queue.is_closed());
+        // A moderator move to channel 11.
+        conn.on_voice_state("s2", Some(11));
+        conn.on_voice_server("t2", Some("e2.discord.media"));
+        assert_eq!(
+            (conn.status().state, conn.status().channel_id),
+            ("connected", Some(11))
+        );
+        m.advance(TICK);
+        w.step(m.now());
+        assert_eq!(stream.queue.close_reason(), Some(CloseReason::UserLeft));
+        drop(stream);
+        m.advance(TICK);
+        w.step(m.now());
+        assert_eq!(
+            (stat("subscriptions"), stat("receive_budget_bytes")),
+            (0, 0)
+        );
+        conn.close(CloseReason::Cleanup);
     }
 
     #[test]

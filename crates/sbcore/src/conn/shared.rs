@@ -1016,6 +1016,9 @@ impl ConnShared {
         #[cfg(test)]
         self.log_exec(Exec::Connect(generation));
         self.stats.connects.fetch_add(1, Ordering::Relaxed);
+        // Before the Driver starts the connection, so the receive pipeline sees a channel change
+        // ahead of every mapping and tick of the new session (§8.5).
+        self.dispatch.media_channel(info.channel_id.0.get());
         let fut = match self.with_driver(|d| d.connect(info, generation)) {
             Some(Some(fut)) => fut,
             Some(None) => {
