@@ -7,6 +7,7 @@ import asyncio
 import faulthandler
 import gc
 import json
+import os
 import struct
 import sys
 import sysconfig
@@ -138,6 +139,11 @@ async def test_close_from_a_foreign_thread_wakes_the_loop(connected_vc: HarnessC
 @pytest.mark.real_only
 async def test_loop_jitter_while_decoding(connected_vc: HarnessClient, testing: Any) -> None:
     """Decoding 20 speakers off the loop adds < 5 ms to the ``loop.call_later`` jitter p99."""
+    if sys.platform == "darwin" and os.environ.get("GITHUB_ACTIONS") == "true":
+        # Their timer noise alone swings between 3 and 12 ms within one run (idle windows of
+        # 2.8, 11.7 and 10.9 ms back to back), so no bound separates noise from a stall there. The
+        # decode path is the same on every platform; the Linux runners and local runs check it.
+        pytest.skip("GitHub macOS runner: idle timer noise reaches 12 ms; checked on Linux and locally")
     vc = connected_vc
     packets = testing.encode_opus(tone(20))
     for i in range(20):

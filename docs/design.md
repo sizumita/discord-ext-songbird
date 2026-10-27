@@ -3238,7 +3238,7 @@ These use pytest 9.1.1 with pytest-asyncio 1.4.1 (`asyncio_mode = "auto"`) and r
   - a `close()` from a foreign thread wakes the loop waiter;
   - no deadlock (watchdog);
   - decoding 20 synthetic speakers adds < 5 ms to the `loop.call_later` jitter p99, measured against an idle
-    baseline taken first in the same run (timer noise on shared CI hosts, e.g. GitHub's macOS runners, can exceed 5 ms with nothing stalling the loop).
+    baseline taken first in the same run (timer noise on shared CI hosts can exceed 5 ms with nothing stalling the loop; skipped on GitHub's macOS runners, whose idle noise reaches 12 ms, see I2.md).
 - **`test_shutdown.py`.** A subprocess creates connections and exits without disconnecting. It must exit with code 0, with no "Fatal Python error" and no "Future exception was never retrieved".
 - **Rust soak (phase 3).** One hour of the pipeline (§13.1) and one hour of `LiveReader` pulls with random writes and clears.
 
