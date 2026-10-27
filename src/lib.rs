@@ -70,6 +70,12 @@ pub fn configure_runtime(py: Python<'_>, net_workers: i64, rx_workers: i64) -> P
 #[pyfunction]
 #[pyo3(name = "_shutdown_all")]
 pub fn shutdown_all() {
+    // §4.10: in a forked child (an inherited `atexit` hook) take no process-global lock. A thread
+    // that held the registry or log-waiter lock at `fork()` does not exist here, so the child would
+    // park forever; inherited connections are leaked, not closed.
+    if runtime::FORKED.load(Ordering::Acquire) {
+        return;
+    }
     runtime::SHUTTING_DOWN.store(true, Ordering::Release);
     sbcore::log::shutdown();
     // Snapshot REGISTRY, then close() each connection outside the registry lock (§4.10).

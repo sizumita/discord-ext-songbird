@@ -348,13 +348,26 @@ fn alloc_count() -> u64 {
     hooks::alloc_count()
 }
 
+/// A background thread holds the native connection registry lock for ``seconds`` (≤ 10); returns
+/// once it is held. Used to fork while a vanished thread owns a process-global lock (§4.10).
+#[pyfunction]
+fn hold_registry_lock(py: Python<'_>, seconds: f64) -> PyResult<()> {
+    ensure_not_forked(py)?;
+    if !(0.0..=10.0).contains(&seconds) {
+        return Err(PyValueError::new_err("seconds must be in 0..=10"));
+    }
+    let d = std::time::Duration::from_secs_f64(seconds);
+    py.detach(|| hooks::hold_registry_lock(d));
+    Ok(())
+}
+
 /// The `native._testing` submodule.
 #[pymodule(submodule, name = "_testing", gil_used = false)]
 pub mod testing_module {
     #[pymodule_export]
     use super::{
         Harness, MixerHarness, alloc_count, detached_connection, encode_opus, fail_track,
-        inject_driver_event, inject_map, inject_tick, inject_user_left, inject_voice_tick_rtp,
-        rtp_wrap, set_ops_answered, track_log,
+        hold_registry_lock, inject_driver_event, inject_map, inject_tick, inject_user_left,
+        inject_voice_tick_rtp, rtp_wrap, set_ops_answered, track_log,
     };
 }

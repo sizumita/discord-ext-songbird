@@ -1018,6 +1018,53 @@ fn mixer_pull_does_not_allocate() {
     assert!(r.q.inner.lock().dead.is_empty());
 }
 
+/// Tiny writes: one pull exhausts more segments than the graveyard holds, and the housekeeper may
+/// run a tick late. The mixer still neither allocates nor frees (the surplus stays queued, spent,
+/// for the housekeeper), and the audio stays contiguous across the spent segments.
+#[test]
+fn tiny_writes_overflowing_the_graveyard_never_free_on_the_mixer() {
+    use crate::alloc_count::{CountGuard, count, frees};
+    let mut r = Rig::new(spec(PCM16_48K_STEREO));
+    let ch = 2usize;
+    // 20-frame writes: 48 segments per 960-frame pull; three pulls without housekeeping.
+    let mut expect: Vec<i16> = Vec::new();
+    for w in 0..(3 * 48 + 10) {
+        let pcm: Vec<i16> = (0..20 * ch).map(|k| (w * 100 + k) as i16).collect();
+        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+        r.write(&bytes).unwrap();
+        expect.extend_from_slice(&pcm);
+    }
+    let mut out = vec![0i16; 960 * ch];
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        let guard = CountGuard::new();
+        let (a0, f0) = (count(), frees());
+        let rep = PcmProvider::pull(&*r.q, &mut out);
+        let (a1, f1) = (count(), frees());
+        drop(guard);
+        assert_eq!(
+            (a1 - a0, f1 - f0),
+            (0, 0),
+            "the mixer pull allocated or freed"
+        );
+        assert_eq!(rep.real, 960);
+        got.extend_from_slice(&out);
+    }
+    assert_eq!(got[..], expect[..got.len()]);
+    // The full graveyard left spent segments queued; the housekeeper reaps them.
+    assert!(r.q.inner.lock().segs.len() > 10);
+    r.house();
+    {
+        let g = r.q.inner.lock();
+        assert!(g.dead.is_empty());
+        assert_eq!(g.segs.len(), 10);
+        assert_eq!(g.queued_frames, 200);
+    }
+    let rep = PcmProvider::pull(&*r.q, &mut out);
+    assert_eq!(rep.real, 200);
+    assert_eq!(out[..200 * ch], expect[got.len()..]);
+}
+
 /// A queue with no track attached yet (W2 attaches right after `driver.play`).
 fn unattached(spec: PlaybackSpec) -> (Arc<PcmQueue>, Arc<WakeHub>, UnixStream) {
     set_role(Role::Harness);

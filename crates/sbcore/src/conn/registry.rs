@@ -43,3 +43,16 @@ pub fn shutdown_all(reason: CloseReason) {
         conn.close(reason);
     }
 }
+
+/// Test hook: a thread holds the registry lock for `d`; returns once it is held (a fork during the
+/// hold copies the lock locked into the child, as a fork racing `register`/`unregister` would).
+#[cfg(feature = "test-hooks")]
+pub(crate) fn hold_lock_for(d: std::time::Duration) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _g = REGISTRY.lock();
+        let _ = tx.send(());
+        std::thread::sleep(d);
+    });
+    let _ = rx.recv();
+}

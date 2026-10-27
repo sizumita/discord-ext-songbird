@@ -8,8 +8,9 @@
 //! Memory: the PCM itself is bounded by `cap_frames`; the number of queued segments is bounded by
 //! `max_segs = cap_frames / MIN_SEG_FRAMES + 64`, so the per-write overhead of pathological
 //! one-frame writes stays proportional to the cap (`docs/deviations/W4.md`). Segments the mixer has
-//! consumed go to a fixed-capacity graveyard that the housekeeper frees on the RX thread, so the
-//! mixer neither allocates nor frees on the PCM path.
+//! consumed go to a graveyard that the housekeeper frees on the RX thread; when it is full (many
+//! tiny writes per housekeeping pass) consumed segments stay queued, spent, until the housekeeper
+//! reaps them. The mixer neither allocates nor frees on the PCM path.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -269,7 +270,9 @@ pub(crate) struct QueueInner {
     pub(crate) track_playing: bool,
     pub(crate) stop_sent: bool,
     pub(crate) link_up: bool,
-    /// Consumed segments, freed by the housekeeper (capacity `GRAVE_CAP`, never grown).
+    /// Consumed segments, freed by the housekeeper. The mixer never grows it (a full graveyard
+    /// leaves spent segments queued); it starts at `GRAVE_CAP` and only the housekeeper's reaping
+    /// can grow it (it is swapped with `HouseLocal::spare`), bounded by `max_segs`.
     pub(crate) dead: Vec<Box<[i16]>>,
 }
 
@@ -1230,6 +1233,7 @@ impl PcmQueue {
             if !g.dead.is_empty() {
                 std::mem::swap(&mut g.dead, spare);
             }
+            reap_spent(&mut g, spare);
             // Space.
             let free = self.lim.cap_frames.saturating_sub(g.queued_frames);
             if g.space_wanted > 0 && free >= g.space_wanted && g.segs.len() + 2 <= self.lim.max_segs
@@ -1374,17 +1378,21 @@ enum Commit {
 
 /// Pops up to `n` frames into `out` (already zeroed): silence segments are skipped, PCM is copied;
 /// per-tag `played` and `last_pull` are updated. Consumed PCM boxes go to the graveyard. No
-/// allocation.
+/// allocation and no free: once the graveyard is full (many tiny writes per housekeeping pass) a
+/// consumed segment stays queued, spent (`off == len` / `frames == 0`), and the walk continues past
+/// it; the housekeeper reaps spent segments under L6 ([`reap_spent`]).
 fn pop_into(g: &mut QueueInner, out: &mut [i16], ch: usize, n: u64, pull: u64) -> (u64, u64) {
     let mut need = n;
     let mut pos = 0usize;
     let mut consumed = 0u64;
     let mut real = 0u64;
+    // Segments before `i` are spent and stay queued (graveyard full).
+    let mut i = 0usize;
     while need > 0 {
-        let Some(front) = g.segs.front_mut() else {
+        let Some(seg) = g.segs.get_mut(i) else {
             break;
         };
-        let exhausted = match front {
+        let exhausted = match seg {
             Seg::Silence { frames } => {
                 let take = (*frames).min(need);
                 *frames -= take;
@@ -1397,35 +1405,67 @@ fn pop_into(g: &mut QueueInner, out: &mut [i16], ch: usize, n: u64, pull: u64) -
                 let o = *off as usize;
                 let avail = (data.len().saturating_sub(o) / ch.max(1)) as u64;
                 let take = avail.min(need);
-                let len = take as usize * ch;
-                if let (Some(dst), Some(src)) = (out.get_mut(pos..pos + len), data.get(o..o + len))
-                {
-                    dst.copy_from_slice(src);
-                }
-                *off = u32::try_from(o + len).unwrap_or(u32::MAX);
-                pos += len;
-                need -= take;
-                consumed += take;
-                real += take;
-                if let Some(id) = *tag
-                    && let Some(e) = g.tags.get_mut(id)
-                {
-                    e.played += take;
-                    e.last_pull = Some(pull);
+                if take > 0 {
+                    let len = take as usize * ch;
+                    if let (Some(dst), Some(src)) =
+                        (out.get_mut(pos..pos + len), data.get(o..o + len))
+                    {
+                        dst.copy_from_slice(src);
+                    }
+                    *off = u32::try_from(o + len).unwrap_or(u32::MAX);
+                    pos += len;
+                    need -= take;
+                    consumed += take;
+                    real += take;
+                    if let Some(id) = *tag
+                        && let Some(e) = g.tags.get_mut(id)
+                    {
+                        e.played += take;
+                        e.last_pull = Some(pull);
+                    }
                 }
                 take == avail
             }
         };
-        if exhausted
-            && let Some(Seg::Pcm { data, .. }) = g.segs.pop_front()
-            && g.dead.len() < g.dead.capacity()
-        {
-            g.dead.push(data);
+        if !exhausted {
+            continue;
+        }
+        let pop = i == 0
+            && match g.segs.front() {
+                Some(Seg::Pcm { .. }) => g.dead.len() < g.dead.capacity(),
+                // No heap: dropping it frees nothing.
+                Some(Seg::Silence { .. }) => true,
+                None => false,
+            };
+        if !pop {
+            i += 1;
+            continue;
+        }
+        if let Some(Seg::Pcm { data, .. }) = g.segs.pop_front() {
+            g.dead.push(data); // within capacity: no reallocation
         }
     }
     g.queued_frames = g.queued_frames.saturating_sub(consumed);
     g.queued_real = g.queued_real.saturating_sub(real);
     (consumed, real)
+}
+
+/// Housekeeper, under L6: moves the spent segments the mixer left queued (graveyard full) to
+/// `spare`, freed after L6 is released. Spent segments are always at the front.
+fn reap_spent(g: &mut QueueInner, spare: &mut Vec<Box<[i16]>>) {
+    loop {
+        let spent = match g.segs.front() {
+            Some(Seg::Pcm { data, off, .. }) => *off as usize >= data.len(),
+            Some(Seg::Silence { frames }) => *frames == 0,
+            None => false,
+        };
+        if !spent {
+            break;
+        }
+        if let Some(Seg::Pcm { data, .. }) = g.segs.pop_front() {
+            spare.push(data); // RX thread: may grow `spare`
+        }
+    }
 }
 
 impl PcmProvider for PcmQueue {

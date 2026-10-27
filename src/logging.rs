@@ -114,6 +114,12 @@ pub(crate) fn log_wait(
     } else {
         Duration::ZERO
     };
+    if sbcore::runtime::FORKED.load(std::sync::atomic::Ordering::Acquire) {
+        // §4.10: no inherited lock in a forked child (the log waiter, L11, may be held by a thread
+        // that does not exist here). Nothing is forwarded; still wait, so a loop never spins.
+        py.detach(|| std::thread::sleep(timeout));
+        return Vec::new();
+    }
     py.detach(|| sbcore::log::wait(timeout));
     let mut recs: Vec<LogRecord> = Vec::new();
     sbcore::log::drain(max.clamp(1, LOG_RING_CAP), &mut recs);

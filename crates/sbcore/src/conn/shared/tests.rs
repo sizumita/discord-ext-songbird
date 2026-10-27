@@ -376,6 +376,51 @@ fn receive_disabled_and_closed_errors() {
     }
 }
 
+/// A deadline armed off the ConnWorker (here the connect task's `ConnectResult(Err)` arming the
+/// rejoin backoff) wakes the worker, so `Rejoin` fires on time rather than at the worker's next
+/// unrelated timer (the heartbeat watchdog, ~3 s after its last step). `receive: false`: no
+/// `DriverDisconnect` → `LinkDown` wake masks the bug.
+#[test]
+fn a_deadline_armed_off_the_worker_fires_on_time() {
+    let _serial = TEST_LOCK.lock();
+    let (b, _peer) = bell();
+    let raw = RawVoiceSettings {
+        receive: false,
+        driver_retries: 1,
+        driver_timeout_s: 1.0,
+        ..RawVoiceSettings::default()
+    };
+    let conn = ConnShared::new(params(Clock::Real, raw), b).unwrap();
+    conn.request_join(NonZeroU64::new(10).unwrap(), false, false);
+    conn.on_voice_state("s", Some(10));
+    // Port 1 on loopback refuses at once: the attempt fails and the rejoin backoff is armed.
+    conn.on_voice_server("t", Some("127.0.0.1:1"));
+    let mut due = None;
+    assert!(wait_until(Duration::from_secs(5), || {
+        due = (conn.status().state == "reconnecting")
+            .then(|| conn.next_deadline())
+            .flatten();
+        due.is_some()
+    }));
+    let due = due.unwrap();
+    let mut out = Vec::new();
+    let mut rejoined = None;
+    assert!(wait_until(Duration::from_secs(6), || {
+        out.clear();
+        conn.take_controls(8, &mut out);
+        if out.iter().any(|c| matches!(c, Control::Rejoin { .. })) {
+            rejoined = Some(Instant::now());
+        }
+        rejoined.is_some()
+    }));
+    conn.close(CloseReason::Cleanup);
+    let late = rejoined.unwrap().saturating_duration_since(due);
+    assert!(
+        late < Duration::from_millis(500),
+        "Rejoin fired {late:?} after its deadline"
+    );
+}
+
 #[test]
 fn dropping_the_last_reference_closes() {
     let _serial = TEST_LOCK.lock();

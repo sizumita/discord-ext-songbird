@@ -319,6 +319,73 @@ fn connection_close_wakes_writers() {
     ));
 }
 
+/// A decode failure while a writer is parked on ring space wakes it at once (to
+/// `StreamClosed`), even self-muted, when the decoded lookahead never drains and the track
+/// never ends.
+#[test]
+fn a_decode_failure_wakes_a_writer_parked_on_ring_space() {
+    let _s = SERIAL.lock();
+    set_role(Role::Harness);
+    let (hub, _bell) = test_hub();
+    let (done, _flags) = guard();
+    let (shared, input) = spawn_encoded_with(
+        EncodedSpec {
+            max_buffer_bytes: 64 << 10,
+            volume: 1.0,
+        },
+        hub.alloc().unwrap(),
+        done,
+        Arc::new(AtomicBool::new(true)), // self-muted: the mixer consumes nothing
+        Clock::Real,
+    )
+    .unwrap();
+    let _input = input;
+    let samples: Vec<i16> = (0..48_000 * 2 * 3)
+        .map(|i| ((i as f64 * 0.01).sin() * 8000.0) as i16)
+        .collect();
+    let bytes = wav(48_000, 2, &samples);
+    // Fill the ring until the writer parks: the decode thread blocks on the full (1 s) internal
+    // queue, so the ring stops draining.
+    let mut pos = 0;
+    let t = Instant::now();
+    loop {
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "the writer never parked"
+        );
+        let n = 16_384.min(bytes.len() - pos);
+        match shared.write(&bytes[pos..pos + n]) {
+            Ok(()) => pos += n,
+            Err(CoreError::PlaybackFull { .. }) => {
+                if !shared.arm_space(n) {
+                    std::thread::sleep(Duration::from_millis(50));
+                    if !shared.arm_space(n) {
+                        break;
+                    }
+                }
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    let mut ready = Vec::new();
+    hub.take_ready(&mut ready);
+    ready.clear();
+    // `decode_main`'s `Outcome::Failed` branch.
+    shared.decode_failed();
+    hub.take_ready(&mut ready);
+    assert_eq!(
+        ready,
+        vec![shared.wake_id().0],
+        "the parked writer was not woken"
+    );
+    assert!(shared.arm_space(1));
+    assert!(matches!(
+        shared.write(&[0]),
+        Err(CoreError::StreamClosed(CloseReason::Closed))
+    ));
+    LiveSource::close(&*shared, CloseMode::Abort);
+}
+
 #[test]
 fn abandon_after_finish_lets_the_stream_play_out() {
     let _s = SERIAL.lock();

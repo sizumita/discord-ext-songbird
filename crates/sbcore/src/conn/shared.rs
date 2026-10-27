@@ -898,9 +898,10 @@ impl ConnShared {
             return;
         }
         let kind = input_kind(&input);
-        let unlisted = {
+        let (unlisted, rearmed) = {
             let mut gw = lock_checked(&self.gw); // L2
             let before = gw.unlisted_inputs();
+            let deadline_before = gw.next_deadline();
             let mut batch: SmallVec<[GwAction; 4]> = SmallVec::new();
             gw.step(input, self.clock.now(), &mut batch); // pure; no I/O
             if !batch.is_empty() {
@@ -911,7 +912,11 @@ impl ConnShared {
                     actions: batch,
                 });
             }
-            gw.unlisted_inputs() != before
+            let deadline_after = gw.next_deadline();
+            (
+                gw.unlisted_inputs() != before,
+                deadline_after.is_some() && deadline_after != deadline_before,
+            )
         }; // L2 released HERE
         if unlisted {
             self.stats
@@ -922,6 +927,14 @@ impl ConnShared {
             }
         }
         self.run_pending();
+        if rearmed {
+            // Gateway deadlines (rejoin backoff, Rejoining timeout, move fallback) are only checked
+            // by the ConnWorker's step. A step on another thread (the connect task, Dispatch, a
+            // Python thread) that arms a new one must wake the worker, or it sleeps until its
+            // next unrelated timer (the heartbeat watchdog, up to 3 s) and the deadline fires
+            // late. `notify_one` stores a permit, so the wake is never lost.
+            self.worker.wake();
+        }
     }
 
     /// Flat combining: whoever wins `executing` drains every queued batch in order; losers return

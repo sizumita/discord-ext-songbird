@@ -272,18 +272,32 @@ impl EncodedShared {
         }
     }
 
-    /// Closes the ring (wakes the decode thread and any waiter); queued bytes are freed.
+    /// Closes the ring (wakes the decode thread and any waiter); queued bytes are freed. A writer
+    /// parked on ring space (`PlaybackFull` + `arm_space`) is woken through the token: zeroing
+    /// `space_wanted` disarms the housekeeper's space check, so nothing else would ring it until
+    /// the decoded audio played out (never, while self-muted). Never called on a mixer thread.
     fn close_ring(&self) {
         self.closed.store(true, Ordering::Release);
-        let old = {
-            let mut g = lock_checked(&self.ring.inner);
+        let (old, writer_parked) = {
+            let mut g = lock_checked(&self.ring.inner); // L8
             g.closed = true;
-            g.space_wanted = 0;
-            std::mem::take(&mut g.bytes)
+            let parked = std::mem::take(&mut g.space_wanted) > 0;
+            (std::mem::take(&mut g.bytes), parked)
         };
         drop(old);
         self.ring.readable.notify_all();
         self.space.notify_all();
+        if writer_parked {
+            self.token.notify();
+        }
+    }
+
+    /// The decode thread gave up (unrecognised data, a fatal decode error or a panic): the ring
+    /// closes (a parked writer wakes to `StreamClosed`) and the track ends with reason `error`
+    /// once the decoded audio has played.
+    fn decode_failed(&self) {
+        self.close_ring();
+        self.pcm.fail();
     }
 
     /// Waits (bounded) until the internal queue can take `frames`; `false` once closed.
@@ -760,8 +774,7 @@ fn decode_main(shared: Arc<EncodedShared>, flags: Arc<TrackFlags>, slot: WorkerS
                 shared.id
             );
             flags.hint(DECODE_ERROR);
-            shared.close_ring();
-            shared.pcm.fail();
+            shared.decode_failed();
         }
     }
     #[cfg(test)]

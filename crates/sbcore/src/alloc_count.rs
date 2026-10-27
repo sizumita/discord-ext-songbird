@@ -11,6 +11,7 @@ use std::cell::Cell;
 thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
     static COUNT: Cell<u64> = const { Cell::new(0) };
+    static FREES: Cell<u64> = const { Cell::new(0) };
 }
 
 #[inline]
@@ -18,6 +19,14 @@ fn record() {
     let active = ACTIVE.try_with(Cell::get).unwrap_or(false);
     if active {
         let _ = COUNT.try_with(|c| c.set(c.get().wrapping_add(1)));
+    }
+}
+
+#[inline]
+fn record_free() {
+    let active = ACTIVE.try_with(Cell::get).unwrap_or(false);
+    if active {
+        let _ = FREES.try_with(|c| c.set(c.get().wrapping_add(1)));
     }
 }
 
@@ -46,6 +55,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        record_free();
         // SAFETY: forwarded unchanged.
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -81,6 +91,11 @@ pub fn count() -> u64 {
     COUNT.try_with(Cell::get).unwrap_or(0)
 }
 
+/// Frees counted on the calling thread so far (inside guards; `realloc` counts as an allocation).
+pub fn frees() -> u64 {
+    FREES.try_with(Cell::get).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,6 +108,9 @@ mod tests {
         let g = CountGuard::new();
         let w: Vec<u8> = Vec::with_capacity(10);
         assert_eq!(count(), before + 1);
+        let freed = frees();
+        drop(Vec::<u8>::with_capacity(10));
+        assert_eq!(frees(), freed + 1);
         std::thread::spawn(|| {
             let _x: Vec<u8> = Vec::with_capacity(10);
         })

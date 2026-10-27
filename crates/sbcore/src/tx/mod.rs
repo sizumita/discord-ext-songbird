@@ -10,6 +10,7 @@ pub mod anchor;
 pub mod decoder;
 pub mod encoded;
 pub mod housekeep;
+pub(crate) mod keep;
 pub mod memory;
 pub mod opus_stream;
 pub mod probe;

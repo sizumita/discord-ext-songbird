@@ -337,6 +337,29 @@ fn a_loop_rewind_clears_eof_so_a_later_stop_all_reports_stopped() {
     }
 }
 
+/// A thread that reads an `AudioFile` input (songbird's live mixer worker) is tagged
+/// `Role::Mixer`, so dependency logs are dropped there; a NET (probe) thread keeps its role.
+#[test]
+fn done_source_reads_tag_an_untagged_thread_as_mixer() {
+    use crate::runtime::role;
+    for (start, end) in [(Role::Unknown, Role::Mixer), (Role::Net, Role::Net)] {
+        let got = std::thread::spawn(move || {
+            if start != Role::Unknown {
+                set_role(start);
+            }
+            assert_eq!(role(), start);
+            let (done, _flags) = guard();
+            let mut src = DoneSource::new(Cursor::new(ArcBytes(Arc::new(vec![1u8; 4]))), done);
+            let mut buf = [0u8; 4];
+            assert_eq!(src.read(&mut buf).unwrap(), 4);
+            role()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(got, end);
+    }
+}
+
 #[test]
 fn resampled_size_is_capped_before_allocating() {
     let max = MAX_SOURCE_BYTES as u64;

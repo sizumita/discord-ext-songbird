@@ -54,3 +54,9 @@ pub fn fail_track(t: &TrackRef, message: &str) -> bool {
 pub fn alloc_count() -> u64 {
     crate::alloc_count::count()
 }
+
+/// A background thread holds the connection registry lock (L10) for `d`; returns once it is held.
+/// A `fork()` meanwhile leaves the child a locked copy whose owner does not exist (§4.10).
+pub fn hold_registry_lock(d: std::time::Duration) {
+    crate::conn::registry::hold_lock_for(d);
+}

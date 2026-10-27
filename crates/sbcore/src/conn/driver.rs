@@ -106,6 +106,8 @@ impl OwnedDriver {
         self.d.play(t)
     }
 
+    /// `SetTrack(None)`: songbird drops every input inline on the mixer (or the Idle task). Memory
+    /// buffers survive that drop: `tx::keep` holds them and frees them on RX.
     pub(crate) fn stop(&mut self) {
         let _g = runtime::net().enter();
         self.d.stop();
@@ -145,7 +147,8 @@ impl OwnedDriver {
     }
 
     /// T2–T4: drop every `Dispatch` clone, stop all tracks (dropped inline on the mixer or Idle
-    /// task), leave, then drop the Driver (`Poison`).
+    /// task; their memory buffers are freed later on RX by `tx::keep`), leave, then drop the Driver
+    /// (`Poison`).
     pub(crate) fn teardown(self) {
         let OwnedDriver { mut d, _live, .. } = self;
         let _g = runtime::net().enter();

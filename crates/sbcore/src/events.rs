@@ -346,19 +346,23 @@ impl EventQueue {
     /// queued events now. Idempotent, and first close wins: a queue T6 already closed keeps its
     /// events (ending with `Disconnected`) readable, since `SongbirdClient.cleanup()` closes every
     /// child stream right after the connection closed (§6.5, §8.11). The hub prunes it on its next
-    /// `emit`/`subscribe`.
+    /// `emit`/`subscribe`. Wakes an armed consumer (I5, §13.5): a task parked in `async for` on
+    /// this stream must observe the close now, since no later `emit` rings a closed queue.
     pub fn close(&self) {
-        let freed = {
-            let mut g = self.inner.lock();
+        let (notify, freed) = {
+            let mut g = self.inner.lock(); // L5q
             if g.closed.is_some() {
                 return;
             }
             g.closed = Some(CloseReason::Closed);
             self.closed_flag.store(true, Ordering::Release);
             g.lagged = 0;
-            std::mem::take(&mut g.items)
+            (std::mem::take(&mut g.armed), std::mem::take(&mut g.items))
         };
         drop(freed);
+        if notify {
+            self.token.notify();
+        }
     }
 
     /// Whether the queue is closed (queued events may still be readable).
@@ -548,6 +552,37 @@ mod tests {
             q.try_pop(),
             Pop::Closed(CloseReason::ConnectionClosed)
         ));
+    }
+
+    /// The subscriber's own `close()` wakes a consumer that armed the queue (lost-wakeup
+    /// regression: `emit` skips closed queues, so nothing else would ring this id).
+    #[test]
+    fn subscriber_close_wakes_armed_consumer() {
+        let (hub, wake, _peer) = hub_with_wake();
+        let q = hub
+            .subscribe(4, KindMask::ALL, wake.alloc().unwrap())
+            .unwrap();
+        let idle = hub
+            .subscribe(4, KindMask::ALL, wake.alloc().unwrap())
+            .unwrap();
+        assert!(matches!(q.try_pop_or_arm(), Pop::Empty));
+        // From a foreign thread, as `EventStream.close()` may run anywhere.
+        let q2 = q.clone();
+        std::thread::spawn(move || q2.close()).join().unwrap();
+        // An unarmed queue's close rings nothing.
+        idle.close();
+        let mut ready = Vec::new();
+        wake.take_ready(&mut ready);
+        assert_eq!(ready, vec![q.wake_id().0]);
+        assert!(matches!(
+            q.try_pop_or_arm(),
+            Pop::Closed(CloseReason::Closed)
+        ));
+        // Idempotent: a second close does not ring again.
+        q.close();
+        ready.clear();
+        wake.take_ready(&mut ready);
+        assert!(ready.is_empty());
     }
 
     #[test]

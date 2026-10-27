@@ -75,6 +75,16 @@ impl AsRef<[u8]> for ArcBytes {
     }
 }
 
+/// One track's view of shared bytes: a per-track `Arc` that `keep` also holds (§5.2).
+#[derive(Debug)]
+pub(crate) struct TrackBytes(Arc<ArcBytes>);
+
+impl AsRef<[u8]> for TrackBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.0.as_slice()
+    }
+}
+
 /// Wraps the media source of one played `AudioFile`: records `EOF_SEEN` when a read returns 0
 /// and drops the track's `DoneGuard` with the input (§7.9).
 pub(crate) struct DoneSource<M: MediaSource> {
@@ -95,6 +105,11 @@ impl<M: MediaSource> DoneSource<M> {
 
 impl<M: MediaSource> Read for DoneSource<M> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // songbird and symphonia decode a playing `AudioFile` on the live mixer thread through
+        // this read: tag it, so a mixer that has hosted only file tracks also drops dependency
+        // log records (symphonia warns per corrupt frame) instead of formatting them (§5.2). Probe
+        // reads on the BlockyTaskPool keep `Role::Net` (`enter_mixer` only upgrades `Unknown`).
+        enter_mixer();
         let n = self.inner.read(buf)?;
         if n == 0 && !buf.is_empty() {
             self.done.flags().hint(EOF_SEEN);
@@ -166,9 +181,19 @@ impl EncodedBytes {
         self.data.as_slice()
     }
 
-    /// A songbird input over a fresh cursor (songbird probes it on its BlockyTaskPool).
+    /// The shared buffer, weakly (tests: who frees it).
+    #[cfg(test)]
+    pub(crate) fn buffer_weak(&self) -> std::sync::Weak<Vec<u8>> {
+        Arc::downgrade(&self.data)
+    }
+
+    /// A songbird input over a fresh cursor (songbird probes it on its BlockyTaskPool). The
+    /// cursor reaches the bytes through a per-track `Arc` that `keep` holds until the input is
+    /// gone, so the mixer never frees them (§5.2).
     pub(crate) fn to_input(&self, done: DoneGuard) -> Input {
-        let src = DoneSource::new(Cursor::new(ArcBytes(self.data.clone())), done);
+        let per_track = Arc::new(ArcBytes(self.data.clone()));
+        super::keep::hold(per_track.clone());
+        let src = DoneSource::new(Cursor::new(TrackBytes(per_track)), done);
         Input::Live(
             LiveInput::Raw(AudioStream {
                 input: Box::new(src),
@@ -384,13 +409,15 @@ impl MemPcm {
         self.fmt.ms_for_frames(self.frames())
     }
 
-    /// A songbird input playing these samples from the start (seekable, loopable).
+    /// A songbird input playing these samples from the start (seekable, loopable). `keep` holds
+    /// the per-track cursor until the input is gone, so the mixer never frees the samples (§5.2).
     pub(crate) fn to_input(self: &Arc<Self>, done: DoneGuard) -> Result<Input, CoreError> {
         let cursor = Arc::new(MemPcmCursor {
             pcm: self.clone(),
             pos: AtomicU64::new(0),
             generation: AtomicU64::new(0),
         });
+        super::keep::hold(cursor.clone());
         super::reader::live_pcm_input(cursor, done, true)
     }
 }
@@ -532,6 +559,12 @@ impl OpusFrames {
         Ok(b.finish())
     }
 
+    /// The shared packet bytes, weakly (tests: who frees them).
+    #[cfg(test)]
+    pub(crate) fn buffer_weak(&self) -> std::sync::Weak<Vec<u8>> {
+        Arc::downgrade(&self.bytes)
+    }
+
     /// Number of packets.
     pub fn len(&self) -> usize {
         self.offsets.len().saturating_sub(1)
@@ -560,8 +593,15 @@ impl OpusFrames {
         let decoder = get_codec_registry()
             .make(&params, &DecoderOptions::default())
             .map_err(|e| CoreError::Source(format!("no Opus decoder: {e}")))?;
+        // A per-track `Arc` over the shared packet buffers, held by `keep` until the input is
+        // gone, so the mixer never frees them (§5.2).
+        let per_track = Arc::new(OpusFrames {
+            bytes: self.bytes.clone(),
+            offsets: self.offsets.clone(),
+        });
+        super::keep::hold(per_track.clone());
         let reader = MemOpusReader {
-            frames: self.clone(),
+            frames: per_track,
             idx: 0,
             track: Track::new(0, params),
             done,

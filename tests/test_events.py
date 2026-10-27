@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from typing import Any
 
 import pytest
@@ -99,6 +101,28 @@ async def test_event_stream_limits(connected_vc: HarnessClient) -> None:
         s.close()
     with pytest.raises(TypeError):
         vc.events(kinds=[int])
+
+
+@pytest.mark.parametrize("closer", ["same_task", "foreign_thread"])
+async def test_close_wakes_a_parked_consumer(connected_vc: HarnessClient, closer: str) -> None:
+    """``EventStream.close()`` ends an ``async for`` parked on the stream (lost-wakeup regression:
+    the native queue must ring an armed consumer on close, §13.5)."""
+    vc = connected_vc
+    events = vc.events()
+
+    async def consume() -> list[Any]:
+        return [e async for e in events]
+
+    consumer = asyncio.create_task(consume())
+    await asyncio.sleep(0.05)
+    assert not consumer.done()
+    if closer == "same_task":
+        events.close()
+    else:
+        t = threading.Thread(target=events.close)
+        t.start()
+        t.join(5)
+    assert await asyncio.wait_for(consumer, 2) == []
 
 
 async def test_receive_off_still_reports_users(world: Any, testing: Any) -> None:
