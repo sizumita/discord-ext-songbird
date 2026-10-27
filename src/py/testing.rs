@@ -361,13 +361,21 @@ fn hold_registry_lock(py: Python<'_>, seconds: f64) -> PyResult<()> {
     Ok(())
 }
 
+/// Copies ``data`` exactly as the write and source entry points do (``bytes`` borrowed, any other
+/// buffer copied) and returns the copy, so tests can check what a concurrent writer leaves in it.
+#[pyfunction]
+fn copy_buffer<'py>(py: Python<'py>, data: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
+    let copied = crate::convert::extract_bytes(data, crate::convert::SOURCE_MAX)?;
+    Ok(PyBytes::new(py, copied.bytes()))
+}
+
 /// The `native._testing` submodule.
 #[pymodule(submodule, name = "_testing", gil_used = false)]
 pub mod testing_module {
     #[pymodule_export]
     use super::{
-        Harness, MixerHarness, alloc_count, detached_connection, encode_opus, fail_track,
-        hold_registry_lock, inject_driver_event, inject_map, inject_tick, inject_user_left,
-        inject_voice_tick_rtp, rtp_wrap, set_ops_answered, track_log,
+        Harness, MixerHarness, alloc_count, copy_buffer, detached_connection, encode_opus,
+        fail_track, hold_registry_lock, inject_driver_event, inject_map, inject_tick,
+        inject_user_left, inject_voice_tick_rtp, rtp_wrap, set_ops_answered, track_log,
     };
 }

@@ -141,7 +141,12 @@ jobs:
         run: brew install opus pkg-config cmake
 
       - uses: dtolnay/rust-toolchain@stable
+      # One cache per interpreter: both builds use the same `.venv/bin/python` path, so cargo does not
+      # rerun pyo3's build script when a cache from the other ABI (GIL vs free-threaded) is restored,
+      # and the stale pyo3 makes `import native` fail.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: python-${{ matrix.python-version }}
 
       - uses: actions/setup-python@v6
         with:

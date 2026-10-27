@@ -10,13 +10,14 @@
 //! * Every extraction takes a [`MaxBytes`]: there is no unbounded copy of a user buffer.
 //! * An `AudioChunk` carries its own format, which must equal the stream format (`InvalidAudio`).
 
-use std::ffi::CStr;
+use std::ffi::{CStr, c_char};
 use std::ops::RangeInclusive;
 
-use pyo3::buffer::PyUntypedBuffer;
 use pyo3::exceptions::{PyMemoryError, PyTypeError};
+use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyString};
+use pyo3::sync::critical_section::{with_critical_section, with_critical_section2};
+use pyo3::types::{PyBytes, PyMemoryView, PyString};
 use sbcore::limits::{LimitScalar, MAX_SOURCE_BYTES, check};
 use sbcore::tx::opus_stream::{MAX_OPUS_PACKET, OPUS_PACKET_SIZE_MSG};
 use sbcore::{Encoding, Format, LimitError, LimitNum};
@@ -118,47 +119,131 @@ fn format_str(f: &CStr) -> String {
 /// Copies a C-contiguous buffer into an owned `Vec<u8>` after checking its format against
 /// `encoding` and its size against `max` (both before allocating), releasing the buffer while still
 /// attached.
+///
+/// The exporter's memory may be written by another thread while it is copied (a `bytearray` on the
+/// free-threaded build, or any buffer written without the GIL), so Rust never forms a slice over it:
+/// CPython's `PyBuffer_ToContiguous` copies it into our allocation, inside the critical section of
+/// the exporter (and, for a `memoryview`, of the object it views). On the free-threaded build the
+/// copy is therefore one whole state with respect to that object's own mutators (`bytearray` slice
+/// assignment, …). Writes that take no lock (e.g. NumPy) may still leave a mix of old and new
+/// bytes, exactly as `bytes(buffer)` would, but never undefined behaviour.
 fn copy_buffer(
     py: Python<'_>,
     obj: &Bound<'_, PyAny>,
     encoding: Option<Encoding>,
     max: MaxBytes,
 ) -> PyResult<Vec<u8>> {
-    let buf = PyUntypedBuffer::get(obj)
-        .map_err(|_| PyTypeError::new_err("expected bytes or a buffer-protocol object"))?;
-    let result = (|| {
-        let fmt = format_str(buf.format());
-        if !format_allowed(&fmt, encoding) {
-            let enc = encoding.map_or("raw bytes", Encoding::as_str);
-            return Err(msg_exc(
-                py,
-                Exc::InvalidAudio,
-                &format!("buffer format {fmt:?} does not match the stream encoding ({enc})"),
-            ));
+    let buf = Export::get(obj)
+        .ok_or_else(|| PyTypeError::new_err("expected bytes or a buffer-protocol object"))?;
+    let fmt = format_str(buf.format());
+    if !format_allowed(&fmt, encoding) {
+        let enc = encoding.map_or("raw bytes", Encoding::as_str);
+        return Err(msg_exc(
+            py,
+            Exc::InvalidAudio,
+            &format!("buffer format {fmt:?} does not match the stream encoding ({enc})"),
+        ));
+    }
+    if !buf.is_c_contiguous() {
+        return Err(msg_exc(
+            py,
+            Exc::InvalidAudio,
+            "buffer must be C-contiguous",
+        ));
+    }
+    let len = buf.len_bytes();
+    max.check(py, len)?;
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(len)
+        .map_err(|_| PyMemoryError::new_err("allocation failed"))?;
+    if len > 0 {
+        let base = viewed_object(obj);
+        let copy = || {
+            // SAFETY: `out` has room for `len` bytes, and `buf` is a live C-contiguous export of
+            // exactly `len` bytes; CPython reads the exporter's memory, Rust only writes `out`.
+            unsafe {
+                ffi::PyBuffer_ToContiguous(
+                    out.as_mut_ptr().cast(),
+                    buf.raw(),
+                    buf.raw().len,
+                    b'C' as c_char,
+                )
+            }
+        };
+        let rc = match &base {
+            Some(base) => with_critical_section2(obj, base, copy),
+            None => with_critical_section(obj, copy),
+        };
+        if rc != 0 {
+            return Err(PyErr::fetch(py));
         }
-        if !buf.is_c_contiguous() {
-            return Err(msg_exc(
-                py,
-                Exc::InvalidAudio,
-                "buffer must be C-contiguous",
-            ));
+        // SAFETY: `PyBuffer_ToContiguous` succeeded, so it wrote all `len` bytes.
+        unsafe { out.set_len(len) };
+    }
+    Ok(out)
+}
+
+/// The object a `memoryview` views (its `obj`), whose own mutators lock that object, not the view.
+fn viewed_object<'py>(obj: &Bound<'py, PyAny>) -> Option<Bound<'py, PyAny>> {
+    let view = obj.cast::<PyMemoryView>().ok()?;
+    let base = view.getattr("obj").ok()?;
+    (!base.is_none() && !base.is(obj)).then_some(base)
+}
+
+/// A `Py_buffer` export, released on drop. It holds `Python<'py>`, so it cannot outlive the
+/// attachment `PyBuffer_Release` needs, and it is boxed because exporters may point the struct's
+/// `shape`/`strides` into itself (`PyBuffer_FillInfo`), so it must never move.
+struct Export<'py> {
+    view: Box<ffi::Py_buffer>,
+    _py: Python<'py>,
+}
+
+impl<'py> Export<'py> {
+    /// `None` (the Python error cleared) if `obj` does not export a buffer.
+    fn get(obj: &Bound<'py, PyAny>) -> Option<Self> {
+        let mut view = Box::<ffi::Py_buffer>::new_uninit();
+        // SAFETY: `view` is writable memory for one `Py_buffer`, filled when the call returns 0.
+        let rc =
+            unsafe { ffi::PyObject_GetBuffer(obj.as_ptr(), view.as_mut_ptr(), ffi::PyBUF_FULL_RO) };
+        if rc != 0 {
+            drop(PyErr::take(obj.py()));
+            return None;
         }
-        let len = buf.len_bytes();
-        max.check(py, len)?;
-        let mut out: Vec<u8> = Vec::new();
-        out.try_reserve_exact(len)
-            .map_err(|_| PyMemoryError::new_err("allocation failed"))?;
-        if len > 0 {
-            // SAFETY: the buffer is C-contiguous, exported for the whole lifetime of `buf`, and
-            // `len_bytes()` is its exact size in bytes.
-            let src =
-                unsafe { std::slice::from_raw_parts(buf.buf_ptr().cast::<u8>().cast_const(), len) };
-            out.extend_from_slice(src);
+        Some(Self {
+            // SAFETY: initialised by the successful `PyObject_GetBuffer` above.
+            view: unsafe { view.assume_init() },
+            _py: obj.py(),
+        })
+    }
+
+    fn raw(&self) -> &ffi::Py_buffer {
+        &self.view
+    }
+
+    fn format(&self) -> &CStr {
+        if self.view.format.is_null() {
+            c"B"
+        } else {
+            // SAFETY: a non-null `format` is a NUL-terminated string owned by the live export.
+            unsafe { CStr::from_ptr(self.view.format) }
         }
-        Ok(out)
-    })();
-    buf.release(py);
-    result
+    }
+
+    fn len_bytes(&self) -> usize {
+        usize::try_from(self.view.len).unwrap_or(0)
+    }
+
+    fn is_c_contiguous(&self) -> bool {
+        // SAFETY: `view` is a live export.
+        unsafe { ffi::PyBuffer_IsContiguous(self.raw(), b'C' as c_char) != 0 }
+    }
+}
+
+impl Drop for Export<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the export is live, released exactly once, and the thread is attached (`'py`).
+        unsafe { ffi::PyBuffer_Release(&mut *self.view) };
+    }
 }
 
 /// Extracts audio for a stream with `encoding`: `bytes` (borrowed) or any other C-contiguous

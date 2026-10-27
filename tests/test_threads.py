@@ -189,6 +189,35 @@ async def test_loop_jitter_while_decoding(connected_vc: HarnessClient, testing: 
     stream.close()
 
 
+@pytest.mark.real_only
+@pytest.mark.parametrize("view", ["bytearray", "memoryview"])
+def test_buffer_copy_is_one_state_of_a_concurrently_written_bytearray(testing: Any, view: str) -> None:
+    """On the free-threaded build another thread may rewrite a ``bytearray`` in place while a call
+    (``write_nowait``, ``RawPcm``, ``AudioFile``, …) copies it. The copy must be one whole state of
+    the object, never a mix of two, and never a Rust slice over memory being written (a data race):
+    it runs through CPython's own buffer copy inside the exporter's critical section."""
+    size = 1 << 20
+    first, second = b"\x11" * size, b"\x22" * size
+    data = bytearray(first)
+    src = data if view == "bytearray" else memoryview(data)
+    stop = threading.Event()
+
+    def writer() -> None:
+        while not stop.is_set():
+            data[:] = second  # same length: allowed while the buffer is exported
+            data[:] = first
+
+    t = threading.Thread(target=writer)
+    t.start()
+    try:
+        copies = [testing.copy_buffer(src) for _ in range(300)]
+    finally:
+        stop.set()
+        t.join(5)
+    torn = sum(1 for c in copies if c not in (first, second))
+    assert torn == 0, f"{torn} of {len(copies)} copies mixed two states"
+
+
 def _endless_wav_header(rate: int = 48_000, channels: int = 2) -> bytes:
     """A PCM16 WAV header announcing ten minutes of audio, so an encoded stream keeps decoding
     whatever PCM is written after it."""
