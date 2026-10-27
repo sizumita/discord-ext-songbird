@@ -51,12 +51,6 @@ The design contract is `docs/design.md`; deviations are recorded in `docs/deviat
   and public Python APIs.
 - Never block the asyncio loop thread or the songbird mixer thread; keep every buffer bounded (§10 of the design).
 
-## Tooling Preference (Serena)
-When analyzing or editing code, use Serena tools as the default approach. Prefer the JetBrains-backed
-symbol tools (e.g., `jet_brains_find_symbol`, `jet_brains_get_symbols_overview`,
-`jet_brains_find_referencing_symbols`) whenever possible to navigate and edit code precisely.
-Only fall back to plain text search when necessary.
-
 ## Testing Guidelines
 - Rust: `cargo test -p sbcore --all-features` (no libpython needed; unit tests live next to the code in
   `crates/sbcore/src/**`). Also run `cargo test -p sbcore --no-default-features --features codec-minimal`.
