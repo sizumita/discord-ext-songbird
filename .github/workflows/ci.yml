@@ -7,49 +7,158 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  CARGO_NET_RETRY: "10"
+  UV_VERSION: "0.11.7"
+
 jobs:
-  check:
-    name: Check Python ${{ matrix.python-version }}
+  lint:
+    name: Lint, invariants and stubs
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version:
-          - "3.14"
-          - "3.14t"
     steps:
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libopus-dev
+          sudo apt-get install -y libopus-dev pkg-config cmake
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
-      - run: rustup component add clippy
-
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
 
       - name: Add problem matchers
         run: echo "::add-matcher::.github/rust.json"
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python-version }}
-          allow-prereleases: true
+          python-version: "3.14"
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-          version: "0.11.7"
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.14"
+
+      - name: Sync uv project
+        run: uv sync --all-extras --dev --no-install-project --frozen --python "$pythonLocation/bin/python"
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy (all features)
+        run: PYO3_PYTHON="$PWD/.venv/bin/python" cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+      - name: clippy (codec-minimal, no arrow)
+        run: PYO3_PYTHON="$PWD/.venv/bin/python" cargo clippy --workspace --no-default-features --features codec-minimal --all-targets -- -D warnings
+
+      - name: Invariants
+        run: uv run --no-sync python scripts/check_invariants.py
+
+      - name: Stub drift (incl. deleted and untracked stubs)
+        run: |
+          rm -rf py-src/discord/ext/songbird/native
+          PYO3_PYTHON="$PWD/.venv/bin/python" cargo run --bin stub_gen
+          git status --porcelain --untracked-files=all -- py-src/discord/ext/songbird/native
+          test -z "$(git status --porcelain --untracked-files=all -- py-src/discord/ext/songbird/native)"
+
+      - name: ruff
+        run: |
+          uv run --no-sync ruff check --output-format=github
+          uv run --no-sync ruff format --diff
+
+      - name: Install the package (editable) for ty
+        run: PYO3_PYTHON="$PWD/.venv/bin/python" uv run --no-sync maturin develop
+
+      - name: ty
+        run: uv run --no-sync ty check --output-format=github
+
+  rust-tests:
+    name: Rust tests (sbcore, no libpython)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopus-dev pkg-config cmake
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (all features)
+        run: cargo test -p sbcore --all-features
+      - name: cargo test (codec-minimal)
+        run: cargo test -p sbcore --no-default-features --features codec-minimal
+
+  python-fake:
+    name: Python layer on the fake native module (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.14", "3.14t"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python-version }}
+      - name: Sync uv project
+        run: uv sync --all-extras --dev --no-install-project --frozen --python "$pythonLocation/bin/python"
+      # Exactly `just test-fake` on a fresh checkout: no build, no PYTHONPATH (conftest.py finds py-src).
+      - name: pytest (fake)
+        env:
+          SONGBIRD_TEST_NATIVE: fake
+        run: |
+          if [[ "${{ matrix.python-version }}" == *t ]]; then export PYTHON_GIL=0; fi
+          uv run --no-sync pytest -ra
+
+  python:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }} (real module, test hooks)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.14", "3.14t"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopus-dev pkg-config cmake
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install opus pkg-config cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+      # One cache per interpreter: both builds use the same `.venv/bin/python` path, so cargo does not
+      # rerun pyo3's build script when a cache from the other ABI (GIL vs free-threaded) is restored,
+      # and the stale pyo3 makes `import native` fail.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python-${{ matrix.python-version }}
+
+      - uses: actions/setup-python@v6
+        with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Syncing uv project
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python-version }}
+
+      - name: Sync uv project
         run: uv sync --all-extras --dev --no-install-project --frozen --python "$pythonLocation/bin/python"
 
       - name: Check Python ABI
@@ -60,23 +169,70 @@ jobs:
             uv run --no-sync python -c "import sys; assert sys._is_gil_enabled()"
           fi
 
-      - name: Run rustfmt
-        run: cargo fmt --all -- --check
+      - name: Build with test hooks
+        run: PYO3_PYTHON="$PWD/.venv/bin/python" uv run --no-sync maturin develop --features test-hooks
 
-      - name: Run clippy
-        run: PYO3_PYTHON="$PWD/.venv/bin/python" cargo clippy --all-features --all-targets
-
-      - name: Build wheels for checking
-        run: PYO3_PYTHON="$PWD/.venv/bin/python" uv run --no-sync maturin develop
-
-      - name: Run ruff
-        run: uv run --no-sync ruff check --output-format=github
-
-      - name: Run ruff formatter
-        run: uv run --no-sync ruff format --diff
-
-      - name: Run ty
+      - name: pytest (real)
+        env:
+          SONGBIRD_TEST_NATIVE: real
         run: |
-          ty_python_version="${{ matrix.python-version }}"
-          ty_python_version="${ty_python_version%t}"
-          uv run --no-sync ty check --output-format=github --python-version "$ty_python_version"
+          if [[ "${{ matrix.python-version }}" == *t ]]; then export PYTHON_GIL=0; fi
+          uv run --no-sync pytest -ra
+
+  windows:
+    name: "Windows (Proactor loop): wake and receive"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.14"
+      - name: Sync uv project
+        shell: bash
+        run: uv sync --all-extras --dev --no-install-project --frozen --python "$pythonLocation/python.exe"
+      - name: Build with test hooks
+        shell: bash
+        run: PYO3_PYTHON="$PWD/.venv/Scripts/python.exe" uv run --no-sync maturin develop --features test-hooks
+      - name: pytest (wake, receive)
+        shell: bash
+        env:
+          SONGBIRD_TEST_NATIVE: real
+        run: uv run --no-sync pytest -ra tests/test_wake.py tests/test_receive.py
+
+  sdist-minimal:
+    name: sdist with codec-minimal (no arrow)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopus-dev pkg-config cmake
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.14"
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - name: Install the sdist with codec-minimal
+        run: |
+          uv venv --python "$pythonLocation/bin/python" .smoke
+          VIRTUAL_ENV=.smoke uv pip install dist/*.tar.gz --config-settings="maturin.build-args=--no-default-features --features codec-minimal"
+      - name: Smoke test
+        run: .smoke/bin/python scripts/smoke.py

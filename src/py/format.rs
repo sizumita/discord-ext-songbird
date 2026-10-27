@@ -1,0 +1,246 @@
+//! `native.AudioFormat` (§9.2): the native part of the Python `AudioFormat`.
+
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyType};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use sbcore::limits::{SILENCE_MS, check};
+use sbcore::{CoreError, Encoding, Format};
+
+use crate::errors::{CoreResultExt, Exc, ensure_not_forked, msg_exc};
+
+/// Immutable raw-audio format. Little-endian, interleaved.
+///
+/// Parameters
+/// ----------
+/// sample_rate : int
+///     One of 8000, 16000, 24000, 48000.
+/// channels : int
+///     1 or 2.
+/// encoding : {"pcm16le", "f32le", "mulaw", "alaw"}, default "pcm16le"
+///     ``"mulaw"``/``"alaw"`` (G.711) require 8000 Hz mono.
+///
+/// Raises
+/// ------
+/// InvalidAudio
+///     For any other combination.
+#[gen_stub_pyclass]
+#[pyclass(
+    module = "discord.ext.songbird.native",
+    name = "AudioFormat",
+    frozen,
+    eq,
+    hash,
+    from_py_object
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PyAudioFormat {
+    pub fmt: Format,
+}
+
+impl PyAudioFormat {
+    pub fn new_from(fmt: Format) -> Self {
+        PyAudioFormat { fmt }
+    }
+
+    pub fn format(&self) -> Format {
+        self.fmt
+    }
+}
+
+fn invalid(py: Python<'_>, msg: &str) -> PyErr {
+    msg_exc(py, Exc::InvalidAudio, msg)
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyAudioFormat {
+    #[new]
+    #[pyo3(signature = (sample_rate, channels, encoding = "pcm16le"))]
+    fn py_new(
+        py: Python<'_>,
+        sample_rate: i64,
+        channels: i64,
+        #[gen_stub(override_type(type_repr = "typing.Literal['pcm16le', 'f32le', 'mulaw', 'alaw']", imports = ("typing",)))]
+        encoding: &str,
+    ) -> PyResult<Self> {
+        ensure_not_forked(py)?;
+        let enc = Encoding::parse(encoding).ok_or_else(|| {
+            invalid(
+                py,
+                &format!("unknown encoding {encoding:?}; expected pcm16le, f32le, mulaw or alaw"),
+            )
+        })?;
+        let rate = u32::try_from(sample_rate).map_err(|_| {
+            invalid(
+                py,
+                &format!("sample_rate must be 8000, 16000, 24000 or 48000 (got {sample_rate})"),
+            )
+        })?;
+        let ch = u8::try_from(channels)
+            .map_err(|_| invalid(py, &format!("channels must be 1 or 2 (got {channels})")))?;
+        Format::new(rate, ch, enc)
+            .py(py)
+            .map(PyAudioFormat::new_from)
+    }
+
+    /// Parse a format specification.
+    ///
+    /// Parameters
+    /// ----------
+    /// spec : str
+    ///     ``'pcm16_48k_stereo'``, ``'pcm16_16k'``, ``'f32_48k'``, ``'mulaw'``, ``'alaw'``,
+    ///     ``'pcm16le/48000/2'`` (encoding/rate/channels) or a preset name such as
+    ///     ``'PCM16_48K_STEREO'``.
+    ///
+    /// Returns
+    /// -------
+    /// AudioFormat
+    ///     The parsed format.
+    ///
+    /// Raises
+    /// ------
+    /// InvalidAudio
+    ///     If the specification is not recognised or the combination is invalid.
+    #[classmethod]
+    fn parse(_cls: &Bound<'_, PyType>, py: Python<'_>, spec: &str) -> PyResult<Self> {
+        ensure_not_forked(py)?;
+        Format::parse(spec).py(py).map(PyAudioFormat::new_from)
+    }
+
+    /// Sample rate in Hz.
+    #[getter]
+    fn sample_rate(&self) -> u32 {
+        self.fmt.rate.hz()
+    }
+
+    /// Number of interleaved channels (1 or 2).
+    #[getter]
+    fn channels(&self) -> u8 {
+        self.fmt.channels
+    }
+
+    /// Wire encoding.
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Literal['pcm16le', 'f32le', 'mulaw', 'alaw']", imports = ("typing",)))]
+    fn encoding(&self) -> &'static str {
+        self.fmt.encoding.as_str()
+    }
+
+    /// Bytes per sample: 2 (pcm16le), 4 (f32le), 1 (G.711).
+    #[getter]
+    fn sample_width(&self) -> usize {
+        self.fmt.sample_width()
+    }
+
+    /// ``sample_width * channels``.
+    #[getter]
+    fn frame_bytes(&self) -> usize {
+        self.fmt.frame_bytes()
+    }
+
+    /// Exact bytes per millisecond (192 for PCM16 48 kHz stereo).
+    #[getter]
+    fn bytes_per_ms(&self) -> usize {
+        self.fmt.bytes_per_ms()
+    }
+
+    /// Exact byte length of ``ms`` milliseconds.
+    ///
+    /// Parameters
+    /// ----------
+    /// ms : int
+    ///     Duration in milliseconds (``0 <= ms <= 2**32 - 1``).
+    ///
+    /// Returns
+    /// -------
+    /// int
+    ///     ``ms * bytes_per_ms``.
+    fn bytes_for(&self, py: Python<'_>, ms: i64) -> PyResult<usize> {
+        let ms = check("ms", ms, 0..=i64::from(u32::MAX)).py(py)?;
+        let ms = u32::try_from(ms).unwrap_or(u32::MAX);
+        self.fmt.bytes_for_ms(ms).py(py)
+    }
+
+    /// Duration of ``nbytes`` bytes.
+    ///
+    /// Parameters
+    /// ----------
+    /// nbytes : int
+    ///     Byte count (``>= 0``).
+    ///
+    /// Returns
+    /// -------
+    /// float
+    ///     Milliseconds.
+    fn ms_for(&self, py: Python<'_>, nbytes: i64) -> PyResult<f64> {
+        let n = check("nbytes", nbytes, 0..=i64::MAX).py(py)?;
+        Ok(n as f64 / self.fmt.bytes_per_ms() as f64)
+    }
+
+    /// ``ms`` of digital silence (0x00; µ-law 0xFF; A-law 0xD5).
+    ///
+    /// Parameters
+    /// ----------
+    /// ms : int
+    ///     ``0 <= ms <= 600_000``, checked before any arithmetic.
+    ///
+    /// Returns
+    /// -------
+    /// bytes
+    ///     ``bytes_for(ms)`` bytes of silence.
+    ///
+    /// Raises
+    /// ------
+    /// LimitExceeded
+    ///     If ``ms`` is out of range.
+    /// MemoryError
+    ///     If the allocation fails.
+    fn silence<'py>(&self, py: Python<'py>, ms: i64) -> PyResult<Bound<'py, PyBytes>> {
+        let n = silence_len(self.fmt, ms).py(py)?;
+        let byte = self.fmt.silence_byte();
+        PyBytes::new_with(py, n, |buf| {
+            buf.fill(byte);
+            Ok(())
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AudioFormat(sample_rate={}, channels={}, encoding='{}')",
+            self.fmt.rate.hz(),
+            self.fmt.channels,
+            self.fmt.encoding.as_str()
+        )
+    }
+}
+
+/// Byte length of `ms` of silence, validated against `SILENCE_MS` before any arithmetic.
+fn silence_len(fmt: Format, ms: i64) -> Result<usize, CoreError> {
+    let max = i64::try_from(*SILENCE_MS.end()).unwrap_or(i64::MAX);
+    let min = i64::try_from(*SILENCE_MS.start()).unwrap_or(0);
+    let ms = check("ms", ms, min..=max)?;
+    let n = sbcore::limits::mul_checked(
+        "ms",
+        u64::try_from(ms).unwrap_or(0),
+        fmt.bytes_per_ms() as u64,
+    )?;
+    usize::try_from(n).map_err(|_| CoreError::Alloc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn silence_len_limits() {
+        let f = sbcore::format::PCM16_48K;
+        assert_eq!(silence_len(f, 0).unwrap(), 0);
+        assert_eq!(silence_len(f, 600_000).unwrap(), 600_000 * 96);
+        assert!(matches!(silence_len(f, 600_001), Err(CoreError::Limit(_))));
+        assert!(matches!(silence_len(f, -1), Err(CoreError::Limit(_))));
+        assert!(matches!(
+            silence_len(f, 1_000_000_000_000),
+            Err(CoreError::Limit(_))
+        ));
+    }
+}

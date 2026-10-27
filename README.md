@@ -5,198 +5,109 @@
 [![PyPI - Version](https://img.shields.io/pypi/v/discord-ext-songbird)](https://pypi.org/project/discord-ext-songbird/)
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/discord-ext-songbird)](https://pypi.org/project/discord-ext-songbird/)
 
-High-performance voice backend for discord.py, powered by Songbird and written in Rust.
-
-discord-ext-songbird provides a native `VoiceProtocol` implementation for discord.py, exposing
-Songbird's Rust audio pipeline through PyO3.
+A general-purpose voice backend for discord.py 2.7, powered by
+[songbird](https://github.com/serenity-rs/songbird) and written in Rust: low-latency audio in and
+out of Discord voice channels for music bots, recorders, voice tools and bridges to other audio
+systems.
 
 ## Highlights
 
-- Drop-in `VoiceProtocol` via `SongbirdClient`
-- Low-latency playback backed by Songbird
-- Voice receive APIs (`BufferSink`, `StreamSink`)
-- Native input types for raw PCM, encoded audio, and streaming
-- PyO3/maturin extension with CPython 3.14 and free-threaded CPython 3.14 support
-- Beta release series (API may evolve)
+- **`SongbirdClient`**, a `discord.VoiceProtocol`: `await channel.connect(cls=SongbirdClient)`.
+- **Receive** continuous, silence-filled, real-time-paced per-user or mixed streams in the format
+  you need (8–48 kHz, mono/stereo, PCM16 / f32 / µ-law / A-law, 10–1000 ms chunks; Discord's
+  native 48 kHz stereo PCM16 by default), with speaking events, timestamps and drop accounting.
+  Chunks are zero-copy buffers (`bytes(chunk)`, `memoryview(chunk)`, NumPy, Arrow).
+- **Send** realtime PCM with backpressure, wall-clock gap filling from source timestamps, and
+  interruption (`clear()`) that is silent within 40 ms and reports how much of each tagged segment
+  was actually played.
+- Files, raw PCM and Opus packets with a sequential queue; push-based encoded and Opus streams.
+- **Leak-free and bounded by construction**: Rust never holds a Python object, no Rust thread ever
+  enters the interpreter, and every buffer has a validated cap.
+- CPython 3.14 and free-threaded 3.14t wheels.
 
 ## Installation
 
 ```bash
 pip install discord-ext-songbird
-```
-
-```bash
+# or
 uv add discord-ext-songbird
 ```
 
-## Quickstart
+`pyarrow` integration is optional: `pip install "discord-ext-songbird[arrow]"`.
+
+## Quick start
 
 ```python
-import pyarrow as pa
+import os
+
 import discord
 from discord.ext import songbird
-from discord.ext.songbird import player
 
 client = discord.Client(intents=discord.Intents.default())
 
+
 @client.event
-async def on_ready():
-    channel = client.get_channel(int(CHANNEL_ID))
-    if isinstance(channel, discord.VoiceChannel):
-        vc = await channel.connect(cls=songbird.SongbirdClient)
+async def on_ready() -> None:
+    channel = client.get_channel(int(os.environ["CHANNEL_ID"]))
+    assert isinstance(channel, discord.VoiceChannel)
+    vc = await songbird.connect(channel, config=songbird.VoiceConfig.low_latency())
 
-        samples = pa.array([0.0, 0.1, 0.0, -0.1], type=pa.float32())
-        source = player.RawPCMInput(samples, sample_rate=48000, channels=2)
-        track = player.Track(source).volume(0.8)
-        await vc.play(track)
+    # Play a file…
+    vc.play(await songbird.load_audio_file("hello.mp3"))
 
-client.run(DISCORD_BOT_TOKEN)
+    # …and echo the channel back, 20 ms at a time (48 kHz stereo PCM16 by default).
+    async with vc.listen_mixed() as mic, vc.open_playback() as out:
+        async for chunk in mic:
+            if chunk.speaking:
+                out.write_nowait(chunk)
+
+
+client.run(os.environ["DISCORD_BOT_TOKEN"])
 ```
 
-## Features
+Streaming to an external service (a speech recogniser, a realtime speech service, another voice
+system) uses the same two calls with the format and chunk size that service expects; see
+[Streaming to external services](docs/index.md#streaming-to-external-services) and
+[`examples/websocket_bridge.py`](examples/websocket_bridge.py).
 
-Detailed API guides are available for [voice output](docs/send.md) and
-[voice receive](docs/receive.md).
+## Documentation
 
-### Playback
-
-Use `SongbirdClient` as your voice client. Playback is driven by `Track` and `TrackHandle`.
-
-```python
-from discord.ext import songbird
-from discord.ext.songbird import player
-
-vc = await channel.connect(cls=songbird.SongbirdClient)
-track = player.Track(source)
-handle = await vc.play(track)
-handle.pause()
-```
-
-### Inputs
-
-Native input types are exported from `discord.ext.songbird.player`.
-
-- `RawPCMInput`: `pyarrow.Float32Array` PCM input
-- `AudioInput`: encoded audio in a `pyarrow.Array`
-- `StreamInput`: `asyncio.StreamReader`
-- `OpusPacketInput`: pre-encoded 20 ms Opus frames in a `pyarrow.BinaryArray`
-- `OpusPacketStreamInput`: live pre-encoded 20 ms Opus packet stream
-
-`AudioInput` and `StreamInput` no longer take a codec argument. Songbird 0.6
-detects encoded stream formats internally, so `SupportedCodec` has been removed
-from the Python API.
-For Ogg/WebM/DCA Opus sources, Songbird may use Opus passthrough internally.
-For raw Opus packets, use `OpusPacketInput` or `OpusPacketStreamInput`.
-Passthrough requires a single active track, 20 ms Opus frames, and volume `1.0`.
-
-```python
-import asyncio
-from discord.ext.songbird import player
-
-buffer = asyncio.StreamReader()
-source = player.StreamInput(buffer)
-track = player.Track(source)
-```
-
-```python
-import pyarrow as pa
-from discord.ext.songbird import player
-
-frames = pa.array([opus_frame_0, opus_frame_1], type=pa.binary())
-source = player.OpusPacketInput(frames)
-track = player.Track(source)  # keep volume at 1.0 for passthrough
-```
-
-### Voice receive
-
-Receive decoded PCM via `BufferSink` or `StreamSink`.
-
-```python
-from discord.ext.songbird import receive
-
-sink = receive.BufferSink(max_duration_secs=5)
-vc.listen(sink)
-
-async for batch in sink:
-    # batch is a pyarrow.RecordBatch with key_kind, key_id, speaking, and pcm columns
-    handle_batch(batch)
-
-async for pcm in sink[receive.VoiceKey.User(user_id)]:
-    if pcm is not None:
-        handle_pcm(pcm)
-```
-
-Receive iteration is columnar. The `pcm` column is `list<int16>` and stores all
-speaking users for a tick in one shared Arrow buffer. Per-key convenience
-iteration still returns `pyarrow.Int16Array | None`.
-SSRC to user ID mapping is tracked at the voice connection level from
-Songbird's speaking updates, so `VoiceKey.Unknown(ssrc)` is limited to packets
-seen before Discord has exposed that mapping.
+- [Overview: connecting, configuration, asyncio rules, logging, errors](docs/index.md)
+- [Sending audio](docs/send.md) — `PlaybackStream`, tracks, the queue, sources
+- [Receiving audio](docs/receive.md) — streams, chunks, events, recording
+- [Migrating from 0.5](docs/migration.md)
 
 ## Examples
 
-See `examples/` for runnable bots:
+| File | What it shows |
+|---|---|
+| [`examples/echo.py`](examples/echo.py) | Receive + playback streaming: a member's voice played back with a delay |
+| [`examples/websocket_bridge.py`](examples/websocket_bridge.py) | Generic bridge: raw PCM chunks out as binary WebSocket frames, returned audio played back, `"clear"` interrupts |
+| [`examples/record.py`](examples/record.py) | One timeline-aligned WAV per user plus a speaking-event log |
+| [`examples/music.py`](examples/music.py) | Music bot on the track queue, including queued HTTP streams |
 
-- `examples/basic.py` (PCM playback)
-- `examples/send_stream.py` (stream input)
-- `examples/receive_stream.py` (voice receive)
-
-For deeper usage notes, see [Send (Voice Output)](docs/send.md) and
-[Receive (Voice Input)](docs/receive.md).
-
-Set `DISCORD_BOT_TOKEN` and `CHANNEL_ID` before running the examples.
-
-## Requirements
-
-- Python 3.14+
-- `discord.py`
-- `pyarrow`
-
-Published CPython wheels are split by ABI. The release workflow builds regular
-`cp314` wheels and free-threaded `cp314t` wheels for the supported platforms, so
-a normal Python 3.14 environment installs the regular wheel while Python 3.14t
-installs the free-threaded wheel.
-Published wheels are built with the full Symphonia codec/format set enabled.
-Rust codec features are compile-time options, so installed wheels cannot switch
-codec sets at runtime. For a smaller source build, pass Cargo features through
-Maturin:
-
-```bash
-pip install . --config-settings="maturin.build-args=--no-default-features --features codec-minimal"
-```
+Set `DISCORD_BOT_TOKEN` (plus `BRIDGE_URL` for the bridge) and run e.g. `python examples/record.py`.
 
 ## Development
 
-```bash
-uv sync --all-extras --dev --no-install-project --python 3.14t
-uv run maturin develop
-```
-
-The default local environment uses free-threaded CPython 3.14 (`3.14t`).
-Release wheels are built separately for the normal and free-threaded ABIs
-(`cp314` and `cp314t`). To check the normal 3.14 build locally, point PyO3 at
-a GIL-enabled interpreter:
+Requirements: Rust (stable), [uv](https://docs.astral.sh/uv/), [just](https://github.com/casey/just).
+The native build also needs Opus: either libopus found by pkg-config (`apt install libopus-dev
+pkg-config`, `brew install opus pkg-config`) or CMake, with which the bundled Opus source is built.
+`just test-fake` needs neither Rust nor Opus.
 
 ```bash
-PYO3_PYTHON=/path/to/python3.14 cargo check
+uv sync --all-extras --dev --no-install-project   # dev dependencies
+just test-fake                                   # Python tests on the pure-Python fake (no build)
+just dev                                         # stubs + uv run --no-sync maturin develop
+just test                                        # Rust tests + fake + real-module tests (test hooks)
+just fmt && just check                           # format; clippy, invariants, ruff, ty (installs editable first if needed)
 ```
 
-```bash
-just build
-just fmt
-just check
-```
-
-## Contributing
-
-Issues and pull requests are welcome. Please keep changes focused and avoid committing build artifacts.
+The workspace has two crates: `crates/sbcore` (all logic; no pyo3 dependency, tested with
+`cargo test -p sbcore`) and the binding crate at the root (`discord_ext_songbird_native`, built
+by maturin into `discord.ext.songbird.native`). The Python layer lives in
+`py-src/discord/ext/songbird/`. See [`docs/design.md`](docs/design.md) for the design.
 
 ## License
 
-MIT. See `LICENSE`.
-
-## Acknowledgements
-
-- Songbird (Rust voice library)
-- discord.py (Python Discord API wrapper)
-- PyO3 (Rust bindings for Python)
+MIT. See [LICENSE](LICENSE).

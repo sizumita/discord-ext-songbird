@@ -1,0 +1,57 @@
+[package]
+name = "sbcore"
+description = "pyo3-free core of discord-ext-songbird: songbird driver ownership, DSP, queues and state machines."
+version = "0.6.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = ["codec-full"]
+codec-full = ["symphonia/all", "codec-simd"]
+codec-minimal = ["codec-pcm", "format-wav"]
+codec-simd = ["symphonia/opt-simd"]
+codec-aac = ["symphonia/aac"]
+codec-adpcm = ["symphonia/adpcm"]
+codec-alac = ["symphonia/alac"]
+codec-flac = ["symphonia/flac"]
+codec-mp1 = ["symphonia/mp1"]
+codec-mp2 = ["symphonia/mp2"]
+codec-mp3 = ["symphonia/mp3"]
+codec-pcm = ["symphonia/pcm"]
+codec-vorbis = ["symphonia/vorbis"]
+format-aiff = ["symphonia/aiff"]
+format-caf = ["symphonia/caf"]
+format-isomp4 = ["symphonia/isomp4"]
+format-mkv = ["symphonia/mkv"]
+format-ogg = ["symphonia/ogg"]
+format-wav = ["symphonia/wav"]
+# Detached connections, fake track control and the per-thread counting allocator (§13.2).
+test-hooks = []
+
+# NOTE: this crate must never depend on pyo3 or any pyo3-family crate (G1, §2.1).
+[dependencies]
+songbird = { version = "=0.6.1", default-features = false, features = ["driver", "receive", "gateway", "tws", "rustls"] }
+symphonia = { version = "=0.5.5", default-features = false }
+rubato = "=0.16.2"
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+parking_lot = "=0.12.5"
+bytes = "=1.12.1"
+bytemuck = "=1.25.2"
+async-trait = "=0.1.92"
+log = { version = "=0.4.34", features = ["std"] }
+nonmax = "=0.5.5"
+smallvec = "=1.16.4"
+thiserror = "=2.0.21"
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.191"
+
+[dev-dependencies]
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "sync", "time", "macros", "test-util"] }
