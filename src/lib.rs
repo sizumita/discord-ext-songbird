@@ -102,8 +102,9 @@ pub fn disable_after_fork() {
 #[gen_stub_pyfunction]
 #[pyfunction]
 #[pyo3(name = "_debug_live_counts")]
-pub fn debug_live_counts() -> HashMap<&'static str, u64> {
-    runtime::live_counts().into_iter().collect()
+pub fn debug_live_counts(py: Python<'_>) -> PyResult<HashMap<&'static str, u64>> {
+    ensure_not_forked(py)?;
+    Ok(runtime::live_counts().into_iter().collect())
 }
 
 pyo3_stub_gen::module_doc!(

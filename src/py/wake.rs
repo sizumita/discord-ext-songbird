@@ -57,10 +57,12 @@ impl WakeBell {
 
     /// Whether a ``Connection`` has taken the doorbell.
     #[getter]
-    fn taken(&self) -> bool {
-        self.bell
+    fn taken(&self, py: Python<'_>) -> PyResult<bool> {
+        ensure_not_forked(py)?;
+        Ok(self
+            .bell
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .is_none()
+            .is_none())
     }
 }

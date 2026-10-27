@@ -547,6 +547,7 @@ The decode mode is fixed at construction, because songbird ignores a later switc
   - `NET`, `RX`, `SCHEDULER` and `DISPOSER` are statics that are never dropped. Exit joins no Rust thread.
   - By I2, Rust threads still running during `Py_Finalize` cannot touch the interpreter.
 - **Fork.** `os.register_at_fork(after_in_child=native._disable_after_fork)` sets `FORKED`. Every native entry point in the child then raises `SongbirdError("discord.ext.songbird is unusable after fork()")`.
+  - "Every" is enforced: `check_invariants.py` requires each `#[pymethods]` method and `#[pyfunction]` of the shipped binding to check `FORKED` before its first `self.` access (PR #12 review: `OpusSink.clear()` and the `arm_*` methods took queue locks unguarded). Exempt are the immutable value classes (`AudioChunk`, `AudioFormat`, the status/stats/progress snapshots, `TrackInfo`, the memory sources' probe getters; their constructors are still checked) and a short lock-free list (`NativeTrack.__eq__`/`__hash__`/`__repr__`, `supported_codecs`, `_log_dropped`). `close()` methods are no-ops in the child, and `repr()` never raises. `test_shutdown.py` calls every public method and property of every inherited handle in a forked child.
   - The two that cannot raise take no process-global lock in the child: `_shutdown_all()` (the inherited `atexit` hook) returns at once, and `_log_wait()` only sleeps and returns nothing. Otherwise they would take `REGISTRY` and `LOG_WAITER`, which a thread that does not exist in the child (an RX thread in `unregister`, the log thread parking) may have held at `fork()`, and the child would never exit.
   - `Drop` is not an entry point, so the check alone would not protect the parent. A `native.Connection` inherited by the child and dropped there would run T9 `shutdown(SHUT_WR)` on the doorbell socket, which the child shares with the parent, and the parent's pump would see EOF and tear down its live connection. `ConnShared` and `WakeHub` therefore record the creating pid. `close()` and every `Drop` skip T2–T9 when `FORKED` is set or `getpid()` differs, and leak the state instead. They never call `shutdown()` or touch the inherited Driver from the child.
 
@@ -3239,7 +3240,7 @@ These use pytest 9.1.1 with pytest-asyncio 1.4.1 (`asyncio_mode = "auto"`) and r
   - no deadlock (watchdog);
   - decoding 20 synthetic speakers adds < 5 ms to the `loop.call_later` jitter p99, measured against an idle
     baseline taken first in the same run (timer noise on shared CI hosts can exceed 5 ms with nothing stalling the loop; skipped on GitHub's macOS runners, whose idle noise reaches 12 ms, see I2.md).
-- **`test_shutdown.py`.** A subprocess creates connections and exits without disconnecting. It must exit with code 0, with no "Fatal Python error" and no "Future exception was never retrieved".
+- **`test_shutdown.py`.** A subprocess creates connections and exits without disconnecting. It must exit with code 0, with no "Fatal Python error" and no "Future exception was never retrieved". In a forked child, every public method and property of every inherited native handle raises `SongbirdError` (or, for `close()`, does nothing) without hanging.
 - **Rust soak (phase 3).** One hour of the pipeline (§13.1) and one hour of `LiveReader` pulls with random writes and clears.
 
 ### 13.6 Manual live matrix [live]

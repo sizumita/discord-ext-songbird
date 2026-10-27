@@ -27,6 +27,11 @@ Checked:
 * I7       No public sbcore function returns a lock guard (``lock_checked`` is the documented
            exemption: it takes a mutex the caller already owns).
 * §5.4     The four ``WakeHub`` operations on ``pending`` / the ready bits use ``SeqCst`` only.
+* §4.10    Every ``#[pymethods]`` method and ``#[pyfunction]`` of the shipped binding checks for a forked
+           child (``ensure_not_forked`` / ``check_not_forked`` / ``forked()`` / ``FORKED.load``) before its
+           first ``self.`` access, so it raises (or is a no-op) before taking a lock a vanished parent
+           thread may hold. Exempt: the immutable value classes (``FORK_VALUE_CLASSES``, except their
+           constructors) and ``FORK_EXEMPT`` (each lock-free, with the reason).
 * hard     No ``todo!()`` / ``unimplemented!()``.
 * §2.3     pyo3 without ``experimental-async`` / ``extension-module``; dropped crates stay dropped;
            ``clippy::await_holding_lock`` is denied; the binding denies ``unwrap_used``/``expect_used``.
@@ -84,6 +89,35 @@ CAPACITY_ALLOW = {
     ("crates/sbcore/src/dsp/resample.rs", "cap"): "one tick of output frames of a fixed SampleRate",
 }
 CFG_TEST = re.compile(r"#\[cfg\(\s*(?:test|all\([^()]*\btest\b[^()]*\))\s*\)\]")
+FORK_GUARD = re.compile(
+    r"\bensure_not_forked\s*\(|\bcheck_not_forked\s*\(|\bforked\s*\(\s*\)|\bFORKED\s*\.\s*load\s*\("
+)
+# Pyclasses holding only immutable data (snapshots, formats, chunks, probe results): nothing to lock.
+# Their constructors (`#[new]`, `#[staticmethod]`, `#[classmethod]`) are still checked.
+FORK_VALUE_CLASSES = {
+    "AudioChunk",
+    "AudioFile",
+    "ChunkBatch",
+    "ClearResult",
+    "ConnectionStatus",
+    "OpusPackets",
+    "PlaybackStats",
+    "PyAudioFormat",
+    "PyVoiceSettings",
+    "RawPcm",
+    "SegmentProgress",
+    "StreamStats",
+    "TrackInfo",
+}
+# Entry points that take no lock, with the reason ("<fn>" = a `#[pyfunction]`).
+FORK_EXEMPT = {
+    ("NativeTrack", "__eq__"): "Arc pointer identity",
+    ("NativeTrack", "__hash__"): "Arc pointer identity",
+    ("NativeTrack", "__repr__"): "atomics only, and a repr must not raise",
+    ("<fn>", "supported_codecs"): "a static list",
+    ("<fn>", "disable_after_fork"): "the after-fork hook itself",
+    ("<fn>", "log_dropped"): "one atomic swap",
+}
 WAKE_OPS = re.compile(r"\b(pending|ready_word)\s*\.\s*(fetch_\w+|swap|store|load|compare_exchange\w*)\s*\(")
 NON_SEQCST = re.compile(r"\b(Relaxed|Acquire|Release|AcqRel)\b")
 
@@ -482,6 +516,50 @@ def check_no_public_guards() -> None:
                 fail(f"{rel(path)}:{line_of(src, m.start())}: pub fn {m.group(1)} returns a lock guard (I7)")
 
 
+def entry_points(src: str) -> Iterator[tuple[str, str, str, str, int]]:
+    """``(class, name, attributes, body, pos)`` for every method of a ``#[pymethods]`` impl and every
+    ``#[pyfunction]`` (class ``"<fn>"``) in ``src`` (already comment-stripped)."""
+    for m in re.finditer(r"#\[pymethods\]\s*impl\s+(\w+)", src):
+        open_brace = src.find("{", m.end())
+        end = matching(src, open_brace) - 1
+        prev = open_brace + 1
+        i = prev
+        while (fm := re.compile(r"\bfn\s+(\w+)\s*[(<]").search(src, i, end)) is not None:
+            body_open = src.find("{", fm.end())
+            body_end = matching(src, body_open)
+            yield m.group(1), fm.group(1), src[prev : fm.start()], src[body_open:body_end], fm.start()
+            prev = i = body_end
+    for m in re.finditer(r"#\[pyfunction\]", src):
+        fm = re.compile(r"\bfn\s+(\w+)").search(src, m.end())
+        if fm is None:
+            continue
+        body_open = src.find("{", fm.end())
+        yield "<fn>", fm.group(1), src[m.start() : fm.start()], src[body_open : matching(src, body_open)], fm.start()
+
+
+def scan_fork_guards(label: str, text: str) -> None:
+    """§4.10 for one shipped binding file (``text`` is the raw file)."""
+    src = code_of(text)
+    for cls, name, attrs, body, pos in entry_points(src):
+        constructor = re.search(r"#\[(new|staticmethod|classmethod)\]", attrs) is not None
+        if (cls in FORK_VALUE_CLASSES and not constructor) or (cls, name) in FORK_EXEMPT:
+            continue
+        guard = FORK_GUARD.search(body)
+        first_self = re.search(r"\bself\s*\.", body)
+        if guard is None or (first_self is not None and first_self.start() < guard.start()):
+            where = name if cls == "<fn>" else f"{cls}.{name}"
+            fail(
+                f"{label}:{line_of(src, pos)}: {where} must check for a forked child before touching its "
+                f"state (`ensure_not_forked(py)?`, or a no-op `if forked()` for close) (§4.10)"
+            )
+
+
+def check_fork_guards() -> None:
+    for path in rust_files(BINDING_SRC):
+        if not is_test_only(path):
+            scan_fork_guards(rel(path), path.read_text())
+
+
 def check_wake_seqcst() -> None:
     path = SBCORE / "src" / "wake.rs"
     src = strip_comments(path.read_text())
@@ -504,6 +582,7 @@ def main() -> int:
     check_binding_holds_no_python()
     check_pyclasses()
     check_no_public_guards()
+    check_fork_guards()
     check_wake_seqcst()
     if errors:
         print(f"check_invariants: {len(errors)} violation(s)", file=sys.stderr)

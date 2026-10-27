@@ -123,8 +123,9 @@ impl ReceiveSubscription {
 
     /// The wake id rung when a chunk arrives after arming.
     #[getter]
-    fn wake_id(&self) -> u8 {
-        self.sub.queue.wake_id().0
+    fn wake_id(&self, py: Python<'_>) -> PyResult<u8> {
+        ensure_not_forked(py)?;
+        Ok(self.sub.queue.wake_id().0)
     }
 
     /// Drops everything queued; returns the milliseconds dropped.
@@ -141,8 +142,9 @@ impl ReceiveSubscription {
 
     /// ``timeline_ms`` of the stream clock origin; ``None`` until the first chunk after a reset.
     #[getter]
-    fn origin_timeline_ms(&self) -> Option<u64> {
-        self.sub.queue.origin_timeline_ms()
+    fn origin_timeline_ms(&self, py: Python<'_>) -> PyResult<Option<u64>> {
+        ensure_not_forked(py)?;
+        Ok(self.sub.queue.origin_timeline_ms())
     }
 
     /// Mixed streams only: applied at the next chunk boundary, with no gap or duplicate.
@@ -173,10 +175,11 @@ impl ReceiveSubscription {
         self.sub.set_filter(f).py(py)
     }
 
-    fn stats(&self) -> StreamStats {
-        StreamStats {
+    fn stats(&self, py: Python<'_>) -> PyResult<StreamStats> {
+        ensure_not_forked(py)?;
+        Ok(StreamStats {
             s: self.sub.queue.stats(),
-        }
+        })
     }
 
     /// Idempotent, any thread; unregisters at the next tick and frees queued chunks.
@@ -189,15 +192,17 @@ impl ReceiveSubscription {
     }
 
     #[getter]
-    fn closed(&self) -> bool {
-        self.sub.queue.is_closed()
+    fn closed(&self, py: Python<'_>) -> PyResult<bool> {
+        ensure_not_forked(py)?;
+        Ok(self.sub.queue.is_closed())
     }
 
     /// ``'closed'``, ``'connection_closed'``, ``'user_left'``, ``'overflow'`` or
     /// ``'internal_error'``.
     #[getter]
-    fn close_reason(&self) -> Option<&'static str> {
-        self.sub.queue.close_reason().map(|r| r.as_str())
+    fn close_reason(&self, py: Python<'_>) -> PyResult<Option<&'static str>> {
+        ensure_not_forked(py)?;
+        Ok(self.sub.queue.close_reason().map(|r| r.as_str()))
     }
 
     /// ``[arrow]`` Drains up to ``max_chunks`` chunks into one batch; ``None`` if empty.
@@ -234,19 +239,22 @@ impl ReceiveSubscription {
 
     /// Stream format.
     #[getter]
-    fn format(&self) -> PyAudioFormat {
-        PyAudioFormat::new_from(self.sub.queue.format())
+    fn format(&self, py: Python<'_>) -> PyResult<PyAudioFormat> {
+        ensure_not_forked(py)?;
+        Ok(PyAudioFormat::new_from(self.sub.queue.format()))
     }
 
     /// The user of a per-user stream; ``None`` for mixed streams.
     #[getter]
-    fn user_id(&self) -> Option<u64> {
-        self.sub.queue.user_id()
+    fn user_id(&self, py: Python<'_>) -> PyResult<Option<u64>> {
+        ensure_not_forked(py)?;
+        Ok(self.sub.queue.user_id())
     }
 
     #[getter]
-    fn chunk_ms(&self) -> u32 {
-        self.sub.queue.chunk_ms()
+    fn chunk_ms(&self, py: Python<'_>) -> PyResult<u32> {
+        ensure_not_forked(py)?;
+        Ok(self.sub.queue.chunk_ms())
     }
 }
 
@@ -286,14 +294,16 @@ impl RouterSubscription {
     }
 
     #[getter]
-    fn wake_id(&self) -> u8 {
-        self.router.queue.wake_id().0
+    fn wake_id(&self, py: Python<'_>) -> PyResult<u8> {
+        ensure_not_forked(py)?;
+        Ok(self.router.queue.wake_id().0)
     }
 
     /// Streams discarded because the router queue (64) overflowed.
     #[getter]
-    fn dropped(&self) -> u64 {
-        self.router.queue.dropped()
+    fn dropped(&self, py: Python<'_>) -> PyResult<u64> {
+        ensure_not_forked(py)?;
+        Ok(self.router.queue.dropped())
     }
 
     /// Closes the router; ``close_streams`` also closes every stream it created.

@@ -95,51 +95,60 @@ impl NativeTrack {
 impl NativeTrack {
     /// Stable per connection.
     #[getter]
-    fn id(&self) -> u64 {
-        self.track.flags.id
+    fn id(&self, py: Python<'_>) -> PyResult<u64> {
+        ensure_not_forked(py)?;
+        Ok(self.track.flags.id)
     }
 
     /// songbird's track uuid (``None`` until a queued entry starts).
     #[getter]
-    fn uuid(&self) -> Option<String> {
-        self.track.flags.uuid().map(format_uuid)
+    fn uuid(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        ensure_not_forked(py)?;
+        Ok(self.track.flags.uuid().map(format_uuid))
     }
 
     #[getter]
     #[gen_stub(override_return_type(type_repr = "typing.Literal['file', 'pcm', 'opus', 'playback', 'encoded_stream', 'opus_stream']", imports = ("typing",)))]
-    fn kind(&self) -> &'static str {
-        self.track.flags.kind.as_str()
+    fn kind(&self, py: Python<'_>) -> PyResult<&'static str> {
+        ensure_not_forked(py)?;
+        Ok(self.track.flags.kind.as_str())
     }
 
     #[getter]
-    fn ended(&self) -> bool {
-        self.track.flags.ended().is_some()
+    fn ended(&self, py: Python<'_>) -> PyResult<bool> {
+        ensure_not_forked(py)?;
+        Ok(self.track.flags.ended().is_some())
     }
 
     /// ``"finished"``, ``"stopped"``, ``"error"``, ``"disconnected"`` or ``None``.
     #[getter]
     #[gen_stub(override_return_type(type_repr = "typing.Literal['finished', 'stopped', 'error', 'disconnected'] | None", imports = ("typing",)))]
-    fn end_reason(&self) -> Option<&'static str> {
-        self.track.flags.ended().map(|r| r.as_str())
+    fn end_reason(&self, py: Python<'_>) -> PyResult<Option<&'static str>> {
+        ensure_not_forked(py)?;
+        Ok(self.track.flags.ended().map(|r| r.as_str()))
     }
 
     /// The error message of an ``"error"`` end.
     #[getter]
-    fn end_error(&self) -> Option<String> {
-        self.track.flags.error().map(str::to_owned)
+    fn end_error(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        ensure_not_forked(py)?;
+        Ok(self.track.flags.error().map(str::to_owned))
     }
 
     /// Whether this is a queue entry that has not started yet.
     #[getter]
-    fn pending(&self) -> bool {
-        self.is_pending()
+    fn pending(&self, py: Python<'_>) -> PyResult<bool> {
+        ensure_not_forked(py)?;
+        Ok(self.is_pending())
     }
 
     fn pause(&self, py: Python<'_>) -> PyResult<()> {
+        ensure_not_forked(py)?;
         self.control(py, PendingChange::Paused(true), TrackRef::pause)
     }
 
     fn resume(&self, py: Python<'_>) -> PyResult<()> {
+        ensure_not_forked(py)?;
         self.control(py, PendingChange::Paused(false), TrackRef::resume)
     }
 
@@ -166,12 +175,14 @@ impl NativeTrack {
 
     /// ``0.0..=4.0``. File tracks: applied by songbird's live mixer.
     fn set_volume(&self, py: Python<'_>, volume: f32) -> PyResult<()> {
+        ensure_not_forked(py)?;
         let volume = check("volume", volume, VOLUME).py(py)?;
         self.control(py, PendingChange::Volume(volume), |t| t.set_volume(volume))
     }
 
     /// ``None`` loops forever. ``TrackError`` for live sources.
     fn set_loops(&self, py: Python<'_>, count: Option<i64>) -> PyResult<()> {
+        ensure_not_forked(py)?;
         if self.track.flags.kind.is_live() {
             return Err(core_err(
                 py,

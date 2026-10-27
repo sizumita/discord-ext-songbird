@@ -494,8 +494,9 @@ impl Connection {
 
     /// Receive timeline position in ms.
     #[getter]
-    fn timeline_ms(&self) -> u64 {
-        self.shared.timeline_ms()
+    fn timeline_ms(&self, py: Python<'_>) -> PyResult<u64> {
+        ensure_not_forked(py)?;
+        Ok(self.shared.timeline_ms())
     }
 
     // ── signalling ───────────────────────────────────────────────────────────────────────────────
@@ -992,13 +993,17 @@ impl Connection {
     fn close(&self, reason: &str) -> PyResult<()> {
         let r = CloseReason::from_name(reason)
             .ok_or_else(|| PyValueError::new_err(format!("unknown close reason {reason:?}")))?;
-        self.shared.close(r);
+        // A no-op after fork() (§4.10): the child leaks the inherited connection.
+        if sbcore::runtime::check_not_forked().is_ok() {
+            self.shared.close(r);
+        }
         Ok(())
     }
 
     #[getter]
-    fn closed(&self) -> bool {
-        self.shared.is_closed()
+    fn closed(&self, py: Python<'_>) -> PyResult<bool> {
+        ensure_not_forked(py)?;
+        Ok(self.shared.is_closed())
     }
 
     /// Receive, control and health counters (§11.3).
@@ -1008,6 +1013,10 @@ impl Connection {
     }
 
     fn __repr__(&self) -> String {
+        // The status takes the gateway lock, which a vanished thread may hold after fork() (§4.10).
+        if sbcore::runtime::check_not_forked().is_err() {
+            return "<Connection (unusable after fork)>".to_owned();
+        }
         format!("<Connection state={:?}>", self.shared.status().state)
     }
 }

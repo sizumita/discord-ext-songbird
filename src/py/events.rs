@@ -261,14 +261,16 @@ impl EventSubscription {
 
     /// The wake id rung when an event arrives after arming.
     #[getter]
-    fn wake_id(&self) -> u8 {
-        self.queue.wake_id().0
+    fn wake_id(&self, py: Python<'_>) -> PyResult<u8> {
+        ensure_not_forked(py)?;
+        Ok(self.queue.wake_id().0)
     }
 
     /// Events dropped by the overflow policy.
     #[getter]
-    fn dropped(&self) -> u64 {
-        self.queue.dropped()
+    fn dropped(&self, py: Python<'_>) -> PyResult<u64> {
+        ensure_not_forked(py)?;
+        Ok(self.queue.dropped())
     }
 
     /// Idempotent; any thread.

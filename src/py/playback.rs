@@ -128,23 +128,27 @@ impl Playback {
     }
 
     /// Arms a space wake-up for ``nbytes``; ``True`` if there is already enough space.
-    fn arm_space(&self, nbytes: usize) -> bool {
-        self.q.arm_space(nbytes)
+    fn arm_space(&self, py: Python<'_>, nbytes: usize) -> PyResult<bool> {
+        ensure_not_forked(py)?;
+        Ok(self.q.arm_space(nbytes))
     }
 
     /// Releases the prebuffer gate and arms the drain wake-up; ``True`` if already drained.
-    fn arm_drain(&self) -> bool {
-        self.q.arm_drain()
+    fn arm_drain(&self, py: Python<'_>) -> PyResult<bool> {
+        ensure_not_forked(py)?;
+        Ok(self.q.arm_drain())
     }
 
     /// Arms the Active → Idle wake-up; ``True`` if already idle.
-    fn arm_idle(&self) -> bool {
-        self.q.arm_idle()
+    fn arm_idle(&self, py: Python<'_>) -> PyResult<bool> {
+        ensure_not_forked(py)?;
+        Ok(self.q.arm_idle())
     }
 
     /// Arms the reader-gone wake-up; ``True`` if the track already ended.
-    fn arm_end(&self) -> bool {
-        self.q.arm_end()
+    fn arm_end(&self, py: Python<'_>) -> PyResult<bool> {
+        ensure_not_forked(py)?;
+        Ok(self.q.arm_end())
     }
 
     /// Interruption: discards all queued audio now (any thread).
@@ -187,8 +191,9 @@ impl Playback {
     }
 
     /// Progress of the tagged segment ``tag``, if it is known.
-    fn segment(&self, tag: &str) -> Option<SegmentProgress> {
-        self.q.segment(tag).map(SegmentProgress::new)
+    fn segment(&self, py: Python<'_>, tag: &str) -> PyResult<Option<SegmentProgress>> {
+        ensure_not_forked(py)?;
+        Ok(self.q.segment(tag).map(SegmentProgress::new))
     }
 
     fn pause(&self, py: Python<'_>) -> PyResult<()> {
@@ -205,8 +210,9 @@ impl Playback {
 
     /// ``0.0..=4.0`` with a 5 ms ramp.
     #[getter]
-    fn volume(&self) -> f32 {
-        self.q.volume()
+    fn volume(&self, py: Python<'_>) -> PyResult<f32> {
+        ensure_not_forked(py)?;
+        Ok(self.q.volume())
     }
 
     #[setter]
@@ -222,39 +228,46 @@ impl Playback {
 
     /// Real audio handed to the Discord encoder.
     #[getter]
-    fn played_ms(&self) -> u64 {
-        self.q.stats().played_ms
+    fn played_ms(&self, py: Python<'_>) -> PyResult<u64> {
+        ensure_not_forked(py)?;
+        Ok(self.q.stats().played_ms)
     }
 
     /// Estimate: ``played_ms`` minus the part of ``output_latency_ms`` not yet elapsed.
     #[getter]
-    fn heard_ms(&self) -> u64 {
-        self.q.stats().heard_ms
+    fn heard_ms(&self, py: Python<'_>) -> PyResult<u64> {
+        ensure_not_forked(py)?;
+        Ok(self.q.stats().heard_ms)
     }
 
     /// Playhead including silence.
     #[getter]
-    fn position_ms(&self) -> u64 {
-        self.q.stats().position_ms
+    fn position_ms(&self, py: Python<'_>) -> PyResult<u64> {
+        ensure_not_forked(py)?;
+        Ok(self.q.stats().position_ms)
     }
 
     #[getter]
-    fn buffered_ms(&self) -> u64 {
-        self.q.stats().buffered_ms
+    fn buffered_ms(&self, py: Python<'_>) -> PyResult<u64> {
+        ensure_not_forked(py)?;
+        Ok(self.q.stats().buffered_ms)
     }
 
     #[getter]
-    fn written_ms(&self) -> u64 {
-        self.q.stats().written_ms
+    fn written_ms(&self, py: Python<'_>) -> PyResult<u64> {
+        ensure_not_forked(py)?;
+        Ok(self.q.stats().written_ms)
     }
 
     #[getter]
-    fn is_idle(&self) -> bool {
-        self.q.stats().idle
+    fn is_idle(&self, py: Python<'_>) -> PyResult<bool> {
+        ensure_not_forked(py)?;
+        Ok(self.q.stats().idle)
     }
 
-    fn stats(&self) -> PlaybackStats {
-        PlaybackStats { s: self.q.stats() }
+    fn stats(&self, py: Python<'_>) -> PyResult<PlaybackStats> {
+        ensure_not_forked(py)?;
+        Ok(PlaybackStats { s: self.q.stats() })
     }
 
     /// Closes the playback (``drain=True``: once everything queued has played). Idempotent.
@@ -267,23 +280,27 @@ impl Playback {
     }
 
     #[getter]
-    fn closed(&self) -> bool {
-        self.q.is_closed()
+    fn closed(&self, py: Python<'_>) -> PyResult<bool> {
+        ensure_not_forked(py)?;
+        Ok(self.q.is_closed())
     }
 
     #[getter]
-    fn wake_id(&self) -> u8 {
-        self.q.wake_id().0
+    fn wake_id(&self, py: Python<'_>) -> PyResult<u8> {
+        ensure_not_forked(py)?;
+        Ok(self.q.wake_id().0)
     }
 
     #[getter]
-    fn playback_id(&self) -> u32 {
-        LiveSource::id(&*self.q)
+    fn playback_id(&self, py: Python<'_>) -> PyResult<u32> {
+        ensure_not_forked(py)?;
+        Ok(LiveSource::id(&*self.q))
     }
 
     #[getter]
-    fn track(&self) -> NativeTrack {
-        NativeTrack::new(self.track.clone(), self.conn.clone())
+    fn track(&self, py: Python<'_>) -> PyResult<NativeTrack> {
+        ensure_not_forked(py)?;
+        Ok(NativeTrack::new(self.track.clone(), self.conn.clone()))
     }
 }
 
@@ -340,8 +357,9 @@ impl EncodedSink {
     }
 
     /// Arms a space wake-up for ``nbytes``; ``True`` if there is already enough space.
-    fn arm_space(&self, nbytes: usize) -> bool {
-        self.enc.arm_space(nbytes)
+    fn arm_space(&self, py: Python<'_>, nbytes: usize) -> PyResult<bool> {
+        ensure_not_forked(py)?;
+        Ok(self.enc.arm_space(nbytes))
     }
 
     /// End of input: the track ends after the decoded audio has played.
@@ -362,18 +380,21 @@ impl EncodedSink {
 
     /// Decoded audio played so far, in ms (frozen while paused, self-muted or the link is down).
     #[getter]
-    fn played_ms(&self) -> u64 {
-        self.enc.played_ms()
+    fn played_ms(&self, py: Python<'_>) -> PyResult<u64> {
+        ensure_not_forked(py)?;
+        Ok(self.enc.played_ms())
     }
 
     #[getter]
-    fn wake_id(&self) -> u8 {
-        self.enc.wake_id().0
+    fn wake_id(&self, py: Python<'_>) -> PyResult<u8> {
+        ensure_not_forked(py)?;
+        Ok(self.enc.wake_id().0)
     }
 
     #[getter]
-    fn track(&self) -> NativeTrack {
-        NativeTrack::new(self.track.clone(), self.conn.clone())
+    fn track(&self, py: Python<'_>) -> PyResult<NativeTrack> {
+        ensure_not_forked(py)?;
+        Ok(NativeTrack::new(self.track.clone(), self.conn.clone()))
     }
 }
 
@@ -430,18 +451,21 @@ impl OpusSink {
     }
 
     /// Arms a space wake-up; ``True`` if there is already space.
-    fn arm_space(&self) -> bool {
-        self.q.arm_space()
+    fn arm_space(&self, py: Python<'_>) -> PyResult<bool> {
+        ensure_not_forked(py)?;
+        Ok(self.q.arm_space())
     }
 
     /// Discards queued packets; returns the milliseconds discarded.
-    fn clear(&self) -> u64 {
-        self.q.clear()
+    fn clear(&self, py: Python<'_>) -> PyResult<u64> {
+        ensure_not_forked(py)?;
+        Ok(self.q.clear())
     }
 
     #[getter]
-    fn buffered_ms(&self) -> u64 {
-        self.q.buffered_ms()
+    fn buffered_ms(&self, py: Python<'_>) -> PyResult<u64> {
+        ensure_not_forked(py)?;
+        Ok(self.q.buffered_ms())
     }
 
     /// Idempotent (``drain=True``: once the queued packets have played).
@@ -454,13 +478,15 @@ impl OpusSink {
     }
 
     #[getter]
-    fn wake_id(&self) -> u8 {
-        self.q.wake_id().0
+    fn wake_id(&self, py: Python<'_>) -> PyResult<u8> {
+        ensure_not_forked(py)?;
+        Ok(self.q.wake_id().0)
     }
 
     #[getter]
-    fn track(&self) -> NativeTrack {
-        NativeTrack::new(self.track.clone(), self.conn.clone())
+    fn track(&self, py: Python<'_>) -> PyResult<NativeTrack> {
+        ensure_not_forked(py)?;
+        Ok(NativeTrack::new(self.track.clone(), self.conn.clone()))
     }
 }
 

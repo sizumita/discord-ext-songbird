@@ -255,3 +255,144 @@ def test_preprocessing_keeps_line_numbers() -> None:
 )
 def test_is_test_only(path: str, test_only: bool) -> None:
     assert ci.is_test_only(ROOT / path) is test_only
+
+
+# ── §4.10: entry points check for a forked child before touching state ─────────────────────────────
+
+
+def fork_guards(src: str, *, label: str = "src/py/x.rs") -> list[str]:
+    ci.errors.clear()
+    ci.scan_fork_guards(label, textwrap.dedent(src))
+    out = list(ci.errors)
+    ci.errors.clear()
+    return out
+
+
+def test_unguarded_handle_method_is_rejected() -> None:
+    """PR #12 review: ``OpusSink.clear()`` took the queue lock in a forked child."""
+    errs = fork_guards(
+        """
+        #[pymethods]
+        impl OpusSink {
+            fn clear(&self) -> u64 {
+                self.q.clear()
+            }
+        }
+        """
+    )
+    assert len(errs) == 1 and "OpusSink.clear" in errs[0] and "§4.10" in errs[0], errs
+
+
+def test_guard_after_the_first_state_access_is_rejected() -> None:
+    errs = fork_guards(
+        """
+        #[pymethods]
+        impl Playback {
+            fn stats(&self, py: Python<'_>) -> PyResult<PlaybackStats> {
+                let s = self.q.stats();
+                ensure_not_forked(py)?;
+                Ok(PlaybackStats { s })
+            }
+        }
+        """
+    )
+    assert len(errs) == 1 and "Playback.stats" in errs[0], errs
+
+
+def test_guard_in_a_comment_or_string_does_not_count() -> None:
+    errs = fork_guards(
+        """
+        #[pymethods]
+        impl OpusSink {
+            // ensure_not_forked(py)?;
+            fn clear(&self) -> u64 {
+                let _ = "ensure_not_forked(py)";
+                self.q.clear()
+            }
+        }
+        """
+    )
+    assert len(errs) == 1, errs
+
+
+def test_unguarded_pyfunction_is_rejected() -> None:
+    errs = fork_guards(
+        """
+        #[gen_stub_pyfunction]
+        #[pyfunction]
+        pub fn live_counts() -> u64 {
+            runtime::count()
+        }
+        """
+    )
+    assert len(errs) == 1 and "live_counts" in errs[0], errs
+
+
+def test_guarded_methods_and_no_op_closes_pass() -> None:
+    assert not fork_guards(
+        """
+        #[pymethods]
+        impl OpusSink {
+            fn clear(&self, py: Python<'_>) -> PyResult<u64> {
+                ensure_not_forked(py)?;
+                Ok(self.q.clear())
+            }
+            #[pyo3(signature = (drain = false))]
+            fn close(&self, drain: bool) {
+                if !forked() {
+                    LiveSource::close(&*self.q, close_mode(drain));
+                }
+            }
+            fn stop(&self) {
+                if sbcore::runtime::check_not_forked().is_ok() {
+                    self.q.stop();
+                }
+            }
+        }
+        #[pyfunction]
+        pub fn log_wait(py: Python<'_>) -> Vec<u8> {
+            if sbcore::runtime::FORKED.load(Ordering::Acquire) {
+                return Vec::new();
+            }
+            drain()
+        }
+        """
+    )
+
+
+def test_value_classes_are_exempt_except_their_constructors() -> None:
+    getter = """
+        #[pymethods]
+        impl AudioChunk {
+            #[getter]
+            fn seq(&self) -> u64 {
+                self.seq
+            }
+        }
+        """
+    assert not fork_guards(getter)
+    errs = fork_guards(
+        """
+        #[pymethods]
+        impl RawPcm {
+            #[new]
+            fn py_new(data: &Bound<'_, PyAny>) -> PyResult<Self> {
+                Ok(RawPcm { p: parse(data)? })
+            }
+        }
+        """
+    )
+    assert len(errs) == 1 and "RawPcm.py_new" in errs[0], errs
+
+
+def test_fork_exemptions_are_per_class() -> None:
+    src = """
+        #[pymethods]
+        impl {cls} {{
+            fn __hash__(&self) -> u64 {{
+                self.h
+            }}
+        }}
+        """
+    assert not fork_guards(src.format(cls="NativeTrack"))
+    assert len(fork_guards(src.format(cls="Playback"))) == 1
