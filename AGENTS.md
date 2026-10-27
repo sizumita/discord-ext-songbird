@@ -2,7 +2,8 @@
 
 This repository hosts a hybrid Rust/Python, general-purpose voice backend for `discord.py` (audio in and
 out of voice channels), built with PyO3 and `maturin`. It stays provider-neutral: no service-specific
-APIs, presets, defaults, examples or tests.
+APIs, presets, defaults, examples or tests. The one exception is `examples/lfm2_audio/`, model-specific
+example bots outside the library (`docs/deviations/lfm2-audio-examples.md`).
 The design contract is `docs/design.md`; deviations are recorded in `docs/deviations/*.md`.
 
 ## Project Structure & Module Organization
@@ -19,7 +20,9 @@ The design contract is `docs/design.md`; deviations are recorded in `docs/deviat
   `just stubs`/`just dev`); do not edit manually.
 - `tests/`: pytest suite (`tests/conftest.py`, `tests/fakes/native_fake.py` — a pure-Python fake of
   the native module).
-- `examples/`: runnable bots (`echo.py`, `websocket_bridge.py`, `record.py`, `music.py`).
+- `examples/`: runnable bots (`echo.py`, `websocket_bridge.py`, `record.py`, `music.py`), plus
+  `lfm2_audio/` (`stt.py`, `tts.py`, `voice_chat.py` on LFM2.5-Audio-1.5B-JP; they need `liquid-audio`,
+  imported lazily so the modules import and test without it).
 - `scripts/`: `check_invariants.py` (structural invariants), `smoke.py` (release smoke test).
 - Build metadata: `Cargo.toml` (workspace), `crates/sbcore/Cargo.toml`, `pyproject.toml`, `build.rs`,
   `justfile`. Build outputs go to `target/` and should not be committed.

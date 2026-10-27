@@ -85,6 +85,7 @@ system) uses the same two calls with the format and chunk size that service expe
 | [`examples/websocket_bridge.py`](examples/websocket_bridge.py) | Generic bridge: raw PCM chunks out as binary WebSocket frames, returned audio played back, `"clear"` interrupts |
 | [`examples/record.py`](examples/record.py) | One timeline-aligned WAV per user plus a speaking-event log |
 | [`examples/music.py`](examples/music.py) | Music bot on the track queue, including queued HTTP streams |
+| [`examples/lfm2_audio/`](examples/lfm2_audio/README.md) | Japanese speech-to-text, read-aloud and realtime voice chat bots on a local speech model (LFM2.5-Audio-1.5B-JP); extra setup in its README |
 
 Set `DISCORD_BOT_TOKEN` (plus `BRIDGE_URL` for the bridge) and run e.g. `python examples/record.py`.
 

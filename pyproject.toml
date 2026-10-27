@@ -93,3 +93,11 @@ python-version = "3.14"
 # The package itself is found through the editable install (`maturin develop` writes a .pth);
 # listing py-src here would make its `discord/` namespace directory shadow discord.py.
 extra-paths = ["tests"]
+
+# The LFM2.5-Audio examples import torch and liquid_audio, which are not dev dependencies (only the
+# model wrappers use them; the bot code is still checked).
+[[tool.ty.overrides]]
+include = ["examples/lfm2_audio/**"]
+
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"
