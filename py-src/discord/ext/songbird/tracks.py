@@ -231,6 +231,9 @@ class TrackQueue:
         # Lazy encoded-stream entries: native track → feed, fed only once the entry is current.
         self._feeds: dict[native.NativeTrack, Any] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
+        # Entries being fed: native track → its feed task, cancelled as soon as the track ends (a feed
+        # may wait on a stalled source indefinitely, and closing the native stream cannot wake it).
+        self._running: dict[native.NativeTrack, asyncio.Task[Any]] = {}
 
     def _wrap(self, t: native.NativeTrack) -> TrackHandle:
         return TrackHandle(t, self._pump)
@@ -357,8 +360,14 @@ class TrackQueue:
     def _prune(self) -> None:
         for t in [t for t in self._feeds if t.ended]:
             del self._feeds[t]
+        self._cancel_ended_feeds()
+
+    def _cancel_ended_feeds(self) -> None:
+        for t in [t for t in self._running if t.ended]:
+            self._running.pop(t).cancel()
 
     def _on_tracks(self) -> None:
+        self._cancel_ended_feeds()
         for t in list(self._feeds):
             if t.ended:
                 del self._feeds[t]
@@ -378,16 +387,22 @@ class TrackQueue:
             # Spawned by the pump: it is cancelled at shutdown even if the client was collected.
             task = self._pump.spawn(_feed(stream, feed), name=f"songbird-queue-feed-{t.id}")
             self._tasks.add(task)
+            self._running[t] = task
             task.add_done_callback(self._feed_done)
+            if t.ended:  # ended between the take and now: no wake-up is left to cancel it
+                self._running.pop(t).cancel()
 
     def _feed_done(self, task: asyncio.Task[Any]) -> None:
         self._tasks.discard(task)
+        for t in [t for t, running in self._running.items() if running is task]:
+            del self._running[t]
         if not task.cancelled() and (exc := task.exception()) is not None:
             _log.error("songbird queue feed %s failed", task.get_name(), exc_info=exc)
 
     def _close(self) -> None:
         """The connection closed: stop feeding (a feed may wait on its source indefinitely)."""
         self._feeds.clear()
+        self._running.clear()
         cancel_tasks(self._tasks)
 
 

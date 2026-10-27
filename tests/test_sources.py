@@ -513,3 +513,50 @@ async def test_queue_feed_ends_quietly_when_the_connection_closes(
         await asyncio.sleep(0.01)
     assert all(t.done() for t in feeds)  # the feed waiting on its source was cancelled
     assert not [r for r in caplog.records if r.levelname == "ERROR"], caplog.records
+
+
+@pytest.mark.parametrize("end", ["queue_skip", "queue_stop", "track_stop"])
+async def test_queue_feed_is_cancelled_when_its_entry_ends(
+    connected_vc: HarnessClient, caplog: pytest.LogCaptureFixture, end: str
+) -> None:
+    """A queued stream whose source stalls must not keep its feed task (and the source) alive after
+    its entry is skipped or stopped: the feed is cancelled when the track ends, not only when the
+    connection closes."""
+    vc = connected_vc
+    blocked = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def stalled() -> AsyncIterator[bytes]:
+        yield wav_bytes(40)
+        blocked.set()
+        try:
+            await asyncio.Event().wait()  # an upstream that never sends again
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        yield b""
+
+    entry = vc.queue.enqueue_stream(stalled())
+    for _ in range(3):
+        vc.harness.step(20)
+        await pump_settle()
+    await asyncio.wait_for(blocked.wait(), 2)
+    feeds = set(vc.queue._tasks)
+    assert feeds
+    with caplog.at_level("ERROR", logger="discord.ext.songbird"):
+        if end == "queue_skip":
+            vc.queue.skip()
+        elif end == "queue_stop":
+            vc.queue.stop()
+        else:
+            entry.stop()
+        for _ in range(3):
+            vc.harness.step(20)
+            await pump_settle()
+        assert (await asyncio.wait_for(entry.wait_ended(), 2)).reason == "stopped"
+        await asyncio.wait_for(cancelled.wait(), 2)
+        await asyncio.sleep(0)
+    assert all(t.done() for t in feeds)
+    assert not vc.queue._tasks and not vc.queue._running
+    assert vc.is_connected()  # only the entry ended, not the connection
+    assert not [r for r in caplog.records if r.levelname == "ERROR"], caplog.records

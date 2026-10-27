@@ -137,7 +137,7 @@ async def test_close_from_a_foreign_thread_wakes_the_loop(connected_vc: HarnessC
 
 @pytest.mark.real_only
 async def test_loop_jitter_while_decoding(connected_vc: HarnessClient, testing: Any) -> None:
-    """``loop.call_later`` jitter p99 < 5 ms while 20 speakers are decoded off the loop."""
+    """Decoding 20 speakers off the loop adds < 5 ms to the ``loop.call_later`` jitter p99."""
     vc = connected_vc
     packets = testing.encode_opus(tone(20))
     for i in range(20):
@@ -166,19 +166,26 @@ async def test_loop_jitter_while_decoding(connected_vc: HarnessClient, testing: 
         lateness.sort()
         return lateness[98]
 
+    async def best_of_three(bound: float) -> list[float]:
+        windows: list[float] = []
+        while len(windows) < 3 and (not windows or windows[-1] >= bound):
+            windows.append(await p99())
+        return windows
+
+    # Timer and scheduler noise on a shared host can exceed 5 ms with nothing stalling the loop
+    # (GitHub's macOS runners measured 6-16 ms here). So the bound is relative to the idle p99
+    # measured first, and it must hold in one of three ~1 s windows. Work that really stalls the
+    # loop (e.g. decoding while holding the GIL) adds its stall to every window and still fails.
+    idle = await best_of_three(0.001)
+    bound = min(idle) + 0.005
     t = threading.Thread(target=feeder)
     t.start()
-    # OS timer noise alone (an idle loop, no feeder) occasionally pushes one 1 s window past 5 ms
-    # on a desktop or CI host, so the bound must hold in one of three windows. Work that really
-    # stalls the loop (e.g. decoding while holding the GIL) fails every window.
-    windows: list[float] = []
     try:
-        while len(windows) < 3 and (not windows or windows[-1] >= 0.005):
-            windows.append(await p99())
+        loaded = await best_of_three(bound)
     finally:
         stop.set()
         t.join(5)
-    assert min(windows) < 0.005, windows
+    assert min(loaded) < bound, {"idle": idle, "loaded": loaded}
     stream.close()
 
 
