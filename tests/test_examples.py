@@ -8,6 +8,7 @@ import contextlib
 import importlib.util
 import json
 import sys
+import time
 import wave
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from pathlib import Path
@@ -18,13 +19,13 @@ import pytest
 from conftest import ROOT, HarnessClient, World, connect_detached, pump_settle, voice_packets, wait_for
 from discord.ext import songbird
 
-EXAMPLES = ["echo", "websocket_bridge", "record", "music"]
+EXAMPLES = ["echo", "websocket_bridge", "record", "music", "lfm2_audio/stt", "lfm2_audio/tts", "lfm2_audio/voice_chat"]
 SPEAKER, SPEAKER_SSRC = 7_000_000_000_000_001, 101
 
 
 def load_example(name: str) -> ModuleType:
     path = ROOT / "examples" / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(f"songbird_example_{name}", path)
+    spec = importlib.util.spec_from_file_location(f"songbird_example_{name.replace('/', '_')}", path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
@@ -306,3 +307,212 @@ def test_music_paths_stay_inside_the_music_dir(tmp_path: Path, monkeypatch: pyte
     assert mod.music_path("../outside.wav") is None
     assert mod.music_path("/etc/passwd") is None
     assert mod.music_path("") is None
+
+
+# ── examples/lfm2_audio: the bot logic with a fake model in place of LFM2.5-Audio ─────────────────
+
+
+async def drive(vc: HarnessClient, testing: Any, ms: int, *, voiced: bool, mixer: Any | None = None) -> None:
+    """``ms`` of manual time in 20 ms ticks, the speaker talking or not; ``mixer`` plays meanwhile."""
+    pkt = voice_packets(testing)[0]
+    for _ in range(ms // 20):
+        if voiced:
+            testing.inject_tick(vc._conn, [(SPEAKER_SSRC, pkt)], [])
+        vc.harness.step(20)
+        if mixer is not None:
+            mixer.pull(1)
+        await asyncio.sleep(0.001)
+
+
+class FakeTranscriber:
+    def __init__(self) -> None:
+        self.sizes: list[int] = []
+
+    def transcribe(self, pcm: bytearray) -> str:
+        self.sizes.append(len(pcm))
+        return f"utterance {len(self.sizes)}"
+
+
+async def test_lfm2_stt_posts_one_transcript_per_utterance(world: World, testing: Any) -> None:
+    stt = load_example("lfm2_audio/stt")
+    vc = await connect_detached(world)
+    testing.inject_map(vc._conn, SPEAKER_SSRC, SPEAKER)
+    model, posts, stop = FakeTranscriber(), [], asyncio.Event()
+
+    async def post(user_id: int, text: str) -> None:
+        posts.append((user_id, text))
+
+    task = asyncio.create_task(stt.transcribe(vc, model, post, stop))
+    await pump_settle()
+    await drive(vc, testing, 500, voiced=True)
+    await drive(vc, testing, stt.END_SILENCE_MS + 400, voiced=False)  # hangover + end of utterance
+    await wait_for(lambda: len(posts) == 1, 5)
+    await drive(vc, testing, 200, voiced=True)  # a blip shorter than MIN_SPEECH_MS
+    await drive(vc, testing, stt.END_SILENCE_MS + 400, voiced=False)
+    stop.set()
+    assert await asyncio.wait_for(task, 5) == 1
+    assert posts == [(SPEAKER, "utterance 1")]
+    assert stt.IN_FMT.bytes_for(500) <= model.sizes[0] <= stt.IN_FMT.bytes_for(500 + stt.END_SILENCE_MS + 400)
+    assert vc.is_connected()
+    await vc.disconnect()
+
+
+async def test_lfm2_stt_transcribes_the_last_utterance_when_the_connection_closes(world: World, testing: Any) -> None:
+    stt = load_example("lfm2_audio/stt")
+    vc = await connect_detached(world)
+    testing.inject_map(vc._conn, SPEAKER_SSRC, SPEAKER)
+    model, posts = FakeTranscriber(), []
+
+    async def post(user_id: int, text: str) -> None:
+        posts.append((user_id, text))
+
+    task = asyncio.create_task(stt.transcribe(vc, model, post, asyncio.Event()))  # no !stop will come
+    await pump_settle()
+    await drive(vc, testing, 500, voiced=True)
+    await pump_settle()
+    await vc.disconnect()  # mid-utterance
+    assert await asyncio.wait_for(task, 5) == 1
+    assert posts == [(SPEAKER, "utterance 1")]
+
+
+class FakeSynthesizer:
+    """80 ms frames of silence: ``frames`` per message, ``delay`` seconds apart (on the worker thread)."""
+
+    def __init__(self, fmt: songbird.AudioFormat, frames: int = 5, delay: float = 0.0) -> None:
+        self.fmt, self.frames, self.delay = fmt, frames, delay
+        self.made: dict[str, int] = {}
+
+    def synthesize(self, text: str) -> Any:
+        self.made[text] = 0
+        for _ in range(self.frames):
+            if self.delay:
+                time.sleep(self.delay)
+            self.made[text] += 1
+            yield self.fmt.silence(80)
+
+
+async def test_lfm2_tts_reads_messages_one_after_another(world: World, testing: Any) -> None:
+    tts = load_example("lfm2_audio/tts")
+    vc = await connect_detached(world)
+    model = FakeSynthesizer(tts.OUT_FMT)
+    reader = tts.Reader(vc, model)
+    task = asyncio.create_task(reader.run())
+    assert reader.say("一通目") and reader.say("二通目")
+    await wait_for(lambda: (pb := playback_of(vc)) is not None and pb.written_ms >= 400, 5)
+    speaker = playback_of(vc)
+    assert speaker is not None and speaker.format == tts.OUT_FMT
+    assert list(model.made) == ["一通目"]  # the next message waits until this one has played
+    clock = Clock(vc)
+    try:
+        clock.mixers.append(testing.MixerHarness(speaker._pb))
+        clock.pulling = True
+        await wait_for(lambda: speaker.written_ms >= 800, 10)
+        assert list(model.made) == ["一通目", "二通目"]
+        reader.stop()
+        assert await asyncio.wait_for(task, 5) == 2
+    finally:
+        await clock.stop()
+    assert not reader.say("もう遅い")
+    await vc.disconnect()
+
+
+async def test_lfm2_tts_skip_cuts_the_message_and_stops_its_generation(world: World, testing: Any) -> None:
+    tts = load_example("lfm2_audio/tts")
+    vc = await connect_detached(world)
+    model = FakeSynthesizer(tts.OUT_FMT, frames=200, delay=0.005)
+    reader = tts.Reader(vc, model)
+    task = asyncio.create_task(reader.run())
+    reader.say("長い文")
+    await wait_for(lambda: (pb := playback_of(vc)) is not None and pb.written_ms >= 400, 5)
+    speaker = playback_of(vc)
+    assert speaker is not None
+    reader.skip()
+    assert speaker.stats().clears == 1
+    made = model.made["長い文"]
+    await asyncio.sleep(0.1)
+    assert model.made["長い文"] <= made + 1 < 200  # the worker stopped after its current frame
+    model.frames, model.delay = 5, 0.0
+    reader.say("次")
+    clock = Clock(vc)
+    try:
+        clock.mixers.append(testing.MixerHarness(speaker._pb))
+        clock.pulling = True
+        await wait_for(lambda: model.made.get("次") == 5, 5)
+    finally:
+        await clock.stop()
+    await vc.disconnect()
+    assert await asyncio.wait_for(task, 5) == 2  # the connection closed: run() returns
+
+
+class FakeChatModel:
+    """Answers with ``frames`` (text id, audio frame) pairs; records the history it was given."""
+
+    def __init__(self, fmt: songbird.AudioFormat, frames: int = 10) -> None:
+        self.fmt, self.frames = fmt, frames
+        self.histories: list[list[int]] = []  # tokens per history turn, for every answer
+
+    def respond(self, history: list[Any], pcm: bytearray) -> Any:
+        assert pcm
+        self.histories.append([len(turn.tokens) for turn in history])
+        for i in range(self.frames):
+            yield i, None
+            yield ("frame", i), self.fmt.silence(80)
+
+    def text(self, turn: Any) -> str:
+        return f"{sum(isinstance(t, int) for t in turn.tokens)} words"
+
+
+async def test_lfm2_voice_chat_answers_each_utterance_with_history(world: World, testing: Any) -> None:
+    chat = load_example("lfm2_audio/voice_chat")
+    vc = await connect_detached(world)
+    testing.inject_map(vc._conn, SPEAKER_SSRC, SPEAKER)
+    model, posts, stop = FakeChatModel(chat.OUT_FMT), [], asyncio.Event()
+
+    async def post(text: str) -> None:
+        posts.append(text)
+
+    task = asyncio.create_task(chat.converse(vc, model, post, stop))
+    await wait_for(lambda: playback_of(vc) is not None, 5)
+    speaker = playback_of(vc)
+    assert speaker is not None and speaker.format == chat.OUT_FMT
+    mixer = testing.MixerHarness(speaker._pb)
+    await drive(vc, testing, 500, voiced=True)
+    await drive(vc, testing, chat.END_SILENCE_MS + 400, voiced=False)
+    await wait_for(lambda: posts == ["10 words"], 5)
+    await drive(vc, testing, 1_200, voiced=False, mixer=mixer)  # the answer (800 ms) plays out
+    await drive(vc, testing, 500, voiced=True, mixer=mixer)
+    await drive(vc, testing, chat.END_SILENCE_MS + 400, voiced=False, mixer=mixer)
+    await wait_for(lambda: len(posts) == 2, 5)
+    stop.set()
+    assert await asyncio.wait_for(task, 5) == 2
+    assert model.histories == [[], [20]]  # the second answer saw the whole first exchange
+    assert speaker.stats().clears == 0
+    await vc.disconnect()
+
+
+async def test_lfm2_voice_chat_barge_in_keeps_only_what_was_heard(world: World, testing: Any) -> None:
+    chat = load_example("lfm2_audio/voice_chat")
+    vc = await connect_detached(world)
+    testing.inject_map(vc._conn, SPEAKER_SSRC, SPEAKER)
+    model, posts = FakeChatModel(chat.OUT_FMT, frames=100), []  # an 8 s answer
+
+    async def post(text: str) -> None:
+        posts.append(text)
+
+    task = asyncio.create_task(chat.converse(vc, model, post, asyncio.Event()))
+    await wait_for(lambda: playback_of(vc) is not None, 5)
+    speaker = playback_of(vc)
+    assert speaker is not None
+    mixer = testing.MixerHarness(speaker._pb)
+    await drive(vc, testing, 500, voiced=True)
+    await drive(vc, testing, chat.END_SILENCE_MS + 400, voiced=False)
+    await wait_for(lambda: len(posts) == 1, 5)
+    await drive(vc, testing, 1_000, voiced=False, mixer=mixer)  # part of the answer plays
+    await drive(vc, testing, 500, voiced=True, mixer=mixer)  # then the user talks over it
+    assert speaker.stats().clears == 1
+    await drive(vc, testing, chat.END_SILENCE_MS + 400, voiced=False, mixer=mixer)
+    await wait_for(lambda: len(model.histories) == 2, 5)
+    (kept,) = model.histories[1]
+    assert 0 < kept < 2 * 100  # the interrupted answer is cut to what was heard
+    await vc.disconnect()
+    assert await asyncio.wait_for(task, 5) == 2

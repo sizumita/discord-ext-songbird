@@ -119,7 +119,7 @@ def test_documented_names_are_in_all() -> None:
     import re
 
     root = pathlib.Path(__file__).resolve().parent.parent
-    files = [root / "README.md", *(root / "docs").glob("*.md"), *(root / "examples").glob("*.py")]
+    files = [root / "README.md", *(root / "docs").glob("*.md"), *(root / "examples").rglob("*.py")]
     used: set[str] = set()
     for path in files:
         if path.name == "design.md":  # the design document also names internals
