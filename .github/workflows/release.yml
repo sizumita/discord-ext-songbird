@@ -220,7 +220,9 @@ jobs:
     strategy:
       matrix:
         platform:
-          - runner: macos-14
+          # Homebrew no longer ships bottles for macOS 14 (Tier 3), so formula upgrades there build from
+          # source and fail. Use a runner that still gets bottles.
+          - runner: macos-15
             target: aarch64
         python-version:
           - 3.14
@@ -234,23 +236,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
 
-      - name: Set up Homebrew
-        id: set-up-homebrew
-        uses: Homebrew/actions/setup-homebrew@main
-
-      - name: Cache Homebrew Bundler RubyGems
-        id: cache
-        uses: actions/cache@v3
-        with:
-          path: ${{ steps.set-up-homebrew.outputs.gems-path }}
-          key: ${{ runner.os }}-rubygems-${{ steps.set-up-homebrew.outputs.gems-hash }}
-          restore-keys: ${{ runner.os }}-rubygems-
-
-      - name: Install Homebrew Bundler RubyGems
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: brew install-bundler-gems
-
+      # The runner image ships Homebrew; do not upgrade formulae it already has (pkgconf).
       - name: Install opus
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_UPGRADE: "1"
         run: brew install opus pkg-config
 
       - name: Install uv
