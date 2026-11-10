@@ -198,6 +198,8 @@ pub enum GwInput {
     RxStalled {
         since: Instant,
     },
+    /// The opt-in media watchdog (`media_timeout_ms`): ticks arrive, valid media does not.
+    MediaStalled,
     HandlersLost,
     Deadline,
     Close(CloseReason),
@@ -488,6 +490,7 @@ impl GatewayState {
                 self.on_driver_disconnect(kind, reason, now, out)
             }
             GwInput::RxStalled { since } => self.on_rx_stalled(since, now, out),
+            GwInput::MediaStalled => self.on_media_stalled(now),
             GwInput::HandlersLost => {
                 if self.phase.is_open() {
                     self.reinstall(now, out);
@@ -1012,6 +1015,19 @@ impl GatewayState {
         self.reinstall(now, out);
         if now.saturating_duration_since(since) >= self.p.stall_recover && self.p.auto_recover {
             // The documented DAVE #310 / UDP-rx #315 recovery.
+            self.schedule_rejoin(1, now);
+        }
+        true
+    }
+
+    /// No valid media for `media_timeout` although ticks keep arriving. The event handlers are
+    /// alive (they deliver the ticks), so nothing is re-installed: the only recovery is a fresh
+    /// voice session (serenity-rs/songbird#310).
+    fn on_media_stalled(&mut self, now: Instant) -> bool {
+        if self.phase != Phase::Connected {
+            return false;
+        }
+        if self.p.auto_recover {
             self.schedule_rejoin(1, now);
         }
         true

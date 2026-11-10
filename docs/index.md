@@ -75,11 +75,12 @@ can be wired up while the connection is still being established). Before `connec
 | `max_decoded_users` | 64 | 1–256 concurrently decoded speakers |
 | `max_receive_mb` | 64 | 1–1024: the sum of every receive queue's bound |
 | `stall_timeout_ms` | 2000 | receive watchdog, 500–30 000 |
+| `media_timeout_ms` | `None` | opt-in media watchdog, 5000–3 600 000; see [Receive stalls](receive.md#receive-stalls) |
 | `mix_mode` | `"stereo"` | `"mono"` halves the Opus encoding cost (`low_latency()`) |
 | `bitrate` | `None` | 6000–510 000 bps; `None` = songbird default (128 kbps) |
 | `driver_timeout_s`, `driver_retries` | 10.0, 5 | per transport attempt; retries 1–10, never infinite |
 | `rejoin_attempts` | 3 | gateway-level rejoins with `reconnect=True`, 0–10 |
-| `auto_recover` | `True` | rejoin after a ≥ 5 s receive stall |
+| `auto_recover` | `True` | rejoin after a ≥ 5 s receive stall, or a media stall |
 
 Invalid values raise `LimitExceeded` (a `ValueError`) when the config is constructed.
 

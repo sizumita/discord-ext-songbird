@@ -286,6 +286,9 @@ pub struct ConnWorker {
     /// `stalled_since` of the stall already reported with `ReceiveStalled`.
     stall_reported: Option<Instant>,
     stall_last_apply: Option<Instant>,
+    /// The same pair for the opt-in media watchdog.
+    media_reported: Option<Instant>,
+    media_last_apply: Option<Instant>,
     hb_last_apply: Option<Instant>,
     _live: LiveCounter,
 }
@@ -322,6 +325,8 @@ impl ConnWorker {
             rx_closed: false,
             stall_reported: None,
             stall_last_apply: None,
+            media_reported: None,
+            media_last_apply: None,
             hb_last_apply: None,
             _live: LiveCounter::new(&live::CONN_WORKER),
         }
@@ -433,6 +438,10 @@ impl ConnWorker {
             .publish(self.pipeline.timeline_ms(), self.pipeline.counts());
         let mut next = rt.next_wake;
         next = earliest(next, self.watch_stall(conn, rt.stalled_since, now));
+        if rt.stalled_since.is_none() {
+            // A tick stall already covers "no media": one `ReceiveStalled` per outage.
+            next = earliest(next, self.watch_media(conn, rt.media_stalled_since, now));
+        }
 
         // 4. Handler liveness (heartbeat), while the Driver exists.
         next = earliest(next, self.watch_heartbeat(conn, now));
@@ -486,6 +495,41 @@ impl ConnWorker {
             conn.apply(GwInput::RxStalled { since });
         }
         self.stall_last_apply
+            .and_then(|t| t.checked_add(WATCHDOG_REPEAT))
+    }
+
+    /// The opt-in media watchdog: emits `ReceiveStalled` once per stall and feeds `MediaStalled`
+    /// to the state machine (at most once per second while the stall lasts).
+    fn watch_media(
+        &mut self,
+        conn: &Arc<ConnShared>,
+        stalled_since: Option<Instant>,
+        now: Instant,
+    ) -> Option<Instant> {
+        let Some(since) = stalled_since else {
+            self.media_reported = None;
+            self.media_last_apply = None;
+            return None;
+        };
+        if self.media_reported != Some(since) {
+            self.media_reported = Some(since);
+            self.media_last_apply = None;
+            // The receive-timeline position of the last valid media packet (or the link-up).
+            let since_ms = conn.timeline_ms_at(since);
+            conn.events().emit(&EventData::ReceiveStalled { since_ms });
+            ::log::warn!(
+                "no valid voice media for {} ms (media_timeout_ms): receive is stalled or the channel is silent",
+                now.saturating_duration_since(since).as_millis()
+            );
+        }
+        if self
+            .media_last_apply
+            .is_none_or(|t| now.saturating_duration_since(t) >= WATCHDOG_REPEAT)
+        {
+            self.media_last_apply = Some(now);
+            conn.apply(GwInput::MediaStalled);
+        }
+        self.media_last_apply
             .and_then(|t| t.checked_add(WATCHDOG_REPEAT))
     }
 
@@ -744,6 +788,46 @@ mod hooked_tests {
             events.try_pop(),
             Pop::Item(EventData::ReceiveStalled { since_ms: 5_000 })
         ));
+        conn.close(CloseReason::Cleanup);
+    }
+
+    /// Issue #16: a media stall is reported once, re-installs nothing and rejoins.
+    #[test]
+    fn media_stall_is_reported_once_and_rejoins_without_reinstall() {
+        let _serial = crate::conn::TEST_LOCK.lock();
+        let (conn, mut w, m, _peer) = detached();
+        let events = conn.subscribe_events(8, KindMask::ALL).unwrap();
+        conn.request_join(NonZeroU64::new(10).unwrap(), false, false);
+        conn.on_voice_state("s", Some(10));
+        conn.on_voice_server("t", Some("e.discord.media"));
+        assert_eq!(conn.status().state, "connected");
+        while let Pop::Item(_) = events.try_pop() {}
+
+        let since = m.now();
+        m.advance(Duration::from_secs(30));
+        let next = w.watch_media(&conn, Some(since), m.now());
+        assert_eq!(next, Some(m.now() + WATCHDOG_REPEAT));
+        assert_eq!(conn.status().state, "reconnecting");
+        m.advance(Duration::from_secs(1));
+        w.watch_media(&conn, Some(since), m.now());
+        let stalls: Vec<EventData> = std::iter::from_fn(|| match events.try_pop() {
+            Pop::Item(e @ EventData::ReceiveStalled { .. }) => Some(e),
+            _ => None,
+        })
+        .collect();
+        assert!(matches!(
+            stalls[..],
+            [EventData::ReceiveStalled { since_ms: 0 }]
+        ));
+        let stat = |name: &str| {
+            conn.stats()
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| *v)
+        };
+        assert_eq!(stat("dispatch_reinstalls"), Some(0));
+        assert_eq!(stat("ticks_media"), Some(0));
+        assert!(stat("media_age_ms").is_some() && stat("decrypt_failures").is_some());
         conn.close(CloseReason::Cleanup);
     }
 

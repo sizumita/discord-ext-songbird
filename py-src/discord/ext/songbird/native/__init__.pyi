@@ -1431,6 +1431,9 @@ class VoiceSettings:
         ``1..=1024``: the sum of all receive-queue bounds per connection.
     stall_timeout_ms : int, default 2000
         ``500..=30000`` receive watchdog.
+    media_timeout_ms : int or None, default None
+        ``5000..=3600000``; opt-in media watchdog (``None`` = off): ``ReceiveStalled`` when no
+        valid media packet arrived for this long while a receive consumer exists.
     mix_mode : {"mono", "stereo"}, default "stereo"
     bitrate : int or None, default None
         ``6000..=510000`` bps; ``None`` = songbird default.
@@ -1458,7 +1461,7 @@ class VoiceSettings:
         r"""
         Whether receive decoding is enabled.
         """
-    def __new__(cls, *, receive: builtins.bool = True, playout_buffer_ms: builtins.int = 60, playout_spike_ms: builtins.int = 60, decode_state_timeout_s: builtins.float = 60.0, speaking_hangover_ms: builtins.int = 200, voice_threshold_dbfs: typing.Optional[builtins.float] = None, max_decoded_users: builtins.int = 64, max_receive_mb: builtins.int = 64, stall_timeout_ms: builtins.int = 2000, mix_mode: typing.Literal['mono', 'stereo'] = "stereo", bitrate: typing.Optional[builtins.int] = None, softclip: builtins.bool = True, driver_timeout_s: builtins.float = 10.0, driver_retries: builtins.int = 5, rejoin_attempts: builtins.int = 3, auto_recover: builtins.bool = True) -> VoiceSettings: ...
+    def __new__(cls, *, receive: builtins.bool = True, playout_buffer_ms: builtins.int = 60, playout_spike_ms: builtins.int = 60, decode_state_timeout_s: builtins.float = 60.0, speaking_hangover_ms: builtins.int = 200, voice_threshold_dbfs: typing.Optional[builtins.float] = None, max_decoded_users: builtins.int = 64, max_receive_mb: builtins.int = 64, stall_timeout_ms: builtins.int = 2000, media_timeout_ms: typing.Optional[builtins.int] = None, mix_mode: typing.Literal['mono', 'stereo'] = "stereo", bitrate: typing.Optional[builtins.int] = None, softclip: builtins.bool = True, driver_timeout_s: builtins.float = 10.0, driver_retries: builtins.int = 5, rejoin_attempts: builtins.int = 3, auto_recover: builtins.bool = True) -> VoiceSettings: ...
     def __repr__(self) -> builtins.str: ...
 
 @typing.final

@@ -237,12 +237,13 @@ enum I {
     DiscReconnectIo,
     DiscNoReason,
     Stalled,
+    MediaStalled,
     HandlersLost,
     Deadline,
     Close,
 }
 
-const ALL_INPUTS: [I; 31] = [
+const ALL_INPUTS: [I; 32] = [
     I::Join,
     I::Move,
     I::BeginRejoin,
@@ -271,6 +272,7 @@ const ALL_INPUTS: [I; 31] = [
     I::DiscReconnectIo,
     I::DiscNoReason,
     I::Stalled,
+    I::MediaStalled,
     I::HandlersLost,
     I::Deadline,
     I::Close,
@@ -328,6 +330,7 @@ fn input(i: I, h: &mut H) -> GwInput {
         I::Stalled => GwInput::RxStalled {
             since: h.now - Duration::from_secs(6),
         },
+        I::MediaStalled => GwInput::MediaStalled,
         I::HandlersLost => GwInput::HandlersLost,
         I::Deadline => {
             h.advance(Duration::from_secs(20));
@@ -501,6 +504,11 @@ fn expected(p: P, i: I) -> Option<(P, &'static [A])> {
         },
         I::Stalled => match p {
             Ph::Connected => (Ph::AwaitingRejoin, &[Reinstall, Notify]),
+            _ => return None,
+        },
+        // No re-install: the handlers are alive, they deliver the (empty) ticks.
+        I::MediaStalled => match p {
+            Ph::Connected => (Ph::AwaitingRejoin, &[Notify]),
             _ => return None,
         },
         I::HandlersLost => match open {
@@ -1428,6 +1436,24 @@ fn rx_stalled_reinstall_is_rate_limited_and_rejoins_at_5s() {
     });
     assert_eq!(classes(&acts), [A::Reinstall]);
     assert_eq!(h.g.status().state, "connected");
+}
+
+/// The opt-in media watchdog (issue #16): a rejoin without touching the handlers, and only with
+/// `auto_recover`.
+#[test]
+fn media_stalled_rejoins_without_reinstalling() {
+    let mut h = build(P::Connected, params(true, 3));
+    let acts = h.step(GwInput::MediaStalled);
+    assert_eq!(classes(&acts), [A::Notify]);
+    assert!(matches!(h.g.phase(), Phase::AwaitingRejoin { attempt: 1, due } if due == h.now));
+
+    // auto_recover off: listed (no "unlisted input" noise), but nothing happens.
+    let mut prm = params(true, 3);
+    prm.auto_recover = false;
+    let mut h = build(P::Connected, prm);
+    assert!(h.step(GwInput::MediaStalled).is_empty());
+    assert_eq!(h.g.status().state, "connected");
+    assert_eq!(h.g.unlisted_inputs(), 0);
 }
 
 #[test]

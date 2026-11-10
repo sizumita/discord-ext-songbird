@@ -22,6 +22,8 @@ pub const MAX_DECODED_USERS: RangeInclusive<u32> = 1..=256;
 pub const MAX_RECEIVE_MB: RangeInclusive<u32> = 1..=1_024;
 /// `stall_timeout_ms` range.
 pub const STALL_TIMEOUT_MS: RangeInclusive<u32> = 500..=30_000;
+/// `media_timeout_ms` range (when set).
+pub const MEDIA_TIMEOUT_MS: RangeInclusive<u32> = 5_000..=3_600_000;
 /// `bitrate` range (bps).
 pub const BITRATE_BPS: RangeInclusive<i64> = 6_000..=510_000;
 /// `driver_timeout_s` range.
@@ -44,6 +46,8 @@ pub struct RawVoiceSettings {
     pub max_decoded_users: u32,
     pub max_receive_mb: u32,
     pub stall_timeout_ms: u32,
+    /// Opt-in media watchdog; `None` disables it.
+    pub media_timeout_ms: Option<u32>,
     pub mix_mode_mono: bool,
     pub bitrate: Option<i32>,
     pub softclip: bool,
@@ -66,6 +70,7 @@ impl Default for RawVoiceSettings {
             max_decoded_users: 64,
             max_receive_mb: 64,
             stall_timeout_ms: 2_000,
+            media_timeout_ms: None,
             mix_mode_mono: false,
             bitrate: None,
             softclip: true,
@@ -89,6 +94,7 @@ pub struct VoiceSettings {
     pub max_decoded_users: usize,
     pub max_receive_bytes: usize,
     pub stall_timeout: Duration,
+    pub media_timeout: Option<Duration>,
     pub mix_mode: MixMode,
     pub bitrate: Option<i32>,
     pub softclip: bool,
@@ -144,6 +150,10 @@ impl VoiceSettings {
         )?;
         let max_receive_mb = check("max_receive_mb", raw.max_receive_mb, MAX_RECEIVE_MB)?;
         let stall_timeout_ms = check("stall_timeout_ms", raw.stall_timeout_ms, STALL_TIMEOUT_MS)?;
+        let media_timeout_ms = match raw.media_timeout_ms {
+            Some(ms) => Some(check("media_timeout_ms", ms, MEDIA_TIMEOUT_MS)?),
+            None => None,
+        };
         let bitrate = match raw.bitrate {
             Some(b) => Some(check("bitrate", i64::from(b), BITRATE_BPS)?),
             None => None,
@@ -168,6 +178,7 @@ impl VoiceSettings {
             max_decoded_users: max_decoded_users as usize,
             max_receive_bytes,
             stall_timeout: Duration::from_millis(u64::from(stall_timeout_ms)),
+            media_timeout: media_timeout_ms.map(|ms| Duration::from_millis(u64::from(ms))),
             mix_mode: if raw.mix_mode_mono {
                 MixMode::Mono
             } else {
@@ -205,6 +216,13 @@ mod tests {
         assert_eq!(s.max_receive_bytes, 64 << 20);
         assert_eq!(s.driver_retries.get(), 5);
         assert_eq!(s.mix_mode, MixMode::Stereo);
+        assert_eq!(s.media_timeout, None, "the media watchdog is opt-in");
+        let s = VoiceSettings::validate(RawVoiceSettings {
+            media_timeout_ms: Some(30_000),
+            ..RawVoiceSettings::default()
+        })
+        .unwrap();
+        assert_eq!(s.media_timeout, Some(Duration::from_secs(30)));
     }
 
     #[test]
@@ -224,6 +242,14 @@ mod tests {
             },
             RawVoiceSettings {
                 decode_state_timeout_s: f64::NAN,
+                ..RawVoiceSettings::default()
+            },
+            RawVoiceSettings {
+                media_timeout_ms: Some(4_999),
+                ..RawVoiceSettings::default()
+            },
+            RawVoiceSettings {
+                media_timeout_ms: Some(3_600_001),
                 ..RawVoiceSettings::default()
             },
             RawVoiceSettings {

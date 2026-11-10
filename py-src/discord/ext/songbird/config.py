@@ -36,7 +36,14 @@ class VoiceConfig:
     max_receive_mb : int, default 64
         Sum of all receive-queue bounds per connection, ``1..=1024``.
     stall_timeout_ms : int, default 2000
-        Receive watchdog, ``500..=30000``.
+        Receive watchdog, ``500..=30000``: reports ``ReceiveStalled`` when songbird's receive task
+        stops delivering ticks. It cannot see a media path that died while that task keeps
+        running; see ``media_timeout_ms``.
+    media_timeout_ms : int or None, default None
+        Opt-in media watchdog, ``5000..=3600000``; ``None`` disables it. When set, and while at
+        least one receive consumer (``listen_*`` stream or router) exists, ``ReceiveStalled`` is
+        reported once no valid voice packet has arrived for this long, and ``auto_recover``
+        rejoins at once. See Notes.
     mix_mode : {"mono", "stereo"}, default "stereo"
         ``"mono"`` halves the Opus encode cost (voice bots).
     bitrate : int or None, default None
@@ -49,7 +56,8 @@ class VoiceConfig:
     rejoin_attempts : int, default 3
         Gateway-level rejoins with ``reconnect=True``, ``0..=10``.
     auto_recover : bool, default True
-        Rejoin after a receive stall of at least 5 s (DAVE / UDP-rx recovery).
+        Rejoin after a receive stall of at least 5 s (DAVE / UDP-rx recovery), and as soon as the
+        media watchdog (``media_timeout_ms``) reports one.
 
     Raises
     ------
@@ -59,6 +67,21 @@ class VoiceConfig:
         A duration is not a multiple of 20 ms.
     ValueError
         ``mix_mode`` is not ``"mono"`` or ``"stereo"``.
+
+    Notes
+    -----
+    ``media_timeout_ms`` exists because of upstream `serenity-rs/songbird#310
+    <https://github.com/serenity-rs/songbird/issues/310>`_: with DAVE, a voice session can stop
+    delivering decodable audio (after an MLS transition, or silently for every member) while the
+    driver stays connected. songbird then reports nothing: it keeps emitting its 20 ms ticks from a
+    timer, drops the undecryptable packets without an event, and a leave and rejoin is the only
+    known recovery. From the library's side this is indistinguishable from a channel where nobody
+    speaks, so the watchdog is a heuristic and stays off by default: with it enabled, a silent
+    channel is also rejoined every ``media_timeout_ms`` (members hear the bot leave and join).
+    Choose a value longer than the silences you expect, or keep ``auto_recover=False`` and decide
+    in your own ``ReceiveStalled`` handler. ``stats()`` exposes the underlying signals
+    (``ticks_media``, ``media_age_ms``, ``decrypt_failures``) for custom policies. The option may
+    become unnecessary once the upstream issue is fixed.
 
     Examples
     --------
@@ -75,6 +98,7 @@ class VoiceConfig:
     max_decoded_users: int = 64
     max_receive_mb: int = 64
     stall_timeout_ms: int = 2_000
+    media_timeout_ms: int | None = None
     mix_mode: Literal["mono", "stereo"] = "stereo"
     bitrate: int | None = None
     softclip: bool = True
@@ -115,6 +139,7 @@ class VoiceConfig:
             max_decoded_users=self.max_decoded_users,
             max_receive_mb=self.max_receive_mb,
             stall_timeout_ms=self.stall_timeout_ms,
+            media_timeout_ms=self.media_timeout_ms,
             mix_mode=self.mix_mode,
             bitrate=self.bitrate,
             softclip=self.softclip,

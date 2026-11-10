@@ -138,6 +138,35 @@ Speaking is detected from packet activity (Opus silence frames do not count) wit
 `speaking_hangover_ms`; set `VoiceConfig.voice_threshold_dbfs` to also require a minimum level.
 Joins are not observable through the voice connection; use discord.py's `on_voice_state_update`.
 
+### Receive stalls
+
+`ReceiveStalled` is reported in two situations:
+
+- **songbird's receive task stopped** (`stall_timeout_ms`, always on): no tick arrived for 2 s.
+  After 5 s, `auto_recover` rejoins.
+- **No valid media arrives although the connection is up** (`media_timeout_ms`, opt-in). This
+  watchdog was added because of upstream
+  [serenity-rs/songbird#310](https://github.com/serenity-rs/songbird/issues/310): with DAVE, a
+  session can stop delivering decodable audio while the driver stays connected, and songbird
+  reports nothing. It keeps sending its timer-driven ticks, so `status` stays `"connected"`,
+  streams keep yielding silence and the first watchdog never fires. A leave and rejoin is the
+  only known recovery.
+
+  ```python
+  cfg = VoiceConfig(media_timeout_ms=120_000)  # no voice packet for 2 min → ReceiveStalled + rejoin
+  ```
+
+  A dead media path cannot be told apart from a channel where nobody speaks, so this is a
+  heuristic and is off by default: with it enabled, a silent channel is also rejoined every
+  `media_timeout_ms`, and members hear the bot leave and join. Pick a value longer than the
+  silences you expect. It only runs while a `listen_*` stream or router exists. With
+  `auto_recover=False` you only get the event and decide yourself (`await vc.reconnect()`).
+
+For your own policy, `vc.stats()` has the raw signals: `ticks_media` (ticks that carried a valid
+voice packet; `ticks_real` counts every tick), `media_age_ms` (time since the last one) and
+`decrypt_failures` (songbird's RTP/RTCP/DAVE decryption failures, counted process-wide from its log
+records, so it needs the library's logger and a `songbird` log level of WARN or lower, the default).
+
 ## Recording
 
 `examples/record.py` writes one timeline-aligned WAV per user:

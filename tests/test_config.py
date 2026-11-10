@@ -33,6 +33,15 @@ def test_defaults() -> None:
     assert cfg.to_native().receive is True
 
 
+def test_media_timeout_is_opt_in() -> None:
+    assert VoiceConfig().media_timeout_ms is None
+    assert VoiceConfig.low_latency().media_timeout_ms is None
+    cfg = VoiceConfig(media_timeout_ms=30_000)
+    assert cfg.media_timeout_ms == 30_000
+    assert cfg.replace(media_timeout_ms=None).media_timeout_ms is None
+    cfg.to_native()
+
+
 def test_low_latency_and_replace() -> None:
     cfg = VoiceConfig.low_latency()
     assert (cfg.playout_buffer_ms, cfg.mix_mode) == (40, "mono")
@@ -63,6 +72,8 @@ def test_frozen() -> None:
         ("max_decoded_users", 10**9, LimitExceeded),
         ("max_receive_mb", 0, LimitExceeded),
         ("stall_timeout_ms", 100, LimitExceeded),
+        ("media_timeout_ms", 4_999, LimitExceeded),
+        ("media_timeout_ms", 3_600_001, LimitExceeded),
         ("bitrate", 1_000, LimitExceeded),
         ("driver_timeout_s", 61.0, LimitExceeded),
         ("driver_retries", 0, LimitExceeded),
