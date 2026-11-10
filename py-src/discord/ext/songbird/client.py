@@ -517,7 +517,17 @@ class SongbirdClient(discord.VoiceProtocol):
         self._require_conn().set_bitrate(bps)
 
     def stats(self) -> dict[str, int]:
-        """Receive, control and health counters (``ticks_real``, ``bad_packets``, ``panics``, …)."""
+        """Receive, control and health counters (``ticks_real``, ``bad_packets``, ``panics``, …).
+
+        Notes
+        -----
+        ``ticks_real`` counts songbird's timer-driven ticks, which keep arriving when no audio
+        does. Media liveness is reported separately: ``ticks_media`` (ticks that carried at least
+        one valid voice packet), ``media_age_ms`` (milliseconds since the last one, counted from
+        the link-up when none arrived since) and ``decrypt_failures`` (songbird's RTP/RTCP/DAVE
+        decryption failures, counted process-wide from its log records). See
+        ``VoiceConfig.media_timeout_ms``.
+        """
         return dict(self._require_conn(allow_closed=True).stats())
 
     # ── receive ──────────────────────────────────────────────────────────────────────────────────

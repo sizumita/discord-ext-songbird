@@ -320,6 +320,7 @@ impl ConnShared {
                 max_decoded_users: s.max_decoded_users,
                 decode_state_timeout: s.decode_state_timeout,
                 stall_timeout: s.stall_timeout,
+                media_timeout: s.media_timeout,
                 t0: self.t0,
             },
             self.events.clone(),
@@ -860,6 +861,15 @@ impl ConnShared {
             ("ticks_synthetic", rx.ticks_synthetic),
             ("ticks_dropped", ld(&d.ticks_dropped)),
             ("ticks_skipped", rx.ticks_skipped),
+            ("ticks_media", rx.ticks_media),
+            (
+                "media_age_ms",
+                rx.media_ref.map_or(0, |t| {
+                    u64::try_from(self.clock.now().saturating_duration_since(t).as_millis())
+                        .unwrap_or(u64::MAX)
+                }),
+            ),
+            ("decrypt_failures", crate::log::decrypt_failures()),
             ("bad_packets", rx.bad_packets),
             ("decode_errors", rx.decode_errors),
             ("plc_frames", rx.plc_frames),
@@ -1417,6 +1427,7 @@ fn input_kind(i: &GwInput) -> &'static str {
         GwInput::DriverReconnect { .. } => "DriverReconnect",
         GwInput::DriverDisconnect { .. } => "DriverDisconnect",
         GwInput::RxStalled { .. } => "RxStalled",
+        GwInput::MediaStalled => "MediaStalled",
         GwInput::HandlersLost => "HandlersLost",
         GwInput::Deadline => "Deadline",
         GwInput::Close(_) => "Close",

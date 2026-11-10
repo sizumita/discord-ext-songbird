@@ -623,6 +623,7 @@ class VoiceSettings:
         max_decoded_users: int = 64,
         max_receive_mb: int = 64,
         stall_timeout_ms: int = 2_000,
+        media_timeout_ms: int | None = None,
         mix_mode: str = "stereo",
         bitrate: int | None = None,
         softclip: bool = True,
@@ -644,6 +645,8 @@ class VoiceSettings:
         _check_int("max_decoded_users", max_decoded_users, 1, 256)
         _check_int("max_receive_mb", max_receive_mb, 1, 1_024)
         _check_int("stall_timeout_ms", stall_timeout_ms, 500, 30_000)
+        if media_timeout_ms is not None:
+            _check_int("media_timeout_ms", media_timeout_ms, 5_000, 3_600_000)
         if mix_mode not in ("mono", "stereo"):
             raise ValueError(f"mix_mode must be 'mono' or 'stereo' (got {mix_mode!r})")
         if bitrate is not None:
@@ -656,6 +659,7 @@ class VoiceSettings:
         self.voice_threshold_dbfs = voice_threshold_dbfs
         self.max_receive_bytes = max_receive_mb << 20
         self.stall_timeout_ms = stall_timeout_ms
+        self.media_timeout_ms = media_timeout_ms  # validated only: the fake has no watchdog
         self.rejoin_attempts = rejoin_attempts
         self.auto_recover = auto_recover
 
@@ -2484,6 +2488,9 @@ class _Conn:
                 "ticks_synthetic",
                 "ticks_dropped",
                 "ticks_skipped",
+                "ticks_media",
+                "media_age_ms",
+                "decrypt_failures",
                 "bad_packets",
                 "decode_errors",
                 "plc_frames",
@@ -3092,6 +3099,8 @@ class _Conn:
             self.counters["ticks_synthetic"] += 1
         else:
             self.counters["ticks_real"] += 1
+        if not synthetic and any(p is not None and not bad for _, p, bad in voices):
+            self.counters["ticks_media"] += 1
         for ssrc, packet, bad in voices:
             if bad:
                 self.counters["bad_packets"] += 1

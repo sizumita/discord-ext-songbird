@@ -49,6 +49,7 @@ fn cfg(t0: Instant) -> RxConfig {
         max_decoded_users: 64,
         decode_state_timeout: Duration::from_secs(60),
         stall_timeout: Duration::from_millis(2_000),
+        media_timeout: None,
         t0,
     }
 }
@@ -631,6 +632,79 @@ fn watchdog_reports_a_stall_on_every_timer_call_while_it_lasts() {
     r.p.on_input(RxInput::LinkDown, r.now);
     r.advance(10_000);
     assert_eq!(r.timer().stalled_since, None);
+}
+
+/// Issue #16: songbird emits `VoiceTick` from a timer, so empty ticks keep the tick watchdog
+/// quiet while the media path is dead. The opt-in media watchdog measures valid media instead.
+#[test]
+fn media_watchdog_reports_ticks_without_media() {
+    let mut r = Rig::with(|c| c.media_timeout = Some(Duration::from_secs(10)));
+    let opus = opus_frames(&sine48(440.0, 0.3, 960 * 3)).remove(1);
+    r.p.on_input(RxInput::LinkUp { ssrc: Some(1) }, r.now);
+    r.map(7, A);
+
+    // No consumer: nothing is watched, however long the silence lasts.
+    for _ in 0..600 {
+        r.tick(vec![]);
+    }
+    let t = r.timer();
+    assert_eq!((t.stalled_since, t.media_stalled_since), (None, None));
+
+    // A consumer appears: the watch starts now, not at the link-up 12 s ago.
+    let _sub = r.mixed(MixFilter::everyone(), PCM16_24K, 20);
+    r.timer();
+    let watch = r.now;
+    for _ in 0..499 {
+        r.tick(vec![]);
+    }
+    let t = r.timer();
+    assert_eq!((t.stalled_since, t.media_stalled_since), (None, None));
+    r.tick(vec![]);
+    let t = r.timer();
+    assert_eq!(t.stalled_since, None, "ticks arrive: no tick stall");
+    assert_eq!(t.media_stalled_since, Some(watch));
+    assert_eq!(r.p.counts().ticks_media, 0);
+
+    // A valid packet ends the stall and moves the reference.
+    let v = r.packet(7, &opus);
+    r.tick(vec![v]);
+    let last = r.now;
+    assert_eq!(r.timer().media_stalled_since, None);
+    let c = r.p.counts();
+    assert_eq!((c.ticks_media, c.media_ref), (1, Some(last)));
+
+    // Losses and malformed packets are no evidence of media.
+    for _ in 0..500 {
+        let bad = RawVoice::Packet {
+            ssrc: 7,
+            packet: Bytes::from_static(&[0x80, 0x78, 0, 1]),
+            payload_offset: 0,
+            payload_end: 0,
+        };
+        r.tick(vec![RawVoice::Lost { ssrc: 7 }, bad]);
+    }
+    assert_eq!(r.timer().media_stalled_since, Some(last));
+    assert_eq!(r.p.counts().ticks_media, 1);
+
+    // A new link (the rejoin) restarts the measurement; link down stops it.
+    r.p.on_input(RxInput::LinkUp { ssrc: Some(1) }, r.now);
+    assert_eq!(r.timer().media_stalled_since, None);
+    r.p.on_input(RxInput::LinkDown, r.now);
+    r.advance(60_000);
+    assert_eq!(r.timer().media_stalled_since, None);
+}
+
+/// Off by default: a silent channel is never reported.
+#[test]
+fn media_watchdog_is_off_by_default() {
+    let mut r = Rig::new();
+    r.p.on_input(RxInput::LinkUp { ssrc: Some(1) }, r.now);
+    let _sub = r.mixed(MixFilter::everyone(), PCM16_24K, 20);
+    for _ in 0..3_000 {
+        r.tick(vec![]);
+    }
+    let t = r.timer();
+    assert_eq!((t.stalled_since, t.media_stalled_since), (None, None));
 }
 
 #[test]

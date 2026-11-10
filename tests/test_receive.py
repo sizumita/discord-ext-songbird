@@ -427,7 +427,11 @@ async def test_full_rtp_path(connected_vc: HarnessClient, testing: Any) -> None:
         vc.harness.step(20)
         chunks = drain(stream)
     assert [c.speaking for c in chunks] == [True, True, False]
-    assert vc.stats()["bad_packets"] >= 1
+    stats = vc.stats()
+    assert stats["bad_packets"] >= 1
+    # Only the two well-formed packets are evidence of media (issue #16).
+    assert stats["ticks_media"] == 2
+    assert {"media_age_ms", "decrypt_failures"} <= stats.keys()
 
 
 async def test_receive_limits(connected_vc: HarnessClient) -> None:
@@ -465,3 +469,31 @@ async def test_streams_end_on_disconnect(connected_vc: HarnessClient, testing: A
     got = [c async for c in stream]  # queued chunks stay readable, then the stream ends
     assert len(got) == 2
     assert stream.closed and stream.close_reason == "connection_closed"
+
+
+@pytest.mark.real_only  # the fake has no receive watchdogs
+async def test_media_watchdog_rejoins_when_ticks_carry_no_media(world: World, testing: Any) -> None:
+    """Issue #16: songbird's ticks are timer-driven, so they keep arriving when the media path is
+    dead. With ``media_timeout_ms`` set, that is reported and recovered by a rejoin."""
+    vc = await connect_detached(world, config=songbird.VoiceConfig(media_timeout_ms=5_000))
+    async with vc.events() as events, vc.listen_mixed(songbird.PCM16_24K):
+        inject_ticks(vc, testing, 5)
+        assert vc.stats()["ticks_media"] == 5
+        inject_ticks(vc, testing, 200, voiced=False)  # 4 s of ticks without a packet
+        assert vc.status.state == "connected"
+        assert vc.stats()["media_age_ms"] >= 4_000
+        inject_ticks(vc, testing, 60, voiced=False)
+        assert vc.status.state == "reconnecting"
+        assert vc.stats()["ticks_media"] == 5 and vc.stats()["dispatch_reinstalls"] == 0
+        async with asyncio.timeout(2):
+            while not isinstance(await anext(events), songbird.VoiceEvent.ReceiveStalled):
+                pass
+    await vc.disconnect(force=True)
+
+
+@pytest.mark.real_only
+async def test_media_watchdog_is_off_by_default(connected_vc: HarnessClient, testing: Any) -> None:
+    vc = connected_vc
+    async with vc.listen_mixed(songbird.PCM16_24K):
+        inject_ticks(vc, testing, 1_500, voiced=False)  # 30 s of silence
+        assert vc.status.state == "connected"

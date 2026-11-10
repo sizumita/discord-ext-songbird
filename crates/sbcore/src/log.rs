@@ -288,6 +288,8 @@ pub(crate) struct LogCore {
     /// The global instance also honours `runtime::SHUTTING_DOWN`.
     global: bool,
     base: OnceLock<Instant>,
+    /// songbird's `RTP/RTCP/DAVE decryption failed` records seen (see [`decrypt_failures`]).
+    decrypt_failures: AtomicU64,
 }
 
 impl LogCore {
@@ -302,6 +304,7 @@ impl LogCore {
             stopping: AtomicBool::new(false),
             global: true,
             base: OnceLock::new(),
+            decrypt_failures: AtomicU64::new(0),
         }
     }
 
@@ -340,6 +343,9 @@ impl LogCore {
         }
         if dependencies_muted() && !is_ours(target) {
             return;
+        }
+        if target.starts_with(UDP_RX_TARGET) && is_decrypt_failure(record.args()) {
+            self.decrypt_failures.fetch_add(1, Ordering::Relaxed);
         }
         if self.rate_limited && !self.bucket.take(self.now_ms()) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -407,6 +413,26 @@ impl LogCore {
     }
 }
 
+/// The target of songbird's UDP receive task, the only place that reports decryption failures.
+const UDP_RX_TARGET: &str = "songbird::driver::tasks::udp_rx";
+
+/// Whether a record of songbird's UDP receive task reports a failed packet decryption
+/// (`RTP decryption failed: …`, `RTCP decryption failed: …`, `DAVE decryption failed`). The
+/// phrase is a literal of the format string, so it always arrives in one `write_str` piece and
+/// nothing has to be buffered.
+fn is_decrypt_failure(args: &fmt::Arguments<'_>) -> bool {
+    struct Find(bool);
+    impl fmt::Write for Find {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            self.0 |= s.contains("decryption failed");
+            Ok(())
+        }
+    }
+    let mut f = Find(false);
+    let _ = fmt::write(&mut f, *args);
+    f.0
+}
+
 static CORE: LogCore = LogCore::new_global();
 static DEFAULTS: std::sync::Once = std::sync::Once::new();
 
@@ -427,6 +453,17 @@ impl ::log::Log for RingLogger {
     }
 
     fn flush(&self) {}
+}
+
+/// Packet decryption failures reported by songbird's UDP receive task since the process started
+/// (`stats()["decrypt_failures"]`).
+///
+/// songbird exposes them only as log records, so this counts those records: it is process-wide
+/// (a record carries no connection), stays 0 when another `log` logger is installed, and misses
+/// records while the `songbird` log level is above WARN. Records dropped by the rate limit or a
+/// full ring are still counted.
+pub fn decrypt_failures() -> u64 {
+    CORE.decrypt_failures.load(Ordering::Relaxed)
 }
 
 /// Installs the ring logger as the `log` facade's logger. `false` if another logger is installed.
@@ -497,6 +534,58 @@ mod tests {
 
     fn count(core: &LogCore) -> usize {
         core.ring.lock().len()
+    }
+
+    /// Issue #16: songbird reports decryption failures only as log records; they are counted,
+    /// also when the rate limit drops the record itself.
+    #[test]
+    fn decrypt_failures_are_counted_from_udp_rx_records() {
+        let core = LogCore::new_private(true);
+        let _ = core.levels.set("", LevelFilter::Warn);
+        let failures = || core.decrypt_failures.load(Ordering::Relaxed);
+        let err = "Crypto(Error)";
+        for msg in ["RTP", "RTCP"] {
+            core.log(
+                &Record::builder()
+                    .args(format_args!("{msg} decryption failed: {err:?}"))
+                    .level(Level::Warn)
+                    .target(UDP_RX_TARGET)
+                    .build(),
+            );
+        }
+        emit(&core, Level::Error, UDP_RX_TARGET, "DAVE decryption failed");
+        assert_eq!(failures(), 3);
+        emit(
+            &core,
+            Level::Warn,
+            UDP_RX_TARGET,
+            "Illegal UDP packet from voice server.",
+        );
+        emit(
+            &core,
+            Level::Warn,
+            "songbird::driver",
+            "RTP decryption failed: elsewhere",
+        );
+        assert_eq!(
+            failures(),
+            3,
+            "other records and other targets do not count"
+        );
+        for _ in 0..BUCKET_BURST * 2 {
+            emit(
+                &core,
+                Level::Warn,
+                UDP_RX_TARGET,
+                "RTCP decryption failed: x",
+            );
+        }
+        assert_eq!(
+            failures(),
+            3 + BUCKET_BURST * 2,
+            "rate-limited records count"
+        );
+        assert!(core.dropped.load(Ordering::Relaxed) > 0);
     }
 
     #[test]

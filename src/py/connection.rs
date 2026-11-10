@@ -15,8 +15,8 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use sbcore::conn::gateway::StatusSnapshot;
 use sbcore::conn::ops::OpResult;
 use sbcore::conn::settings::{
-    BITRATE_BPS, DRIVER_RETRIES, MAX_DECODED_USERS, MAX_RECEIVE_MB, REJOIN_ATTEMPTS,
-    SPEAKING_HANGOVER_MS, STALL_TIMEOUT_MS,
+    BITRATE_BPS, DRIVER_RETRIES, MAX_DECODED_USERS, MAX_RECEIVE_MB, MEDIA_TIMEOUT_MS,
+    REJOIN_ATTEMPTS, SPEAKING_HANGOVER_MS, STALL_TIMEOUT_MS,
 };
 use sbcore::conn::{ConnParams, ConnShared, RawVoiceSettings, VoiceSettings};
 use sbcore::events::KindMask;
@@ -72,6 +72,9 @@ fn snowflake(what: &str, v: u64) -> PyResult<NonZeroU64> {
 ///     ``1..=1024``: the sum of all receive-queue bounds per connection.
 /// stall_timeout_ms : int, default 2000
 ///     ``500..=30000`` receive watchdog.
+/// media_timeout_ms : int or None, default None
+///     ``5000..=3600000``; opt-in media watchdog (``None`` = off): ``ReceiveStalled`` when no
+///     valid media packet arrived for this long while a receive consumer exists.
 /// mix_mode : {"mono", "stereo"}, default "stereo"
 /// bitrate : int or None, default None
 ///     ``6000..=510000`` bps; ``None`` = songbird default.
@@ -120,6 +123,7 @@ impl PyVoiceSettings {
         max_decoded_users = 64,
         max_receive_mb = 64,
         stall_timeout_ms = 2_000,
+        media_timeout_ms = None,
         mix_mode = "stereo",
         bitrate = None,
         softclip = true,
@@ -140,6 +144,7 @@ impl PyVoiceSettings {
         max_decoded_users: i64,
         max_receive_mb: i64,
         stall_timeout_ms: i64,
+        media_timeout_ms: Option<i64>,
         #[gen_stub(override_type(type_repr = "typing.Literal['mono', 'stereo']", imports = ("typing",)))]
         mix_mode: &str,
         bitrate: Option<i64>,
@@ -161,6 +166,10 @@ impl PyVoiceSettings {
         };
         let bitrate = match bitrate {
             Some(b) => Some(check("bitrate", b, BITRATE_BPS).py(py)?),
+            None => None,
+        };
+        let media_timeout_ms = match media_timeout_ms {
+            Some(ms) => Some(int_arg(py, "media_timeout_ms", ms, MEDIA_TIMEOUT_MS)?),
             None => None,
         };
         let raw = RawVoiceSettings {
@@ -188,6 +197,7 @@ impl PyVoiceSettings {
             )?,
             max_receive_mb: int_arg(py, "max_receive_mb", max_receive_mb, MAX_RECEIVE_MB)?,
             stall_timeout_ms: int_arg(py, "stall_timeout_ms", stall_timeout_ms, STALL_TIMEOUT_MS)?,
+            media_timeout_ms,
             mix_mode_mono,
             bitrate: bitrate.and_then(|b| i32::try_from(b).ok()),
             softclip,

@@ -71,6 +71,9 @@ pub struct RxConfig {
     pub max_decoded_users: usize,
     pub decode_state_timeout: Duration,
     pub stall_timeout: Duration,
+    /// Opt-in media watchdog (`VoiceConfig.media_timeout_ms`): report a stall when no valid media
+    /// packet has arrived for this long while consumers exist. `None` (the default) disables it.
+    pub media_timeout: Option<Duration>,
     /// Timeline origin (ConnWorker start).
     pub t0: Instant,
 }
@@ -83,6 +86,9 @@ pub struct RxTimer {
     /// every call while the stall lasts (the gateway rate-limits `RxStalled` itself). The
     /// ConnWorker emits `ReceiveStalled` once per stall; the pipeline never does.
     pub stalled_since: Option<Instant>,
+    /// Set while no valid media packet has arrived for `media_timeout` (receive on, link up, at
+    /// least one consumer). Ticks keep arriving in this state: songbird emits them from a timer.
+    pub media_stalled_since: Option<Instant>,
 }
 
 /// Receive counters (§11.3).
@@ -91,6 +97,10 @@ pub struct RxCounts {
     pub ticks_real: u64,
     pub ticks_synthetic: u64,
     pub ticks_skipped: u64,
+    /// Real ticks that carried at least one valid media packet.
+    pub ticks_media: u64,
+    /// The last valid media packet's arrival, or the last link-up when none arrived since.
+    pub media_ref: Option<Instant>,
     pub bad_packets: u64,
     pub decode_errors: u64,
     pub plc_frames: u64,
@@ -228,6 +238,10 @@ pub struct RxPipeline {
     tick_index: u64,
     link_up: bool,
     stall_ref: Option<Instant>,
+    /// Since when the media watchdog has had a consumer to watch for (`None`: no consumer).
+    media_watch: Option<Instant>,
+    /// The tick being processed carried a valid media packet.
+    media_tick: bool,
     // Per-tick scratch (reused).
     scratch: Box<[f32]>,
     tmp: Box<[f32; TICK_SAMPLES_48K]>,
@@ -316,6 +330,8 @@ impl RxPipeline {
             tick_index: 0,
             link_up: false,
             stall_ref: None,
+            media_watch: None,
+            media_tick: false,
             scratch: vec![0.0f32; DECODE_SCRATCH_LEN].into_boxed_slice(),
             tmp: Box::new([0.0; TICK_SAMPLES_48K]),
             cur: Vec::new(),
@@ -351,6 +367,7 @@ impl RxPipeline {
             RxInput::LinkUp { .. } => {
                 self.link_up = true;
                 self.stall_ref = Some(now);
+                self.counts.media_ref = Some(now);
             }
             RxInput::LinkDown => {
                 self.link_up = false;
@@ -369,8 +386,12 @@ impl RxPipeline {
         }
         self.prune(now);
         let (stalled_since, stall_wake) = self.check_stall(now);
+        let (media_stalled_since, media_wake) = self.check_media(now);
         self.flush_events();
-        let mut next = stall_wake;
+        let mut next = match (stall_wake, media_wake) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         let mut consider = |t: Option<Instant>| {
             if let Some(t) = t {
                 next = Some(next.map_or(t, |n: Instant| n.min(t)));
@@ -392,6 +413,7 @@ impl RxPipeline {
         RxTimer {
             next_wake: next,
             stalled_since,
+            media_stalled_since,
         }
     }
 
@@ -875,7 +897,12 @@ impl RxPipeline {
             return;
         }
         self.counts.ticks_real += 1;
+        self.media_tick = false;
         self.run_tick(&raw.voices, false, raw.arrived);
+        if self.media_tick {
+            self.counts.ticks_media += 1;
+            self.counts.media_ref = Some(at);
+        }
     }
 
     fn on_map(&mut self, ssrc: u32, user: u64, now: Instant) {
@@ -1044,6 +1071,32 @@ impl RxPipeline {
         (Some(since), now.checked_add(STALL_REPORT_INTERVAL))
     }
 
+    /// The opt-in media watchdog: `(stalled_since, next check)`.
+    ///
+    /// songbird emits `VoiceTick` from a 20 ms timer whether or not any packet arrived, so
+    /// [`Self::check_stall`] cannot see a media path that died while the driver kept running
+    /// (the DAVE failures of serenity-rs/songbird#310). This one measures the time since the last
+    /// valid media packet instead. A channel where nobody speaks looks exactly the same, which is
+    /// why it is off unless `media_timeout` is set, and why it only runs while a consumer exists.
+    fn check_media(&mut self, now: Instant) -> (Option<Instant>, Option<Instant>) {
+        let Some(timeout) = self.cfg.media_timeout else {
+            return (None, None);
+        };
+        if !(self.cfg.enabled && self.link_up && self.has_consumers()) {
+            self.media_watch = None;
+            return (None, None);
+        }
+        let watch = *self.media_watch.get_or_insert(now);
+        let since = self.counts.media_ref.map_or(watch, |m| m.max(watch));
+        let Some(deadline) = since.checked_add(timeout) else {
+            return (None, None);
+        };
+        if now < deadline {
+            return (None, Some(deadline));
+        }
+        (Some(since), now.checked_add(STALL_REPORT_INTERVAL))
+    }
+
     fn flush_events(&mut self) {
         for ev in self.ev.drain(..) {
             self.events.emit(&ev);
@@ -1183,6 +1236,8 @@ impl RxPipeline {
             }
         }
         if !decode_any || !self.needs(user) {
+            // Nobody decodes this user: a well-formed packet is the evidence of media.
+            self.media_tick |= pkt.is_some();
             return;
         }
         if !self.states.contains_key(&ssrc) && !self.create_state(ssrc, user, now) {
@@ -1196,7 +1251,9 @@ impl RxPipeline {
         slot.state.touch(tick);
         match pkt {
             Some((p, seq)) => {
-                if slot.state.push_packet(p, seq, &mut self.scratch).is_err() {
+                if slot.state.push_packet(p, seq, &mut self.scratch).is_ok() {
+                    self.media_tick = true;
+                } else {
                     self.counts.decode_errors += 1;
                     slot.state.conceal(&mut self.scratch);
                     self.counts.plc_frames += FRAMES_PER_TICK_48K as u64;
