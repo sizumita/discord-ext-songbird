@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "discord-ext-songbird"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3420,7 +3420,7 @@ dependencies = [
 
 [[package]]
 name = "sbcore"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "async-trait",
  "bytemuck",

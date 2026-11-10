@@ -28,7 +28,7 @@ from collections import deque
 from collections.abc import Callable, Iterable
 from typing import Any
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 WAKE_CONN = 0
 WAKE_OPS = 1
 WAKE_CTRL = 2
